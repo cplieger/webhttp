@@ -31,6 +31,7 @@ func TestValidRequestID(t *testing.T) {
 		{"tab", "a\tb", false},
 		{"colon", "a:b", false},
 		{"unicode", "café", false},
+		{"crlf injection", "abc\r\nX-Evil: 1", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -253,17 +254,11 @@ func TestRequestLogger_metricHookOnLoggedPath(t *testing.T) {
 	}
 }
 
-func TestRequestLogger_metricHookOnSkipPathReportsOK(t *testing.T) {
-	var (
-		calls     int
-		gotStatus int
-	)
-	hook := func(_, _ string, status int, _ time.Duration) {
-		calls++
-		gotStatus = status
-	}
-	// The handler writes 418, but the skip path is served through the raw
-	// writer with no recorder, so the metric reports 200 by design.
+func TestRequestLogger_skipPathExcludedFromMetricHook(t *testing.T) {
+	var calls int
+	hook := func(_, _ string, _ int, _ time.Duration) { calls++ }
+	// A skip path is excluded from BOTH the access log and the metric hook: a
+	// stream's open-to-close duration plus a synthetic status is misleading.
 	h := webhttp.RequestLogger(statusHandler(http.StatusTeapot),
 		webhttp.WithLogger(discardLogger()),
 		webhttp.WithSkipPaths("/stream"),
@@ -271,11 +266,8 @@ func TestRequestLogger_metricHookOnSkipPathReportsOK(t *testing.T) {
 
 	serve(h, http.MethodGet, "/stream", nil)
 
-	if calls != 1 {
-		t.Fatalf("hook called %d times for skip path, want 1", calls)
-	}
-	if gotStatus != http.StatusOK {
-		t.Errorf("skip-path metric status = %d, want 200 (raw writer, no recorder)", gotStatus)
+	if calls != 0 {
+		t.Errorf("metric hook called %d times for a skip path, want 0", calls)
 	}
 }
 
@@ -319,5 +311,96 @@ func TestRequestLogger_nilOptionIgnored(t *testing.T) {
 	rr := serve(h, http.MethodGet, "/x", nil)
 	if !webhttp.ValidRequestID(rr.Header().Get(webhttp.HeaderRequestID)) {
 		t.Error("did not echo a valid request id")
+	}
+}
+
+func TestRequestLogger_panicStillEmitsAccessLine(t *testing.T) {
+	logCap := &captureHandler{}
+	next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		panic("boom")
+	})
+	h := webhttp.RequestLogger(next, webhttp.WithLogger(slog.New(logCap)))
+
+	// RequestLogger does not recover; the panic propagates out of ServeHTTP.
+	// Recover it here so the test can assert the deferred access line still ran.
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Error("handler panic did not propagate through RequestLogger")
+			}
+		}()
+		serve(h, http.MethodGet, "/boom", nil)
+	}()
+
+	recs := logCap.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("got %d log records after panic, want exactly 1", len(recs))
+	}
+	if recs[0].Message != "http" {
+		t.Errorf("log message = %q, want %q", recs[0].Message, "http")
+	}
+	if m := attrsOf(recs[0]); m["status"] != int64(http.StatusOK) {
+		t.Errorf("panic access line status = %v, want 200 (recorded default)", m["status"])
+	}
+}
+
+func TestRequestLogger_skipFuncSuppressesLogAndMetricButEchoesID(t *testing.T) {
+	logCap := &captureHandler{}
+	var metricCalls int
+	// A path parameter (/ws/{id}) that an exact WithSkipPaths match cannot cover.
+	h := webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(slog.New(logCap)),
+		webhttp.WithSkipFunc(func(r *http.Request) bool {
+			return strings.HasPrefix(r.URL.Path, "/ws/")
+		}),
+		webhttp.WithRecordMetric(func(_, _ string, _ int, _ time.Duration) { metricCalls++ }))
+
+	rr := serve(h, http.MethodGet, "/ws/room-42", nil)
+
+	if n := len(logCap.snapshot()); n != 0 {
+		t.Errorf("skip-func path emitted %d log lines, want 0", n)
+	}
+	if metricCalls != 0 {
+		t.Errorf("skip-func path called the metric hook %d times, want 0", metricCalls)
+	}
+	if !webhttp.ValidRequestID(rr.Header().Get(webhttp.HeaderRequestID)) {
+		t.Error("skip-func path did not echo a valid request id")
+	}
+}
+
+func TestRequestLogger_skipFuncFalseStillLogs(t *testing.T) {
+	logCap := &captureHandler{}
+	h := webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(slog.New(logCap)),
+		webhttp.WithSkipFunc(func(*http.Request) bool { return false }))
+
+	serve(h, http.MethodGet, "/normal", nil)
+
+	if n := len(logCap.snapshot()); n != 1 {
+		t.Errorf("skip-func returning false emitted %d log lines, want 1", n)
+	}
+}
+
+func TestRequestLogger_rejectsCRLFInjectionInboundID(t *testing.T) {
+	var seen string
+	next := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		seen = webhttp.RequestIDFromContext(r.Context())
+	})
+	h := webhttp.RequestLogger(next, webhttp.WithLogger(discardLogger()))
+
+	hdr := http.Header{}
+	// A header-splitting / log-forging inbound id must be rejected, not echoed.
+	hdr.Set(webhttp.HeaderRequestID, "abc\r\nX-Evil: 1")
+	rr := serve(h, http.MethodGet, "/x", hdr)
+
+	echoed := rr.Header().Get(webhttp.HeaderRequestID)
+	if strings.ContainsAny(echoed, "\r\n") {
+		t.Errorf("echoed id %q contains CR/LF; injection content was not rejected", echoed)
+	}
+	if !webhttp.ValidRequestID(echoed) {
+		t.Errorf("echoed id %q is not a freshly minted valid id", echoed)
+	}
+	if seen != echoed {
+		t.Errorf("context id %q != echoed header %q", seen, echoed)
 	}
 }

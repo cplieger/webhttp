@@ -19,26 +19,34 @@ func LimitBody(w http.ResponseWriter, r *http.Request, maxBytes int64) {
 }
 
 // RequireMethod reports whether the request method equals method. On a mismatch
-// it writes a 405 error response (code "method_not_allowed") and returns false,
-// so a handler can guard with:
+// it sets the RFC 9110 Allow header to method, writes a 405 error response
+// (code "method_not_allowed"), and returns false, so a handler can guard with:
 //
 //	if !webhttp.RequireMethod(w, r, http.MethodPost) {
 //		return
 //	}
 func RequireMethod(w http.ResponseWriter, r *http.Request, method string) bool {
 	if r.Method != method {
+		w.Header().Set("Allow", method)
 		WriteError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return false
 	}
 	return true
 }
 
-// DecodeBody limits the body to MaxJSONBody and decodes a single JSON value
-// into v. On any decode failure it writes a 400 error response (code
-// "bad_request") carrying errMsg and returns false; on success it returns true.
+// DecodeBody limits the body to MaxJSONBody and decodes exactly one JSON value
+// into v. The decoded value must be the entire body: trailing data or a second
+// JSON value is rejected. On any decode failure it writes a 400 error response
+// (code "bad_request") carrying errMsg and returns false; on success it returns
+// true.
 func DecodeBody(w http.ResponseWriter, r *http.Request, v any, errMsg string) bool {
 	LimitBody(w, r, MaxJSONBody)
-	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(v); err != nil {
+		WriteError(w, r, http.StatusBadRequest, "bad_request", errMsg)
+		return false
+	}
+	if dec.Decode(&struct{}{}) != io.EOF {
 		WriteError(w, r, http.StatusBadRequest, "bad_request", errMsg)
 		return false
 	}

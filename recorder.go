@@ -1,13 +1,25 @@
 package webhttp
 
-import "net/http"
+import (
+	"bufio"
+	"io"
+	"net"
+	"net/http"
+)
 
 // StatusRecorder wraps an http.ResponseWriter to capture the response status
-// code while remaining transparent to http.ResponseController. Middleware that
-// needs to observe the final status (access logging, metrics) wraps the writer
-// in a StatusRecorder; the Unwrap method lets http.NewResponseController reach
-// the underlying writer, so Flush and Hijack still work for SSE, WebSocket, and
-// other streaming handlers running behind the middleware.
+// code. Middleware that needs to observe the final status (access logging,
+// metrics) wraps the writer in a StatusRecorder.
+//
+// It stays transparent to streaming in two complementary ways. The Unwrap
+// method lets http.NewResponseController walk to the underlying writer, so
+// ResponseController-based callers reach its Flusher, Hijacker, and deadline
+// setters. It also implements http.Flusher, http.Hijacker, and io.ReaderFrom
+// directly, so a handler or library that type-asserts those interfaces on the
+// writer (as gorilla/websocket does with w.(http.Hijacker)) still works, and
+// io.Copy/http.ServeContent keep the zero-copy sendfile fast path. Each
+// passthrough returns the underlying writer's own result, so, for example,
+// Hijack reports http.ErrNotSupported on an HTTP/2 stream.
 type StatusRecorder struct {
 	http.ResponseWriter
 	status      int
@@ -50,4 +62,32 @@ func (s *StatusRecorder) Status() int {
 // recorder.
 func (s *StatusRecorder) Unwrap() http.ResponseWriter {
 	return s.ResponseWriter
+}
+
+// Flush forwards to the underlying writer via http.ResponseController (which
+// walks the Unwrap chain), so a handler that type-asserts http.Flusher directly
+// still streams through the recorder. A no-op if the underlying writer cannot flush.
+func (s *StatusRecorder) Flush() {
+	// Best-effort: an underlying writer that cannot flush has nothing to do, so
+	// its error is intentionally discarded.
+	_ = http.NewResponseController(s.ResponseWriter).Flush()
+}
+
+// Hijack forwards to the underlying writer via http.ResponseController for
+// libraries that hijack the connection through a direct http.Hijacker assertion.
+// Returns an error (e.g. http.ErrNotSupported) when the underlying writer, such
+// as an HTTP/2 stream, cannot be hijacked.
+func (s *StatusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return http.NewResponseController(s.ResponseWriter).Hijack()
+}
+
+// ReadFrom preserves the zero-copy (sendfile) fast path for io.Copy and
+// http.ServeContent when the underlying writer implements io.ReaderFrom. Writing
+// the body implies a 200 status when WriteHeader was not called.
+func (s *StatusRecorder) ReadFrom(src io.Reader) (int64, error) {
+	s.wroteHeader = true
+	if rf, ok := s.ResponseWriter.(io.ReaderFrom); ok {
+		return rf.ReadFrom(src)
+	}
+	return io.Copy(s.ResponseWriter, src)
 }

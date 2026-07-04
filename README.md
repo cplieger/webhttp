@@ -86,13 +86,14 @@ func main() {
 
 ### Status recorder
 
-`StatusRecorder` wraps an `http.ResponseWriter` to capture the response status while staying transparent to `http.ResponseController`. Its `Unwrap` method is the point: `http.NewResponseController(rec)` walks `Unwrap` to reach a `Flusher` or `Hijacker` on the underlying writer, so SSE, WebSocket, and other streaming handlers keep working behind status-capturing middleware.
+`StatusRecorder` wraps an `http.ResponseWriter` to capture the response status while staying transparent to streaming. It works two complementary ways: `Unwrap` lets `http.NewResponseController(rec)` walk to the underlying writer's `Flusher`, `Hijacker`, and deadline setters, and it also implements `http.Flusher`/`http.Hijacker`/`io.ReaderFrom` directly, so a handler or library that type-asserts those interfaces on the writer (as gorilla/websocket does with `w.(http.Hijacker)`) still works and `io.Copy`/`http.ServeContent` keep the zero-copy sendfile fast path. Each passthrough returns the underlying writer's own result (e.g. `Hijack` errors on an HTTP/2 stream).
 
 - `NewStatusRecorder(w) *StatusRecorder` — status defaults to 200
 - `(*StatusRecorder).WriteHeader(code)` — records the first explicit code only
 - `(*StatusRecorder).Write(b)` — implicit 200 on first write
 - `(*StatusRecorder).Status() int`
 - `(*StatusRecorder).Unwrap() http.ResponseWriter`
+- `(*StatusRecorder).Flush()` / `.Hijack()` / `.ReadFrom(src)` — passthroughs to the underlying writer
 
 ### Request id and access logging
 

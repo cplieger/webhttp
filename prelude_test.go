@@ -37,12 +37,46 @@ func TestRequireMethod_mismatch(t *testing.T) {
 	if rr.Code != http.StatusMethodNotAllowed {
 		t.Errorf("code = %d, want 405", rr.Code)
 	}
+	// RFC 9110 requires a 405 to carry an Allow header naming the permitted method.
+	if allow := rr.Header().Get("Allow"); allow != http.MethodPost {
+		t.Errorf("Allow header = %q, want %q", allow, http.MethodPost)
+	}
 	var got webhttp.ErrorResponse
 	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	if got.Code != "method_not_allowed" {
 		t.Errorf("code = %q, want method_not_allowed", got.Code)
+	}
+}
+
+func TestDecodeBody_rejectsTrailingData(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"second json value", `{"a":1}{"b":2}`},
+		{"trailing junk", `{"a":1} junk`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(tc.body))
+			var p payload
+			if webhttp.DecodeBody(rr, req, &p, "exactly one value") {
+				t.Error("DecodeBody = true, want false for trailing data after the first value")
+			}
+			if rr.Code != http.StatusBadRequest {
+				t.Errorf("code = %d, want 400", rr.Code)
+			}
+			var got webhttp.ErrorResponse
+			if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if got.Code != "bad_request" || got.Error != "exactly one value" {
+				t.Errorf("body = %+v, want code=bad_request error='exactly one value'", got)
+			}
+		})
 	}
 }
 

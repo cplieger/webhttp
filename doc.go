@@ -4,8 +4,10 @@
 // It bundles the pieces almost every server ends up hand-rolling:
 //
 //   - request-id injection plus one-line access logging (RequestLogger),
-//   - a flush/hijack-safe status recorder that stays transparent to
-//     http.ResponseController (StatusRecorder),
+//   - a status recorder that stays transparent to http.ResponseController and
+//     also implements http.Flusher/http.Hijacker/io.ReaderFrom passthroughs, so
+//     both ResponseController-based and direct-type-assertion callers (plus the
+//     sendfile fast path) keep working (StatusRecorder),
 //   - JSON response and error helpers (WriteJSON, WriteJSONStatus, Ok,
 //     WriteError),
 //   - request-prelude helpers for body limiting, method gating, and JSON

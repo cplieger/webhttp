@@ -3,6 +3,7 @@ package webhttp
 import (
 	"context"
 	"errors"
+	"log"
 	"net"
 	"net/http"
 	"time"
@@ -48,11 +49,25 @@ func WithMaxHeaderBytes(n int) ServerOption {
 	return func(s *http.Server) { s.MaxHeaderBytes = n }
 }
 
+// WithErrorLog sets http.Server.ErrorLog so connection-level errors go to the
+// caller's logger instead of the standard logger. Wire it to slog with
+// slog.NewLogLogger(handler, slog.LevelError).
+func WithErrorLog(l *log.Logger) ServerOption { return func(s *http.Server) { s.ErrorLog = l } }
+
 // NewServer builds an *http.Server for handler with streaming-safe defaults:
 // ReadHeaderTimeout 10s (a slowloris guard), IdleTimeout 120s, MaxHeaderBytes
 // 1 MiB, and ReadTimeout/WriteTimeout left unset (0) so SSE, WebSocket, and
 // other long-lived responses work out of the box. Options override the
 // defaults.
+//
+// Because ReadTimeout and WriteTimeout are unset by default, only header
+// reading is time-bounded (by ReadHeaderTimeout); a slow request BODY is not.
+// A non-streaming handler should add WithReadTimeout to bound slowloris-style
+// slow bodies. A streaming handler, which cannot use a whole-request timeout,
+// should instead apply per-request deadlines via
+// http.ResponseController.SetReadDeadline/SetWriteDeadline. Note that
+// MaxBytesReader (see LimitBody) bounds body SIZE, not the time taken to send
+// it.
 func NewServer(handler http.Handler, opts ...ServerOption) *http.Server {
 	srv := &http.Server{
 		Handler:           handler,
@@ -121,12 +136,13 @@ func Run(ctx context.Context, srv *http.Server, ln net.Listener, onShutdown func
 	case <-ctx.Done():
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), c.shutdownGrace)
+	deadline := time.Now().Add(c.shutdownGrace)
+	shutdownCtx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	shutdownErr := srv.Shutdown(shutdownCtx)
 
 	if onShutdown != nil {
-		teardownCtx, teardownCancel := context.WithTimeout(context.Background(), c.shutdownGrace)
+		teardownCtx, teardownCancel := context.WithDeadline(context.Background(), deadline)
 		defer teardownCancel()
 		onShutdown(teardownCtx)
 	}

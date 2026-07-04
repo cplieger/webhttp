@@ -71,6 +71,7 @@ func RequestIDFromContext(ctx context.Context) string {
 type logConfig struct {
 	logger       *slog.Logger
 	skipPaths    map[string]struct{}
+	skipFunc     func(*http.Request) bool
 	recordMetric func(method, path string, status int, d time.Duration)
 }
 
@@ -83,11 +84,13 @@ func WithLogger(l *slog.Logger) LogOption {
 	return func(c *logConfig) { c.logger = l }
 }
 
-// WithSkipPaths marks request paths that should pass through WITHOUT an
-// access-log line. Use it for long-lived streams (SSE, WebSocket) whose single
-// open-forever request would otherwise emit one misleading high-latency line at
-// close. The request id is still minted, echoed, and threaded into the context
-// for skipped paths.
+// WithSkipPaths marks exact request paths (compared against r.URL.Path) that
+// should pass through WITHOUT an access-log line AND without a metric hook. Use
+// it for long-lived streams (SSE, WebSocket) whose single open-forever request
+// would otherwise emit one misleading high-latency line and a synthetic status
+// at close. The request id is still minted, echoed, and threaded into the
+// context for skipped paths. Because the match is exact, streaming routes with
+// path parameters (e.g. "/ws/{id}") need WithSkipFunc instead.
 func WithSkipPaths(paths ...string) LogOption {
 	return func(c *logConfig) {
 		if c.skipPaths == nil {
@@ -99,11 +102,21 @@ func WithSkipPaths(paths ...string) LogOption {
 	}
 }
 
-// WithRecordMetric registers a hook invoked once per request with the final
-// method, path, status, and latency. It fires for both logged and skipped
-// paths, so a metrics pipeline stays complete even where access logging is
-// suppressed. Because a skipped path is served through the raw writer (no
-// status recorder), its status is reported as http.StatusOK.
+// WithSkipFunc registers a predicate; when it returns true for a request, that
+// request is passed through WITHOUT an access-log line or metric (like a
+// WithSkipPaths match), while the request id is still minted, echoed, and
+// threaded. Use it for streaming routes with path parameters (e.g. "/ws/{id}")
+// that an exact WithSkipPaths match cannot cover.
+func WithSkipFunc(fn func(*http.Request) bool) LogOption {
+	return func(c *logConfig) { c.skipFunc = fn }
+}
+
+// WithRecordMetric registers a hook invoked once per logged request with the
+// final method, path, status, and latency. It fires from a deferred call, so a
+// panicking handler is still recorded. Requests skipped via WithSkipPaths or
+// WithSkipFunc are excluded from the hook as well as from access logging: a
+// stream's open-to-close duration paired with a synthetic status is misleading,
+// which is the whole reason the path is skipped.
 func WithRecordMetric(fn func(method, path string, status int, d time.Duration)) LogOption {
 	return func(c *logConfig) { c.recordMetric = fn }
 }
@@ -121,9 +134,13 @@ func WithRecordMetric(fn func(method, path string, status int, d time.Duration))
 // inbound HeaderRequestID is reused when it satisfies ValidRequestID; otherwise
 // a new id is minted with NewRequestID.
 //
-// Paths registered with WithSkipPaths still get an id minted, echoed, and
-// threaded, but are served through the raw writer with no recorder and no log
-// line. A WithRecordMetric hook, if set, still fires for them.
+// A request matched by WithSkipPaths or WithSkipFunc still gets an id minted,
+// echoed, and threaded, but is served through the raw writer with no recorder,
+// no access-log line, and no metric hook.
+//
+// The access-log line and metric hook are emitted from a deferred call, so a
+// handler that panics is still logged (the status shows the recorded value)
+// before the panic continues up the stack to net/http.
 func RequestLogger(next http.Handler, opts ...LogOption) http.Handler {
 	c := &logConfig{}
 	for _, o := range opts {
@@ -147,26 +164,26 @@ func RequestLogger(next http.Handler, opts ...LogOption) http.Handler {
 
 		path := r.URL.Path
 
-		if _, skip := c.skipPaths[path]; skip {
+		_, skipPath := c.skipPaths[path]
+		if skipPath || (c.skipFunc != nil && c.skipFunc(r)) {
 			next.ServeHTTP(w, r)
-			if c.recordMetric != nil {
-				c.recordMetric(r.Method, path, http.StatusOK, time.Since(start))
-			}
 			return
 		}
 
 		rec := NewStatusRecorder(w)
+		defer func() {
+			d := time.Since(start)
+			c.logger.Info("http",
+				"method", r.Method,
+				"path", path,
+				"status", rec.Status(),
+				"duration_ms", d.Milliseconds(),
+				"request_id", id,
+			)
+			if c.recordMetric != nil {
+				c.recordMetric(r.Method, path, rec.Status(), d)
+			}
+		}()
 		next.ServeHTTP(rec, r)
-
-		c.logger.Info("http",
-			"method", r.Method,
-			"path", path,
-			"status", rec.Status(),
-			"duration_ms", time.Since(start).Milliseconds(),
-			"request_id", id,
-		)
-		if c.recordMetric != nil {
-			c.recordMetric(r.Method, path, rec.Status(), time.Since(start))
-		}
 	})
 }

@@ -32,6 +32,15 @@ type ReadinessChecker interface {
 
 var _ ReadinessChecker = (*Ready)(nil)
 
+// readinessResponse is the JSON body ReadinessHandler writes. A struct (rather
+// than a map) fixes the key order to {"status":…,"reason":…}: encoding/json
+// sorts map keys alphabetically, which would otherwise emit
+// {"reason":…,"status":…}. Reason is omitted when empty.
+type readinessResponse struct {
+	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
+}
+
 // ReadinessHandler returns a handler that reports serving state as JSON: 200
 // with {"status":"ok"} when c reports ready, otherwise 503 with
 // {"status":"unready","reason":"starting up or shutting down"}.
@@ -45,12 +54,12 @@ var _ ReadinessChecker = (*Ready)(nil)
 func ReadinessHandler(c ReadinessChecker) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		if c.Ready() {
-			WriteJSONStatus(w, http.StatusOK, map[string]string{"status": "ok"})
+			WriteJSONStatus(w, http.StatusOK, readinessResponse{Status: "ok"})
 			return
 		}
-		WriteJSONStatus(w, http.StatusServiceUnavailable, map[string]string{
-			"status": "unready",
-			"reason": "starting up or shutting down",
+		WriteJSONStatus(w, http.StatusServiceUnavailable, readinessResponse{
+			Status: "unready",
+			Reason: "starting up or shutting down",
 		})
 	}
 }
