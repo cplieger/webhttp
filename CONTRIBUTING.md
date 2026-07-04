@@ -51,10 +51,17 @@ A few properties are load-bearing. Keep them when you change the code.
   `Recoverer` must re-panic `http.ErrAbortHandler` untouched (the net/http
   silent-abort contract) and is documented to sit inside `Logging` so a
   recovered request records its 500 before the deferred access line runs.
-- **`ClientIP` trusts forwarded headers only from a trusted peer.** With no
-  trusted ranges it returns the `RemoteAddr` host and ignores
-  `X-Forwarded-For`/`X-Real-IP`; those are honored only when the direct peer is
-  inside a caller-supplied trusted range. The library hardcodes no CIDR.
+- **`ClientIP` trusts `X-Forwarded-For` only from a trusted peer, and walks it
+  right-to-left.** With no trusted ranges (or an untrusted direct peer) it
+  returns the `RemoteAddr` host and ignores `X-Forwarded-For`. Only when the
+  direct peer is inside a caller-supplied trusted range is the header consulted,
+  and then it is walked from the right, skipping trusted-proxy hops, down to the
+  first untrusted entry (the client). That is the correct reading when a proxy
+  appends the peer it saw (Caddy and most reverse proxies), which makes the
+  leftmost entry the attacker-controlled value the client sent; the trusted set
+  must therefore contain every proxy hop. `X-Real-IP` is deliberately not
+  consulted — it is client-settable and not overwritten by Caddy, so it would be
+  a spoof vector. The library hardcodes no CIDR.
 - **`SecurityHeaders` never builds a CSP.** A Content-Security-Policy is
   application-owned; the middleware only sets what `WithCSP` is given. HSTS stays
   off unless `WithHSTS` is passed.

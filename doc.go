@@ -12,7 +12,7 @@
 //     recoverer (Recoverer), baseline response security headers
 //     (SecurityHeaders), access logging as middleware (Logging), and a JSON
 //     per-route timeout (RouteTimeout), plus a spoof-aware client-IP resolver
-//     (ClientIP),
+//     that reads X-Forwarded-For only from trusted proxy hops (ClientIP),
 //   - JSON response and error helpers (WriteJSON, WriteJSONStatus, Ok,
 //     WriteError),
 //   - request-prelude helpers for body limiting, method gating, and JSON

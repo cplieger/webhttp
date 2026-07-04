@@ -236,6 +236,62 @@ func TestRecoverer_insideLoggingLogsStatus500(t *testing.T) {
 	}
 }
 
+func TestRecoverer_committedResponseNotDoubleWritten(t *testing.T) {
+	logCap := &captureHandler{}
+	// A handler that commits a 200 with a partial body and then panics. The
+	// recoverer must not write a second status or body onto the already-committed
+	// response (which would corrupt the body and, under an outer Logging, mislog
+	// the status), but it must still log the panic.
+	panicky := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("partial"))
+		panic("boom after commit")
+	})
+	h := webhttp.Recoverer(webhttp.WithRecoverLogger(slog.New(logCap)))(panicky)
+
+	// Observe the response through a StatusRecorder so the recorded status can be
+	// asserted; Recoverer detects its Wrote() accessor and reuses it rather than
+	// double-wrapping.
+	rec := webhttp.NewStatusRecorder(httptest.NewRecorder())
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+
+	// The panic must not escape Recoverer.
+	func() {
+		defer func() {
+			if v := recover(); v != nil {
+				t.Fatalf("panic escaped Recoverer: %v", v)
+			}
+		}()
+		h.ServeHTTP(rec, req)
+	}()
+
+	if rec.Status() != http.StatusOK {
+		t.Errorf("recorded status = %d, want 200 (a committed response must not be overwritten)", rec.Status())
+	}
+	inner, ok := rec.Unwrap().(*httptest.ResponseRecorder)
+	if !ok {
+		t.Fatalf("Unwrap() = %T, want *httptest.ResponseRecorder", rec.Unwrap())
+	}
+	if inner.Code != http.StatusOK {
+		t.Errorf("underlying status = %d, want 200 (no second WriteHeader)", inner.Code)
+	}
+	if body := inner.Body.String(); body != "partial" {
+		t.Errorf("body = %q, want %q (no 500 body appended to a committed response)", body, "partial")
+	}
+
+	// The panic is still logged even though the 500 body was skipped.
+	recs := logCap.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("got %d log records, want exactly 1 (the recovered panic)", len(recs))
+	}
+	if recs[0].Level != slog.LevelError {
+		t.Errorf("log level = %v, want Error", recs[0].Level)
+	}
+	if m := attrsOf(recs[0]); m["panic"] != "boom after commit" {
+		t.Errorf("panic attr = %v, want 'boom after commit'", m["panic"])
+	}
+}
+
 func TestSecurityHeaders_defaults(t *testing.T) {
 	h := webhttp.SecurityHeaders()(okHandler())
 	rr := serve(h, http.MethodGet, "/", nil)
@@ -276,7 +332,7 @@ func TestSecurityHeaders_optionsOverride(t *testing.T) {
 	rr := serve(h, http.MethodGet, "/", nil)
 
 	want := map[string]string{
-		"X-Content-Type-Options":     "nosniff", // always on, not overridable
+		"X-Content-Type-Options":     "nosniff", // set by default (a handler could still override it)
 		"Content-Security-Policy":    "default-src 'self'",
 		"X-Frame-Options":            "SAMEORIGIN",
 		"Referrer-Policy":            "no-referrer",
@@ -415,14 +471,37 @@ func TestClientIP(t *testing.T) {
 		trusted    []*net.IPNet
 		want       string
 	}{
+		// (a) No trusted proxies: the socket peer is the only trustworthy source,
+		// returned even when an X-Forwarded-For header is present. A client
+		// cannot spoof its way past the default.
 		{"no trusted set returns peer, XFF ignored", "203.0.113.5:1234", "1.2.3.4", "", nil, "203.0.113.5"},
-		{"trusted peer honors leftmost XFF", "10.0.0.1:9999", "1.2.3.4, 10.0.0.1", "", trusted("10.0.0.0/8"), "1.2.3.4"},
-		{"trusted peer trims XFF whitespace", "10.0.0.1:9999", "  1.2.3.4 , 10.0.0.1", "", trusted("10.0.0.0/8"), "1.2.3.4"},
-		{"trusted peer falls back to X-Real-IP", "10.0.0.1:9999", "", "5.6.7.8", trusted("10.0.0.0/8"), "5.6.7.8"},
-		{"trusted peer, malformed XFF, uses X-Real-IP", "10.0.0.1:9999", "garbage", "9.9.9.9", trusted("10.0.0.0/8"), "9.9.9.9"},
+		// (b) Trusted single-hop proxy: the client sent a spoofed leftmost entry
+		// and the proxy appended the real peer on the right. Walking right-to-left,
+		// the first untrusted entry (the appended real client) wins and the spoof
+		// is ignored.
+		{"trusted peer returns real right client not spoofed left", "10.0.0.1:9999", "1.2.3.4, 198.51.100.9", "", trusted("10.0.0.0/8"), "198.51.100.9"},
+		// Whitespace around entries is trimmed; the appended trusted hop on the
+		// right is skipped and the real client returned.
+		{"trusted peer trims XFF whitespace and skips trusted hop", "10.0.0.1:9999", "  1.2.3.4 , 10.0.0.1", "", trusted("10.0.0.0/8"), "1.2.3.4"},
+		// (c) Multi-hop trusted chain: the two rightmost entries are our own
+		// proxies and are skipped; the leftmost untrusted entry is the client.
+		{"trusted multi-hop skips trusted proxies to client", "10.0.0.1:9999", "1.2.3.4, 10.0.0.2, 10.0.0.3", "", trusted("10.0.0.0/8"), "1.2.3.4"},
+		// A malformed entry at the right boundary stops the walk: nothing further
+		// left can be trusted, so the peer is returned.
+		{"trusted peer, malformed XFF boundary, returns peer", "10.0.0.1:9999", "garbage", "", trusted("10.0.0.0/8"), "10.0.0.1"},
+		// Trusted peer but no forwarded header: the peer is the client.
 		{"trusted peer, no forwarded header, uses peer", "10.0.0.1:9999", "", "", trusted("10.0.0.0/8"), "10.0.0.1"},
-		{"untrusted peer ignores XFF", "203.0.113.5:1234", "1.2.3.4", "9.9.9.9", trusted("10.0.0.0/8"), "203.0.113.5"},
+		// X-Real-IP is no longer consulted (removed as a client-settable spoof
+		// vector): a trusted peer with only X-Real-IP set still returns the peer.
+		{"trusted peer ignores removed X-Real-IP", "10.0.0.1:9999", "", "5.6.7.8", trusted("10.0.0.0/8"), "10.0.0.1"},
+		// (d) Untrusted direct peer: forwarded headers are attacker-controlled and
+		// ignored, including a spoofed XFF and X-Real-IP.
+		{"untrusted peer ignores XFF and X-Real-IP", "203.0.113.5:1234", "1.2.3.4", "9.9.9.9", trusted("10.0.0.0/8"), "203.0.113.5"},
+		// (e) IPv6 trusted peer parsed from a bracketed host:port; the untrusted
+		// XFF entry is the client.
 		{"IPv6 trusted peer honors XFF", "[::1]:8080", "2001:db8::1", "", trusted("::1/128"), "2001:db8::1"},
+		// (e) Malformed RemoteAddr with no port is used verbatim; an unparseable
+		// peer can never be trusted, so XFF is ignored with or without a set.
 		{"malformed RemoteAddr, no trusted set", "not-an-addr", "1.2.3.4", "", nil, "not-an-addr"},
 		{"malformed RemoteAddr with trusted set", "weird", "1.2.3.4", "", trusted("10.0.0.0/8"), "weird"},
 	}
@@ -528,6 +607,58 @@ func TestRouteTimeout_fastHandler503KeepsItsContentType(t *testing.T) {
 	}
 	if rr.Body.String() != "<html>down</html>" {
 		t.Errorf("body = %q, want the handler's own body", rr.Body.String())
+	}
+}
+
+func TestRouteTimeout_fastHandler503WithoutContentTypeIsRelabeled(t *testing.T) {
+	// A handler that finishes in time but emits a 503 with NO Content-Type is
+	// indistinguishable from a genuine timeout envelope, so the wrapper relabels
+	// it application/json (+ nosniff). This documents and locks in that behavior;
+	// a handler that wants to avoid it must set its own Content-Type (see the
+	// sibling test that emits text/html).
+	h := webhttp.RouteTimeout(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("nope"))
+	}), 5*time.Second, "too slow")
+
+	rr := serve(h, http.MethodGet, "/", nil)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", rr.Code)
+	}
+	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json (an unlabeled 503 is relabeled)", ct)
+	}
+	if ns := rr.Header().Get("X-Content-Type-Options"); ns != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q, want nosniff", ns)
+	}
+	// Only the headers are added; the handler's own body bytes are unchanged.
+	if rr.Body.String() != "nope" {
+		t.Errorf("body = %q, want the handler's own body %q", rr.Body.String(), "nope")
+	}
+}
+
+func TestRouteTimeout_nonPositiveDurationReturnsHandlerUnwrapped(t *testing.T) {
+	// A non-positive timeout disables the wrapper: the original handler is
+	// returned unchanged, so its response passes through untouched (no JSON
+	// relabel, no 503, no buffering).
+	base := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("direct"))
+	})
+	for _, d := range []time.Duration{0, -time.Second} {
+		h := webhttp.RouteTimeout(base, d, "unused")
+		rr := serve(h, http.MethodGet, "/", nil)
+		if rr.Code != http.StatusOK {
+			t.Errorf("d=%v: status = %d, want 200", d, rr.Code)
+		}
+		if ct := rr.Header().Get("Content-Type"); ct != "text/plain" {
+			t.Errorf("d=%v: Content-Type = %q, want text/plain (handler returned unwrapped)", d, ct)
+		}
+		if rr.Body.String() != "direct" {
+			t.Errorf("d=%v: body = %q, want direct", d, rr.Body.String())
+		}
 	}
 }
 
