@@ -60,35 +60,3 @@ func DecodeBodyOptional(w http.ResponseWriter, r *http.Request, v any) {
 	LimitBody(w, r, MaxJSONBody)
 	_ = json.NewDecoder(r.Body).Decode(v)
 }
-
-// LimitedWriter wraps an io.Writer and caps the total bytes forwarded at N.
-// Once N bytes have been written, further bytes are silently dropped; every
-// Write still reports its full input length and a nil error, so the cap is
-// transparent to the caller. An N of zero or less drops everything. It is the
-// write-side counterpart to io.LimitReader, useful for bounding how much of a
-// stream is mirrored into a buffer.
-type LimitedWriter struct {
-	// W is the underlying writer that receives the un-dropped bytes.
-	W io.Writer
-	// N is the remaining byte budget; it decreases as bytes are forwarded.
-	N int64
-}
-
-// Write forwards up to the remaining N bytes of p to the underlying writer and
-// silently drops the rest, reporting len(p) written so the cap is transparent.
-// If the underlying writer errors, that error and its short count are returned.
-func (lw *LimitedWriter) Write(p []byte) (int, error) {
-	if lw.N <= 0 {
-		return len(p), nil
-	}
-	total := len(p)
-	if int64(total) > lw.N {
-		p = p[:lw.N]
-	}
-	n, err := lw.W.Write(p)
-	lw.N -= int64(n)
-	if err != nil {
-		return n, err
-	}
-	return total, nil
-}

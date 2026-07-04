@@ -8,7 +8,7 @@
 
 > Resilient server-side HTTP plumbing for Go
 
-A standalone Go library bundling the server-side pieces almost every service ends up hand-rolling: request-id injection with one-line access logging, a flush/hijack-safe status recorder, JSON response and error helpers, request-prelude helpers, an HTTP readiness gate, and a graceful server bootstrap. Standard-library only, no external runtime dependencies.
+A standalone Go library bundling the server-side pieces almost every service ends up hand-rolling: request-id injection with one-line access logging, a flush/hijack-safe status recorder, a composable middleware set (panic recovery, security headers, per-route JSON timeout, and a `Chain` combinator) with a spoof-aware client-IP resolver, JSON response and error helpers, request-prelude helpers, an HTTP readiness gate, and a graceful server bootstrap. Standard-library only, no external runtime dependencies.
 
 webhttp is the inbound-server counterpart to [httpx](https://github.com/cplieger/httpx): httpx makes resilient requests going _out_, webhttp handles the requests coming _in_. The two are complementary and share no code. It ships the mechanism only; each application layers its own route table, error taxonomy, and named helpers on top.
 
@@ -50,14 +50,18 @@ func main() {
 		webhttp.WriteJSONStatus(w, http.StatusCreated, body)
 	})
 
-	// RequestLogger mints/echoes a request id, threads it through the context,
-	// and logs one line per request. Skip long-lived streams so they don't emit
-	// a misleading high-latency line at close.
-	handler := webhttp.RequestLogger(mux,
-		webhttp.WithSkipPaths("/events"),
-		webhttp.WithRecordMetric(func(method, path string, status int, d time.Duration) {
-			// feed your metrics pipeline here
-		}),
+	// Compose middleware with Chain: the first listed is the outermost wrapper.
+	// Logging outermost means a panic recovered below it is logged as its 500,
+	// not a misleading 200.
+	handler := webhttp.Chain(mux,
+		webhttp.Logging(
+			webhttp.WithSkipPaths("/events"), // don't log long-lived streams
+			webhttp.WithRecordMetric(func(method, path string, status int, d time.Duration) {
+				// feed your metrics pipeline here
+			}),
+		),
+		webhttp.Recoverer(),
+		webhttp.SecurityHeaders(),
 	)
 
 	// Streaming-safe defaults: ReadHeaderTimeout + IdleTimeout set,
@@ -83,6 +87,29 @@ func main() {
 ```
 
 ## API
+
+### Middleware
+
+All middleware share the standard `func(http.Handler) http.Handler` shape (the `Middleware` type alias) and compose with `Chain`.
+
+- `Middleware` — alias for `func(http.Handler) http.Handler`
+- `Chain(h, mw...) http.Handler` — wraps `h`; the **first** middleware listed is the **outermost** wrapper (first to see the request, last to touch the response), so `Chain(h, A, B, C)` is `A(B(C(h)))`. A nil entry is skipped.
+- `Recoverer(opts...) Middleware` — recovers a downstream panic, logs it at `Error` with the stack and request id, fires an optional hook, then writes `WriteError(w, r, 500, "internal_error", "internal server error")`. Re-panics `http.ErrAbortHandler` per the net/http contract. Options: `WithRecoverLogger(l)`, `WithPanicHook(fn)`
+- `SecurityHeaders(opts...) Middleware` — sets baseline response headers before the next handler. Always `X-Content-Type-Options: nosniff`; defaults `X-Frame-Options: DENY` and `Referrer-Policy: strict-origin-when-cross-origin`. Options: `WithCSP`, `WithFrameOptions`, `WithReferrerPolicy`, `WithPermissionsPolicy`, `WithCOOP`, `WithHSTS(maxAge, includeSubDomains, preload)`
+- `Logging(opts...) Middleware` — `RequestLogger` in `Chain`-composable form; takes the same `LogOption` values. `RequestLogger(next, opts...)` stays available for direct use
+- `RouteTimeout(h, d, msg) http.Handler` — wraps `http.TimeoutHandler`; on timeout emits a 503 JSON `ErrorResponse` (`code: "timeout"`) as `application/json` instead of the plain-text/HTML default
+
+Put `Recoverer` **inside** `Logging` (logging outermost, e.g. `Chain(mux, Logging(), Recoverer())`) so a panicked request is logged as its 500 rather than the `StatusRecorder`'s default 200. If `Recoverer` sits outside the logger, the access line is written during the panic unwind and records 200 even though the client still receives the 500.
+
+`SecurityHeaders` does **not** build a Content-Security-Policy for you: a CSP is application-specific (it must match the app's own script/style sources), so pass the exact policy via `WithCSP`. Any header default can be omitted by passing an empty string (e.g. `WithFrameOptions("")` when a CSP `frame-ancestors` supersedes it). **HSTS is off by default**; enable it with `WithHSTS` only for a service reached exclusively over HTTPS, since the header makes browsers refuse plain-HTTP and untrusted-cert connections for the whole max-age.
+
+`RouteTimeout` **cannot wrap streaming or hijacking handlers**: `http.TimeoutHandler` buffers the entire response so it can discard it on timeout, so SSE, WebSocket upgrades, and flushing responses do not work through it. Use per-request deadlines (`http.ResponseController.SetWriteDeadline`) for those. Because the body is produced outside request scope, the timeout envelope carries no `request_id`.
+
+### Client IP
+
+- `ClientIP(r, trusted...) string` — the best-effort client IP
+
+With **no** trusted ranges, forwarded headers are ignored entirely and the host part of `r.RemoteAddr` (the TCP peer, unspoofable at this layer) is returned. With one or more trusted ranges, the leftmost `X-Forwarded-For` entry (then `X-Real-IP`, then the peer) is honored **only** when `r.RemoteAddr` falls inside a trusted range, meaning a proxy you control set the header; an untrusted peer's forwarded headers are ignored. The caller supplies the trusted CIDRs (typically the reverse proxy's range); the library hardcodes none.
 
 ### Status recorder
 
@@ -124,7 +151,6 @@ An inbound `X-Request-ID` is reused when it satisfies `ValidRequestID`, otherwis
 - `RequireMethod(w, r, method) bool` — 405 + `false` on mismatch
 - `DecodeBody(w, r, v, errMsg) bool` — cap + decode; 400 + `false` on failure
 - `DecodeBodyOptional(w, r, v)` — cap + decode, error ignored
-- `LimitedWriter{W, N}` — caps total bytes forwarded, silently dropping the rest
 
 ### Readiness
 
