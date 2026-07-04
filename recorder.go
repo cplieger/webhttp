@@ -56,6 +56,14 @@ func (s *StatusRecorder) Status() int {
 	return s.status
 }
 
+// Wrote reports whether the response has been committed, i.e. WriteHeader or
+// the first Write (or ReadFrom) has run. Middleware such as Recoverer consults
+// it to avoid writing a second status and body onto a response a handler has
+// already started, which would corrupt the body and mislabel the status.
+func (s *StatusRecorder) Wrote() bool {
+	return s.wroteHeader
+}
+
 // Unwrap returns the wrapped http.ResponseWriter. http.NewResponseController
 // walks Unwrap to reach a Flusher, Hijacker, or other optional interface
 // implemented by the underlying writer, so streaming still works through the
