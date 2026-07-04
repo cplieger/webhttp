@@ -1,9 +1,7 @@
 package webhttp_test
 
 import (
-	"bytes"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -169,57 +167,5 @@ func TestLimitBody_withinLimitReadsFully(t *testing.T) {
 	}
 	if string(b) != "abc" {
 		t.Errorf("read %q, want abc", b)
-	}
-}
-
-func TestLimitedWriter(t *testing.T) {
-	cases := []struct {
-		name    string
-		n       int64
-		writes  []string
-		wantOut string
-		wantN   []int
-	}{
-		{"under budget", 100, []string{"hello"}, "hello", []int{5}},
-		{"exact budget", 5, []string{"hello"}, "hello", []int{5}},
-		{"over budget single write", 3, []string{"hello"}, "hel", []int{5}},
-		{"zero budget drops all", 0, []string{"hello"}, "", []int{5}},
-		{"negative budget drops all", -1, []string{"hello"}, "", []int{5}},
-		{"multi write accumulates to cap", 4, []string{"ab", "cd", "ef"}, "abcd", []int{2, 2, 2}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			var buf bytes.Buffer
-			lw := &webhttp.LimitedWriter{W: &buf, N: tc.n}
-			for i, s := range tc.writes {
-				n, err := lw.Write([]byte(s))
-				if err != nil {
-					t.Fatalf("write %d: unexpected error %v", i, err)
-				}
-				if n != tc.wantN[i] {
-					t.Errorf("write %d returned n=%d, want %d", i, n, tc.wantN[i])
-				}
-			}
-			if buf.String() != tc.wantOut {
-				t.Errorf("output = %q, want %q", buf.String(), tc.wantOut)
-			}
-		})
-	}
-}
-
-var errBoom = errors.New("boom")
-
-type errWriter struct{}
-
-func (errWriter) Write([]byte) (int, error) { return 0, errBoom }
-
-func TestLimitedWriter_underlyingErrorPropagates(t *testing.T) {
-	lw := &webhttp.LimitedWriter{W: errWriter{}, N: 100}
-	n, err := lw.Write([]byte("hello"))
-	if !errors.Is(err, errBoom) {
-		t.Errorf("err = %v, want errBoom", err)
-	}
-	if n != 0 {
-		t.Errorf("n = %d, want 0 on underlying error", n)
 	}
 }

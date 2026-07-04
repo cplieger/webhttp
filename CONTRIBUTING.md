@@ -12,6 +12,8 @@ few small, independent pieces:
 
 - `StatusRecorder` — a status-capturing `http.ResponseWriter` wrapper,
 - `RequestLogger` — request-id middleware with one-line access logging,
+- a composable middleware set — `Chain`, `Recoverer`, `SecurityHeaders`,
+  `Logging`, and `RouteTimeout`, plus the `ClientIP` resolver,
 - JSON helpers — `WriteJSON`, `WriteJSONStatus`, `Ok`, `WriteError`,
 - request-prelude helpers — `LimitBody`, `RequireMethod`, `DecodeBody`,
 - a readiness gate — `Ready`, `ReadinessHandler`,
@@ -44,8 +46,20 @@ A few properties are load-bearing. Keep them when you change the code.
   real serve error takes precedence over a shutdown error in the return value.
 - **`WriteError` is nil-safe.** It must not panic when `r` is nil; the
   `RequestID` field simply stays empty.
-- **Functional options skip nil.** Every `...Option` loop ignores a nil option
-  so callers can pass conditionally-built options.
+- **`Chain` order and `Recoverer` placement.** `Chain` applies middleware so the
+  first listed is the outermost wrapper (`Chain(h, A, B, C)` is `A(B(C(h)))`).
+  `Recoverer` must re-panic `http.ErrAbortHandler` untouched (the net/http
+  silent-abort contract) and is documented to sit inside `Logging` so a
+  recovered request records its 500 before the deferred access line runs.
+- **`ClientIP` trusts forwarded headers only from a trusted peer.** With no
+  trusted ranges it returns the `RemoteAddr` host and ignores
+  `X-Forwarded-For`/`X-Real-IP`; those are honored only when the direct peer is
+  inside a caller-supplied trusted range. The library hardcodes no CIDR.
+- **`SecurityHeaders` never builds a CSP.** A Content-Security-Policy is
+  application-owned; the middleware only sets what `WithCSP` is given. HSTS stays
+  off unless `WithHSTS` is passed.
+- **Functional options skip nil.** Every `...Option` loop, and `Chain` itself,
+  ignores a nil entry so callers can pass conditionally-built values.
 
 ## Local development
 
@@ -96,10 +110,15 @@ Tests live beside the code, one file per source unit:
 - `reqlog_test.go` — the `ValidRequestID` table, `NewRequestID`, and the
   `RequestLogger` behaviors (mint, reuse, replace, echo, thread, skip-path,
   metric hook, captured status).
+- `middleware_test.go` — `Chain` ordering (first = outermost, nil-skip),
+  `Recoverer` (panic → 500 JSON + log, `ErrAbortHandler` re-panic, hook, and the
+  status-500 access line when inside `Logging`), `SecurityHeaders` (defaults,
+  overrides, empty-omit, the HSTS table), `Logging` composing in a `Chain`,
+  `ClientIP` (the trust model), and `RouteTimeout` (fast pass, slow → 503 JSON).
 - `json_test.go` — JSON headers, `WriteJSON`/`WriteJSONStatus`/`Ok`, the
   encode-failure `Warn`, and `WriteError` including the nil-request case.
-- `prelude_test.go` — `RequireMethod`, `DecodeBody` (200 / 405 / 400 / oversize)
-  and `LimitedWriter` caps.
+- `prelude_test.go` — `RequireMethod`, `DecodeBody` (200 / 405 / 400 / oversize),
+  and the request body-limit helpers.
 - `readiness_test.go` — `Ready` transitions and the 200/503 handler bodies.
 - `server_test.go` — `NewServer` defaults and overrides, and `Run`'s
   serve/graceful-shutdown/onShutdown paths.
