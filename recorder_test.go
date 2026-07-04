@@ -2,9 +2,11 @@ package webhttp_test
 
 import (
 	"bufio"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/cplieger/webhttp"
@@ -116,5 +118,93 @@ func TestStatusRecorder_hijackReachesCustomHijackerThroughUnwrap(t *testing.T) {
 	}
 	if !hw.hijacked {
 		t.Error("custom Hijack was not reached through the Unwrap chain")
+	}
+}
+
+func TestStatusRecorder_satisfiesFlusherAndHijackerDirectly(t *testing.T) {
+	rec := webhttp.NewStatusRecorder(httptest.NewRecorder())
+	// A direct type assertion is what libraries like gorilla/websocket use
+	// (w.(http.Hijacker)); it must succeed independently of ResponseController.
+	if _, ok := any(rec).(http.Flusher); !ok {
+		t.Error("*StatusRecorder does not satisfy http.Flusher via a direct type assertion")
+	}
+	if _, ok := any(rec).(http.Hijacker); !ok {
+		t.Error("*StatusRecorder does not satisfy http.Hijacker via a direct type assertion")
+	}
+	if _, ok := any(rec).(io.ReaderFrom); !ok {
+		t.Error("*StatusRecorder does not satisfy io.ReaderFrom via a direct type assertion")
+	}
+}
+
+func TestStatusRecorder_directFlushReachesUnderlyingFlusher(t *testing.T) {
+	fw := &flushOnlyWriter{ResponseWriter: httptest.NewRecorder()}
+	rec := webhttp.NewStatusRecorder(fw)
+	rec.Flush() // direct call, not via http.NewResponseController
+	if !fw.flushed {
+		t.Error("direct StatusRecorder.Flush did not reach the underlying flusher")
+	}
+}
+
+func TestStatusRecorder_directHijackReachesUnderlyingHijacker(t *testing.T) {
+	hw := &hijackOnlyWriter{ResponseWriter: httptest.NewRecorder()}
+	rec := webhttp.NewStatusRecorder(hw)
+	if _, _, err := rec.Hijack(); err != nil { // direct call, not via ResponseController
+		t.Fatalf("Hijack: %v", err)
+	}
+	if !hw.hijacked {
+		t.Error("direct StatusRecorder.Hijack did not reach the underlying hijacker")
+	}
+}
+
+// readerFromWriter records ReadFrom calls to prove StatusRecorder.ReadFrom
+// forwards to an underlying io.ReaderFrom (the zero-copy/sendfile fast path).
+type readerFromWriter struct {
+	http.ResponseWriter
+	readFromCalled bool
+}
+
+func (rw *readerFromWriter) ReadFrom(src io.Reader) (int64, error) {
+	rw.readFromCalled = true
+	return io.Copy(rw.ResponseWriter, src)
+}
+
+func TestStatusRecorder_readFromUsesUnderlyingReaderFrom(t *testing.T) {
+	under := &readerFromWriter{ResponseWriter: httptest.NewRecorder()}
+	rec := webhttp.NewStatusRecorder(under)
+	n, err := rec.ReadFrom(strings.NewReader("hello"))
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if n != 5 {
+		t.Errorf("ReadFrom n = %d, want 5", n)
+	}
+	if !under.readFromCalled {
+		t.Error("ReadFrom did not forward to the underlying io.ReaderFrom")
+	}
+	if rec.Status() != http.StatusOK {
+		t.Errorf("Status() = %d, want 200 (ReadFrom implies a written body)", rec.Status())
+	}
+}
+
+// plainWriter is an http.ResponseWriter with no ReadFrom method, so
+// StatusRecorder.ReadFrom must fall back to io.Copy. Because the embedded field
+// is the http.ResponseWriter interface, ReadFrom is not promoted even when the
+// dynamic value has one.
+type plainWriter struct {
+	http.ResponseWriter
+}
+
+func TestStatusRecorder_readFromFallsBackToCopy(t *testing.T) {
+	under := httptest.NewRecorder()
+	rec := webhttp.NewStatusRecorder(&plainWriter{ResponseWriter: under})
+	n, err := rec.ReadFrom(strings.NewReader("world"))
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if n != 5 {
+		t.Errorf("ReadFrom n = %d, want 5", n)
+	}
+	if under.Body.String() != "world" {
+		t.Errorf("underlying body = %q, want world (io.Copy fallback)", under.Body.String())
 	}
 }

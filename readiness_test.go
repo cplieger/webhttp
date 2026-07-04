@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/cplieger/webhttp"
@@ -81,5 +82,31 @@ func TestReadinessHandler_customChecker(t *testing.T) {
 		ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 	if rr.Code != http.StatusOK {
 		t.Errorf("code = %d, want 200 for a ready custom checker", rr.Code)
+	}
+}
+
+func TestReadinessHandler_unreadyBodyKeyOrderIsExact(t *testing.T) {
+	r := &webhttp.Ready{} // zero value: not ready
+	rr := httptest.NewRecorder()
+	webhttp.ReadinessHandler(r).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+
+	// The struct (not a map) fixes the key order to status-before-reason; a map
+	// would serialize alphabetically as reason-before-status.
+	const want = `{"status":"unready","reason":"starting up or shutting down"}`
+	if got := strings.TrimSpace(rr.Body.String()); got != want {
+		t.Errorf("raw 503 body = %q, want %q", got, want)
+	}
+}
+
+func TestReadinessHandler_readyBodyIsExact(t *testing.T) {
+	r := &webhttp.Ready{}
+	r.Set(true)
+	rr := httptest.NewRecorder()
+	webhttp.ReadinessHandler(r).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+
+	// Reason is omitempty, so a ready response carries only the status key.
+	const want = `{"status":"ok"}`
+	if got := strings.TrimSpace(rr.Body.String()); got != want {
+		t.Errorf("raw 200 body = %q, want %q", got, want)
 	}
 }

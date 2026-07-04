@@ -2,6 +2,8 @@ package webhttp_test
 
 import (
 	"context"
+	"io"
+	"log"
 	"net"
 	"net/http"
 	"sync/atomic"
@@ -57,6 +59,14 @@ func TestNewServer_optionsOverride(t *testing.T) {
 	}
 	if srv.MaxHeaderBytes != 512 {
 		t.Errorf("MaxHeaderBytes = %d, want 512", srv.MaxHeaderBytes)
+	}
+}
+
+func TestWithErrorLog_setsServerErrorLog(t *testing.T) {
+	logger := log.New(io.Discard, "", 0)
+	srv := webhttp.NewServer(nil, webhttp.WithErrorLog(logger))
+	if srv.ErrorLog != logger {
+		t.Error("WithErrorLog did not set http.Server.ErrorLog")
 	}
 }
 
@@ -172,5 +182,131 @@ func TestRun_onShutdownNilIsSafe(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after cancellation with nil onShutdown")
+	}
+}
+
+func TestRun_slowOnShutdownStillRunsWithinGrace(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := webhttp.NewServer(okHandler())
+
+	var teardownDone atomic.Bool
+	onShutdown := func(ctx context.Context) {
+		// A teardown that takes real time must still complete: the shared grace
+		// budget gives it room after Shutdown returns.
+		select {
+		case <-time.After(150 * time.Millisecond):
+			teardownDone.Store(true)
+		case <-ctx.Done():
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- webhttp.Run(ctx, srv, ln, onShutdown, webhttp.WithShutdownGrace(2*time.Second))
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Run = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+	if !teardownDone.Load() {
+		t.Error("slow onShutdown did not complete within the shared grace budget")
+	}
+}
+
+func TestRun_holdsRequestOpenAcrossShutdown(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	const (
+		grace    = 2 * time.Second
+		blockFor = 400 * time.Millisecond
+	)
+	started := make(chan struct{})
+	srv := webhttp.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		time.Sleep(blockFor) // remain in-flight so Shutdown must wait for us
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	var (
+		teardownDL    time.Time
+		teardownHasDL bool
+		teardownRan   atomic.Bool
+	)
+	onShutdown := func(ctx context.Context) {
+		teardownDL, teardownHasDL = ctx.Deadline()
+		teardownRan.Store(true)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- webhttp.Run(ctx, srv, ln, onShutdown, webhttp.WithShutdownGrace(grace))
+	}()
+
+	addr := ln.Addr().String()
+	statusCh := make(chan int, 1)
+	go func() {
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Get("http://" + addr + "/")
+		if err != nil {
+			statusCh <- 0
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		statusCh <- resp.StatusCode
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		cancel()
+		t.Fatal("handler never became in-flight")
+	}
+
+	t0 := time.Now()
+	cancel() // request is in-flight; graceful shutdown must let it finish
+
+	var runErr error
+	select {
+	case runErr = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return")
+	}
+	if runErr != nil {
+		t.Errorf("Run = %v, want nil", runErr)
+	}
+
+	select {
+	case code := <-statusCh:
+		if code != http.StatusOK {
+			t.Errorf("in-flight request status = %d, want 200 (held open across shutdown)", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight request never completed")
+	}
+
+	if !teardownRan.Load() || !teardownHasDL {
+		t.Fatal("onShutdown did not run with a deadline")
+	}
+	// One shared budget: the teardown deadline sits ~grace from when shutdown
+	// began (t0), even though Shutdown first spent ~blockFor draining the
+	// in-flight request. A per-phase timeout would push it out to ~grace+blockFor.
+	if span := teardownDL.Sub(t0); span > grace+250*time.Millisecond {
+		t.Errorf("teardown deadline is %v after shutdown start, want ~%v (shared budget, not ~%v)",
+			span, grace, grace+blockFor)
 	}
 }
