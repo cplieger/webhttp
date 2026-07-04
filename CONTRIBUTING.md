@@ -1,0 +1,128 @@
+# Contributing to webhttp
+
+Notes on the public API, the invariants that make the plumbing safe, and the
+test suite that guards them.
+
+## What the library provides
+
+`webhttp` is a standard-library-only Go package of server-side HTTP plumbing.
+It has no external runtime dependencies, and it must stay that way: every
+dependency would be inherited by every consuming service. The package groups a
+few small, independent pieces:
+
+- `StatusRecorder` — a status-capturing `http.ResponseWriter` wrapper,
+- `RequestLogger` — request-id middleware with one-line access logging,
+- JSON helpers — `WriteJSON`, `WriteJSONStatus`, `Ok`, `WriteError`,
+- request-prelude helpers — `LimitBody`, `RequireMethod`, `DecodeBody`,
+- a readiness gate — `Ready`, `ReadinessHandler`,
+- a graceful server bootstrap — `NewServer`, `Run`.
+
+## Invariants to preserve
+
+A few properties are load-bearing. Keep them when you change the code.
+
+- **`StatusRecorder` stays transparent to `http.ResponseController`.** The
+  whole reason the recorder is safe to wrap around streaming handlers is its
+  `Unwrap` method: `http.NewResponseController` walks `Unwrap` to reach the
+  `Flusher` / `Hijacker` on the underlying writer. Never add a method to
+  `StatusRecorder` that shadows an optional `http.ResponseWriter` interface
+  (such as `Flush` or `Hijack`) unless you forward it correctly; doing so would
+  break SSE and WebSocket handlers running behind the middleware. Only the
+  first explicit `WriteHeader` code is recorded, matching net/http semantics.
+- **`ValidRequestID` is the trust boundary for the echoed id.** The id is
+  written back on a response header and into log lines, so it must reject any
+  byte outside `[A-Za-z0-9_-]` and anything longer than 64 chars. That is what
+  stops log-forging newlines and header-splitting content. The `NewRequestID`
+  timestamp fallback must stay inside the same charset (no dot, no colon).
+- **`NewServer` defaults are streaming-safe.** `ReadTimeout` and `WriteTimeout`
+  are deliberately left unset (0) so SSE, WebSocket, and long responses work
+  out of the box; a `WriteTimeout` would cut an in-progress stream. Keep the
+  slowloris guard (`ReadHeaderTimeout`) and the header-size cap.
+- **`Run`'s shutdown ordering.** On context cancellation `Run` calls
+  `srv.Shutdown` with a grace-bounded context, then `onShutdown` with a fresh
+  grace-bounded context, and treats `http.ErrServerClosed` as a clean stop. A
+  real serve error takes precedence over a shutdown error in the return value.
+- **`WriteError` is nil-safe.** It must not panic when `r` is nil; the
+  `RequestID` field simply stays empty.
+- **Functional options skip nil.** Every `...Option` loop ignores a nil option
+  so callers can pass conditionally-built options.
+
+## Local development
+
+The module targets the Go version pinned in `go.mod`.
+
+```sh
+go build ./...
+go test ./...
+go test -race ./...
+go test -cover ./...
+```
+
+### Linting and formatting
+
+Lint config lives in `.golangci.yaml` (golangci-lint v2, synced from
+`cplieger/ci`). Formatting is `gofumpt` with `extra-rules` plus `gci` import
+grouping; `golangci-lint run` reports unformatted files as issues, so format
+before pushing.
+
+```sh
+golangci-lint run
+golangci-lint fmt
+```
+
+### Mutation testing
+
+`.gremlins.yaml` configures [Gremlins](https://gremlins.dev) mutation testing
+(synced from `cplieger/ci`; change it upstream). Run it locally to check that
+new tests actually kill mutants:
+
+```sh
+gremlins unleash .
+```
+
+## Test suite conventions
+
+Tests are **standard library only** — `testing` plus `net/http/httptest`. Do
+not add a third-party test dependency (no `testify`, no `rapid`); it would show
+up in `go.sum` and, for a zero-dependency library, that is a regression. Use
+plain `if got != want { t.Errorf(...) }`, table-driven subtests, and
+`httptest` throughout.
+
+Tests live beside the code, one file per source unit:
+
+- `recorder_test.go` — default-200, record-once, and the `Unwrap` flush/hijack
+  chain (both `httptest.ResponseRecorder` and a custom writer that exposes the
+  optional interface only through `Unwrap`).
+- `reqlog_test.go` — the `ValidRequestID` table, `NewRequestID`, and the
+  `RequestLogger` behaviors (mint, reuse, replace, echo, thread, skip-path,
+  metric hook, captured status).
+- `json_test.go` — JSON headers, `WriteJSON`/`WriteJSONStatus`/`Ok`, the
+  encode-failure `Warn`, and `WriteError` including the nil-request case.
+- `prelude_test.go` — `RequireMethod`, `DecodeBody` (200 / 405 / 400 / oversize)
+  and `LimitedWriter` caps.
+- `readiness_test.go` — `Ready` transitions and the 200/503 handler bodies.
+- `server_test.go` — `NewServer` defaults and overrides, and `Run`'s
+  serve/graceful-shutdown/onShutdown paths.
+- `helpers_test.go` — shared handlers and the capturing `slog.Handler`.
+- `example_test.go` — runnable `Example` functions kept compiling.
+
+Tests that capture `slog` output by swapping `slog.Default()` mutate
+process-global state, so they must run serially (no `t.Parallel()`); prefer
+injecting a logger with `WithLogger` where the API allows it.
+
+## Commits and PRs
+
+Branch from `main`, keep changes focused with tests, and open a PR. This
+account uses [Conventional Commits](https://www.conventionalcommits.org/)
+parsed by git-cliff (`cliff.toml`) to build release notes, so the commit type
+drives the version bump: `feat:`, `fix:`, `sec:`, and
+`chore:`/`docs:`/`refactor:`/`test:` (no release). Write the subject as the
+changelog line a consumer would read.
+
+## Conduct & security
+
+By participating you agree to the org-wide
+[Code of Conduct](https://github.com/cplieger/.github/blob/main/CODE_OF_CONDUCT.md).
+Report security issues through the
+[security policy](https://github.com/cplieger/.github/blob/main/SECURITY.md) —
+never in a public issue.
