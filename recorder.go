@@ -56,10 +56,11 @@ func (s *StatusRecorder) Status() int {
 	return s.status
 }
 
-// Wrote reports whether the response has been committed, i.e. WriteHeader or
-// the first Write (or ReadFrom) has run. Middleware such as Recoverer consults
-// it to avoid writing a second status and body onto a response a handler has
-// already started, which would corrupt the body and mislabel the status.
+// Wrote reports whether the response has been committed, i.e. WriteHeader, the
+// first Write or ReadFrom, or a successful Flush or Hijack has run. Middleware
+// such as Recoverer consults it to avoid writing a second status and body onto
+// a response a handler has already started, which would corrupt the body and
+// mislabel the status.
 func (s *StatusRecorder) Wrote() bool {
 	return s.wroteHeader
 }
@@ -76,9 +77,13 @@ func (s *StatusRecorder) Unwrap() http.ResponseWriter {
 // walks the Unwrap chain), so a handler that type-asserts http.Flusher directly
 // still streams through the recorder. A no-op if the underlying writer cannot flush.
 func (s *StatusRecorder) Flush() {
-	// Best-effort: an underlying writer that cannot flush has nothing to do, so
-	// its error is intentionally discarded.
-	_ = http.NewResponseController(s.ResponseWriter).Flush()
+	// A successful flush commits the response (net/http writes an implicit 200
+	// header when none was set yet), so mark the recorder written to keep Wrote()
+	// honest for Recoverer's commit gate. Best-effort: an underlying writer that
+	// cannot flush has nothing to do, so its error is intentionally discarded.
+	if err := http.NewResponseController(s.ResponseWriter).Flush(); err == nil {
+		s.wroteHeader = true
+	}
 }
 
 // Hijack forwards to the underlying writer via http.ResponseController for
@@ -86,16 +91,36 @@ func (s *StatusRecorder) Flush() {
 // Returns an error (e.g. http.ErrNotSupported) when the underlying writer, such
 // as an HTTP/2 stream, cannot be hijacked.
 func (s *StatusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	return http.NewResponseController(s.ResponseWriter).Hijack()
+	conn, rw, err := http.NewResponseController(s.ResponseWriter).Hijack()
+	if err == nil {
+		// The connection is now the caller's; the ResponseWriter can no longer
+		// emit a status/body, so mark it committed to stop Recoverer writing onto it.
+		s.wroteHeader = true
+	}
+	return conn, rw, err
 }
 
 // ReadFrom preserves the zero-copy (sendfile) fast path for io.Copy and
 // http.ServeContent when the underlying writer implements io.ReaderFrom. Writing
 // the body implies a 200 status when WriteHeader was not called.
 func (s *StatusRecorder) ReadFrom(src io.Reader) (int64, error) {
-	s.wroteHeader = true
+	// Delegate first, then commit only when at least one byte was actually
+	// written. A zero-byte failure (src returns (0, err) immediately) must leave
+	// the response uncommitted so Recoverer can still emit its 500 on a following
+	// panic; committing unconditionally before the copy would leak an empty 200.
+	// A partial write (n > 0 with an error) has already started the body, so it
+	// commits like a normal Write. This only ever sets wroteHeader to true, so an
+	// earlier true from WriteHeader/Write is preserved. Mirrors the success-only
+	// commit gate on Flush/Hijack.
+	var n int64
+	var err error
 	if rf, ok := s.ResponseWriter.(io.ReaderFrom); ok {
-		return rf.ReadFrom(src)
+		n, err = rf.ReadFrom(src)
+	} else {
+		n, err = io.Copy(s.ResponseWriter, src)
 	}
-	return io.Copy(s.ResponseWriter, src)
+	if n > 0 {
+		s.wroteHeader = true
+	}
+	return n, err
 }
