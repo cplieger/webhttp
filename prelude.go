@@ -11,9 +11,11 @@ import (
 const MaxJSONBody int64 = 1 << 20
 
 // LimitBody caps the request body at maxBytes by replacing r.Body with an
-// http.MaxBytesReader. A read past the limit then fails and the server responds
-// 413 instead of buffering an unbounded payload. Call it before reading the
-// body.
+// http.MaxBytesReader. A read past the limit then fails with a
+// *http.MaxBytesError (and net/http is asked to close the connection); it does
+// not by itself write a 413, so the caller chooses the response status.
+// DecodeBody, for example, surfaces the resulting decode error as a 400. Call
+// it before reading the body.
 func LimitBody(w http.ResponseWriter, r *http.Request, maxBytes int64) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 }

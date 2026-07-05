@@ -42,8 +42,10 @@ A few properties are load-bearing. Keep them when you change the code.
   out of the box; a `WriteTimeout` would cut an in-progress stream. Keep the
   slowloris guard (`ReadHeaderTimeout`) and the header-size cap.
 - **`Run`'s shutdown ordering.** On context cancellation `Run` calls
-  `srv.Shutdown` with a grace-bounded context, then `onShutdown` with a fresh
-  grace-bounded context, and treats `http.ErrServerClosed` as a clean stop. A
+  `srv.Shutdown` with a context bounded by a single shutdown deadline (now +
+  grace), then `onShutdown` with a context bounded by that SAME deadline (the
+  grace budget remaining after `Shutdown` drains), and treats
+  `http.ErrServerClosed` as a clean stop. A
   real serve error takes precedence over a shutdown error in the return value.
 - **`WriteError` is nil-safe.** It must not panic when `r` is nil; the
   `RequestID` field simply stays empty.

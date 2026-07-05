@@ -102,9 +102,11 @@ func WithShutdownGrace(d time.Duration) RunOption {
 //
 // It starts srv.Serve(ln) in a goroutine (treating http.ErrServerClosed as a
 // clean stop) and blocks until either ctx is cancelled or Serve returns on its
-// own. On cancellation it calls srv.Shutdown with a fresh context bounded by
-// the shutdown grace period, then, if onShutdown is non-nil, calls it with
-// another grace-bounded context for application teardown. Run returns the first
+// own. On cancellation it computes a single shutdown deadline (now + the shutdown
+// grace period) and calls srv.Shutdown with a context bounded by it, then, if
+// onShutdown is non-nil, calls it with a context bounded by that SAME deadline:
+// onShutdown runs within whatever grace budget REMAINS after Shutdown drains
+// in-flight requests, not a fresh full window. Run returns the first
 // non-ErrServerClosed error it observes (a serve error, else a shutdown error),
 // or nil on a clean graceful stop.
 //
