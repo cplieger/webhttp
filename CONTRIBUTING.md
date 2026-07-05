@@ -13,7 +13,8 @@ few small, independent pieces:
 - `StatusRecorder` — a status-capturing `http.ResponseWriter` wrapper,
 - `RequestLogger` — request-id middleware with one-line access logging,
 - a composable middleware set — `Chain`, `Recoverer`, `SecurityHeaders`,
-  `Logging`, and `RouteTimeout`, plus the `ClientIP` resolver,
+  `Logging`, and `RouteTimeout`, plus the `ClientIP` resolver and the
+  `DefaultStack` correct-order convenience constructor,
 - JSON helpers — `WriteJSON`, `WriteJSONStatus`, `Ok`, `WriteError`,
 - request-prelude helpers — `LimitBody`, `RequireMethod`, `DecodeBody`,
 - a readiness gate — `Ready`, `ReadinessHandler`,
@@ -51,6 +52,8 @@ A few properties are load-bearing. Keep them when you change the code.
   `Recoverer` must re-panic `http.ErrAbortHandler` untouched (the net/http
   silent-abort contract) and is documented to sit inside `Logging` so a
   recovered request records its 500 before the deferred access line runs.
+  `DefaultStack` composes that exact order (`Logging` outermost, then
+  `Recoverer`, then `SecurityHeaders`); preserve it if you change the constructor.
 - **`ClientIP` trusts `X-Forwarded-For` only from a trusted peer, and walks it
   right-to-left.** With no trusted ranges (or an untrusted direct peer) it
   returns the `RemoteAddr` host and ignores `X-Forwarded-For`. Only when the
@@ -122,6 +125,9 @@ Tests live beside the code, one file per source unit:
   status-500 access line when inside `Logging`), `SecurityHeaders` (defaults,
   overrides, empty-omit, the HSTS table), `Logging` composing in a `Chain`,
   `ClientIP` (the trust model), and `RouteTimeout` (fast pass, slow → 503 JSON).
+- `stack_test.go` — `DefaultStack`: the load-bearing ordering (a downstream
+  panic logs as 500, not 200), all three layers present, per-layer option
+  routing, and nil-option safety.
 - `json_test.go` — JSON headers, `WriteJSON`/`WriteJSONStatus`/`Ok`, the
   encode-failure `Warn`, and `WriteError` including the nil-request case.
 - `prelude_test.go` — `RequireMethod`, `DecodeBody` (200 / 405 / 400 / oversize),
