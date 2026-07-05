@@ -2,6 +2,7 @@ package webhttp_test
 
 import (
 	"bufio"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -206,5 +207,218 @@ func TestStatusRecorder_readFromFallsBackToCopy(t *testing.T) {
 	}
 	if under.Body.String() != "world" {
 		t.Errorf("underlying body = %q, want world (io.Copy fallback)", under.Body.String())
+	}
+}
+
+// TestStatusRecorder_flushMarksCommitted asserts a successful Flush commits the
+// response so Wrote() reports true. net/http writes an implicit 200 on flush, so
+// Recoverer must not write a second status/body onto an already-flushed response.
+func TestStatusRecorder_flushMarksCommitted(t *testing.T) {
+	rec := webhttp.NewStatusRecorder(httptest.NewRecorder())
+	if rec.Wrote() {
+		t.Fatal("Wrote() = true before any write")
+	}
+	rec.Flush()
+	if !rec.Wrote() {
+		t.Error("Wrote() = false after a successful Flush; Recoverer would double-write onto a committed response")
+	}
+}
+
+// TestStatusRecorder_hijackMarksCommitted asserts a successful Hijack commits the
+// response so Wrote() reports true. Once the connection is hijacked the
+// ResponseWriter can no longer emit a status/body, so Recoverer must skip its 500.
+func TestStatusRecorder_hijackMarksCommitted(t *testing.T) {
+	hw := &hijackOnlyWriter{ResponseWriter: httptest.NewRecorder()}
+	rec := webhttp.NewStatusRecorder(hw)
+	if rec.Wrote() {
+		t.Fatal("Wrote() = true before any write")
+	}
+	if _, _, err := rec.Hijack(); err != nil {
+		t.Fatalf("Hijack: %v", err)
+	}
+	if !rec.Wrote() {
+		t.Error("Wrote() = false after a successful Hijack; Recoverer would double-write onto a hijacked connection")
+	}
+}
+
+// --- Negative-path regressions ---------------------------------------------
+// The success-path tests above prove Wrote() flips to true on a successful
+// Flush or Hijack. These prove the opposite branch: a FAILED or unsupported
+// Flush, Hijack, or ReadFrom must NOT commit the recorder, so Recoverer keeps
+// emitting its 500 on a following panic. A future change that marked the
+// recorder committed unconditionally would silently suppress that 500, and this
+// suite would catch it.
+
+// errRead is the sentinel returned by errReader and failingReaderFromWriter, so
+// a zero-byte ReadFrom failure is identifiable through errors.Is.
+var errRead = errors.New("read failed")
+
+// errReader fails on its first Read, so a copy over it writes zero bytes and
+// returns errRead.
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, errRead }
+
+// failedHijackWriter's Hijack always fails, modeling an HTTP/2 stream (or any
+// writer) that cannot be hijacked. It proves a FAILED hijack neither commits
+// the recorder nor swallows the underlying error.
+type failedHijackWriter struct {
+	http.ResponseWriter
+}
+
+func (*failedHijackWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return nil, nil, http.ErrNotSupported
+}
+
+// failingReaderFromWriter is an underlying writer whose ReadFrom always fails
+// with zero bytes written, exercising the io.ReaderFrom fast path of
+// StatusRecorder.ReadFrom on its failure branch.
+type failingReaderFromWriter struct {
+	http.ResponseWriter
+}
+
+func (*failingReaderFromWriter) ReadFrom(io.Reader) (int64, error) {
+	return 0, errRead
+}
+
+func TestStatusRecorder_unsupportedFlushLeavesUncommitted(t *testing.T) {
+	// plainWriter implements no optional interface, so a Flush through the
+	// recorder finds no flusher and http.NewResponseController returns
+	// http.ErrNotSupported. A failed flush must not commit the response.
+	rec := webhttp.NewStatusRecorder(&plainWriter{ResponseWriter: httptest.NewRecorder()})
+	if rec.Wrote() {
+		t.Fatal("Wrote() = true before any operation")
+	}
+	rec.Flush()
+	if rec.Wrote() {
+		t.Error("Wrote() = true after an unsupported Flush; a failed flush must not commit the response")
+	}
+}
+
+func TestStatusRecorder_failedHijackLeavesUncommitted(t *testing.T) {
+	rec := webhttp.NewStatusRecorder(&failedHijackWriter{ResponseWriter: httptest.NewRecorder()})
+	if rec.Wrote() {
+		t.Fatal("Wrote() = true before any operation")
+	}
+	conn, rw, err := rec.Hijack()
+	if !errors.Is(err, http.ErrNotSupported) {
+		t.Errorf("Hijack err = %v, want the underlying http.ErrNotSupported to propagate", err)
+	}
+	if conn != nil || rw != nil {
+		t.Errorf("Hijack returned conn=%v rw=%v, want both nil on failure", conn, rw)
+	}
+	if rec.Wrote() {
+		t.Error("Wrote() = true after a failed Hijack; a failed hijack must not commit the response")
+	}
+}
+
+func TestStatusRecorder_failedReadFromCopyPathLeavesUncommitted(t *testing.T) {
+	// The underlying httptest recorder is not an io.ReaderFrom, so ReadFrom takes
+	// the io.Copy fallback and the failing source writes zero bytes. A zero-byte
+	// failure must not commit the response.
+	rec := webhttp.NewStatusRecorder(httptest.NewRecorder())
+	if rec.Wrote() {
+		t.Fatal("Wrote() = true before any operation")
+	}
+	n, err := rec.ReadFrom(errReader{})
+	if n != 0 {
+		t.Errorf("ReadFrom n = %d, want 0 on a failed read", n)
+	}
+	if !errors.Is(err, errRead) {
+		t.Errorf("ReadFrom err = %v, want the source error errRead to propagate", err)
+	}
+	if rec.Wrote() {
+		t.Error("Wrote() = true after a zero-byte ReadFrom failure (copy path); must not commit")
+	}
+}
+
+func TestStatusRecorder_failedReadFromReaderFromPathLeavesUncommitted(t *testing.T) {
+	// The underlying writer IS an io.ReaderFrom that fails with zero bytes, so
+	// ReadFrom takes the fast path and returns (0, err). It must not commit.
+	rec := webhttp.NewStatusRecorder(&failingReaderFromWriter{ResponseWriter: httptest.NewRecorder()})
+	if rec.Wrote() {
+		t.Fatal("Wrote() = true before any operation")
+	}
+	n, err := rec.ReadFrom(strings.NewReader("unused"))
+	if n != 0 {
+		t.Errorf("ReadFrom n = %d, want 0 on a failed read", n)
+	}
+	if !errors.Is(err, errRead) {
+		t.Errorf("ReadFrom err = %v, want the underlying error errRead to propagate", err)
+	}
+	if rec.Wrote() {
+		t.Error("Wrote() = true after a zero-byte ReadFrom failure (ReaderFrom path); must not commit")
+	}
+}
+
+// TestRecoverer_emits500AfterFailedReadFrom ties the recorder's negative-path
+// contract to Recoverer end to end: a handler whose ReadFrom fails with zero
+// bytes leaves the response uncommitted (Wrote() == false), so a following
+// panic must still produce the 500. Recoverer reads only Wrote(), so one failed
+// op through the full middleware proves the wiring the three recorder-level
+// negative tests above establish for each op.
+func TestRecoverer_emits500AfterFailedReadFrom(t *testing.T) {
+	panicky := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		rf, ok := w.(io.ReaderFrom)
+		if !ok {
+			t.Error("Recoverer's writer is not an io.ReaderFrom")
+		} else if n, err := rf.ReadFrom(errReader{}); n != 0 || err == nil {
+			t.Errorf("failed ReadFrom = (%d, %v), want (0, non-nil)", n, err)
+		}
+		panic("boom after failed readfrom")
+	})
+	h := webhttp.Recoverer(webhttp.WithRecoverLogger(discardLogger()))(panicky)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	func() {
+		defer func() {
+			if v := recover(); v != nil {
+				t.Fatalf("panic escaped Recoverer: %v", v)
+			}
+		}()
+		h.ServeHTTP(rec, req)
+	}()
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500 (a failed ReadFrom must not suppress Recoverer's 500)", rec.Code)
+	}
+}
+
+// TestStatusRecorder_readFromMarksCommitted asserts a successful (n>0) ReadFrom
+// commits the response so Wrote() reports true, the positive-branch sibling of
+// flushMarksCommitted / hijackMarksCommitted. Streaming a body via the
+// io.ReaderFrom fast path starts the response just like Write, so Recoverer must
+// not append a second status/body onto it. Without this test, deleting the
+// "if n > 0 { s.wroteHeader = true }" commit line in ReadFrom survives the whole
+// suite: the negative tests pin only the n==0 branch, and the two success-path
+// ReadFrom tests (readFromUsesUnderlyingReaderFrom, readFromFallsBackToCopy)
+// assert only Status()/n/body, never Wrote().
+func TestStatusRecorder_readFromMarksCommitted(t *testing.T) {
+	// readerFromWriter implements io.ReaderFrom, so ReadFrom takes the fast path
+	// (rf.ReadFrom) rather than the io.Copy fallback.
+	under := &readerFromWriter{ResponseWriter: httptest.NewRecorder()}
+	rec := webhttp.NewStatusRecorder(under)
+	if rec.Wrote() {
+		t.Fatal("Wrote() = true before any write")
+	}
+	n, err := rec.ReadFrom(strings.NewReader("hello"))
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if n != 5 {
+		t.Errorf("ReadFrom n = %d, want 5", n)
+	}
+	if !under.readFromCalled {
+		t.Error("ReadFrom did not take the io.ReaderFrom fast path")
+	}
+	if !rec.Wrote() {
+		t.Error("Wrote() = false after a successful ReadFrom; Recoverer would double-write onto a committed body")
+	}
+	// The body is committed at the implicit 200, so a later WriteHeader must not
+	// overwrite the recorded status (first-code-wins, guarded by wroteHeader).
+	rec.WriteHeader(http.StatusInternalServerError)
+	if got := rec.Status(); got != http.StatusOK {
+		t.Errorf("Status() = %d, want 200 (a committed ReadFrom body fixes the status; a later WriteHeader must not overwrite it)", got)
 	}
 }
