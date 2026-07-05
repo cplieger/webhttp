@@ -121,6 +121,7 @@ With **no** trusted ranges (or when the direct peer is not inside one), `X-Forwa
 - `(*StatusRecorder).WriteHeader(code)` — records the first explicit code only
 - `(*StatusRecorder).Write(b)` — implicit 200 on first write
 - `(*StatusRecorder).Status() int`
+- `(*StatusRecorder).Wrote() bool` — reports whether the response is committed (WriteHeader, the first Write/ReadFrom, or a successful Flush/Hijack); the seam Recoverer uses to skip a double-write onto an already-started response
 - `(*StatusRecorder).Unwrap() http.ResponseWriter`
 - `(*StatusRecorder).Flush()` / `.Hijack()` / `.ReadFrom(src)` — passthroughs to the underlying writer
 
@@ -131,9 +132,9 @@ With **no** trusted ranges (or when the direct peer is not inside one), `X-Forwa
 - `NewRequestID() string` — 16 random bytes hex-encoded, with a charset-safe timestamp fallback
 - `WithRequestID(ctx, id)` / `RequestIDFromContext(ctx) string`
 - `RequestLogger(next, opts...) http.Handler` — mints/echoes/threads the id, records status via a `StatusRecorder`, emits one `Info` access-log line per request
-- Options: `WithLogger(l)`, `WithSkipPaths(paths...)`, `WithRecordMetric(fn)`
+- Options: `WithLogger(l)`, `WithSkipPaths(paths...)`, `WithSkipFunc(fn)`, `WithRecordMetric(fn)`
 
-An inbound `X-Request-ID` is reused when it satisfies `ValidRequestID`, otherwise a fresh id is minted. Skip-path requests still get an id minted, echoed, and threaded, but are served through the raw writer with no access-log line; a metric hook, if set, still fires for them.
+An inbound `X-Request-ID` is reused when it satisfies `ValidRequestID`, otherwise a fresh id is minted. Skip-path requests still get an id minted, echoed, and threaded, but are served through the raw writer with no access-log line and no metric hook (a stream's open-to-close duration paired with a synthetic status would be misleading, which is why the path is skipped).
 
 ### JSON responses and errors
 
@@ -166,7 +167,7 @@ This is the HTTP serving-state gate (lowercase `"ok"`), for a load balancer aski
 ### Server
 
 - `NewServer(handler, opts...) *http.Server` — streaming-safe defaults: `ReadHeaderTimeout` 10s (slowloris guard), `IdleTimeout` 120s, `MaxHeaderBytes` 1 MiB; `ReadTimeout` and `WriteTimeout` unset so streaming works out of the box
-- Options: `WithReadTimeout`, `WithWriteTimeout`, `WithIdleTimeout`, `WithReadHeaderTimeout`, `WithMaxHeaderBytes`
+- Options: `WithReadTimeout`, `WithWriteTimeout`, `WithIdleTimeout`, `WithReadHeaderTimeout`, `WithMaxHeaderBytes`, `WithErrorLog`
 - `Run(ctx, srv, ln, onShutdown, opts...) error` — serves until `ctx` is cancelled, then shuts down gracefully within the shutdown grace period and runs `onShutdown` for application teardown
 - Option: `WithShutdownGrace(d)` (default 5s)
 
