@@ -157,8 +157,9 @@ An inbound `X-Request-ID` is reused when it satisfies `ValidRequestID`, otherwis
 - `MaxJSONBody` — 1 MiB default body cap
 - `LimitBody(w, r, maxBytes)` — wraps the body in `http.MaxBytesReader`
 - `RequireMethod(w, r, method) bool` — 405 + `false` on mismatch
-- `DecodeBody(w, r, v, errMsg) bool` — cap + decode; 400 + `false` on failure
+- `DecodeBody(w, r, v, errMsg) bool` — cap + decode (reject trailing data); 400 + `false` on failure
 - `DecodeBodyOptional(w, r, v)` — cap + decode, error ignored
+- `DecodeJSONInto(w, r, v, maxBytes) error` — the mechanism behind `DecodeBody`, exposed for apps with their own error envelope or a per-endpoint cap: cap + decode + reject-trailing, **writing nothing** and returning the decode error. A `*http.MaxBytesError` (test with `errors.As`) means the body exceeded `maxBytes` (map to 413 or 400 as you choose); `ErrTrailingData` means a second JSON value followed the first; otherwise it's a malformed body. Map the result to your own status/envelope.
 
 ### Readiness
 
