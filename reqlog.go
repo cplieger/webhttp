@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 )
@@ -69,10 +70,12 @@ func RequestIDFromContext(ctx context.Context) string {
 
 // logConfig holds resolved RequestLogger configuration.
 type logConfig struct {
-	logger       *slog.Logger
-	skipPaths    map[string]struct{}
-	skipFunc     func(*http.Request) bool
-	recordMetric func(method, path string, status int, d time.Duration)
+	logger          *slog.Logger
+	skipPaths       map[string]struct{}
+	skipFunc        func(*http.Request) bool
+	recordMetric    func(method, path string, status int, d time.Duration)
+	logClientIP     bool
+	clientIPTrusted []*net.IPNet
 }
 
 // LogOption configures RequestLogger.
@@ -121,6 +124,21 @@ func WithRecordMetric(fn func(method, path string, status int, d time.Duration))
 	return func(c *logConfig) { c.recordMetric = fn }
 }
 
+// WithClientIP adds a "client_ip" attribute to the access-log line, set to the
+// best-effort client IP resolved by ClientIP with the given trusted proxy
+// ranges. With no trusted ranges the immediate socket peer is logged (the
+// spoof-proof default); pass the reverse-proxy CIDRs to resolve the real client
+// from a trusted X-Forwarded-For, exactly as ClientIP does. The attribute is
+// omitted entirely unless this option is supplied, so the default access line
+// is unchanged. It is resolved once per request, inside the deferred access
+// log, so it costs nothing on skipped (streaming) paths.
+func WithClientIP(trusted ...*net.IPNet) LogOption {
+	return func(c *logConfig) {
+		c.logClientIP = true
+		c.clientIPTrusted = trusted
+	}
+}
+
 // RequestLogger returns middleware that gives each request a request id, echoes
 // it on the response HeaderRequestID header, threads it through the request
 // context (see RequestIDFromContext), and emits one access-log line at Info
@@ -128,6 +146,10 @@ func WithRecordMetric(fn func(method, path string, status int, d time.Duration))
 //
 //	logger.Info("http", "method", …, "path", …, "status", …,
 //		"duration_ms", …, "request_id", …)
+//
+// With WithClientIP the line additionally carries a "client_ip" attribute
+// resolved by ClientIP (spoof-proof, honoring only the trusted proxy ranges
+// passed to the option).
 //
 // It records the status via a StatusRecorder that stays transparent to
 // http.ResponseController, so wrapped handlers can still Flush and Hijack. An
@@ -173,13 +195,17 @@ func RequestLogger(next http.Handler, opts ...LogOption) http.Handler {
 		rec := NewStatusRecorder(w)
 		defer func() {
 			d := time.Since(start)
-			c.logger.Info("http",
+			args := []any{
 				"method", r.Method,
 				"path", path,
 				"status", rec.Status(),
 				"duration_ms", d.Milliseconds(),
 				"request_id", id,
-			)
+			}
+			if c.logClientIP {
+				args = append(args, "client_ip", ClientIP(r, c.clientIPTrusted...))
+			}
+			c.logger.Info("http", args...)
 			if c.recordMetric != nil {
 				c.recordMetric(r.Method, path, rec.Status(), d)
 			}
