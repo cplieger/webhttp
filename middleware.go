@@ -360,6 +360,45 @@ func ipInTrusted(ip net.IP, nets []*net.IPNet) bool {
 	return false
 }
 
+// ParseCIDRs parses trusted reverse-proxy entries into the *net.IPNet set that
+// ClientIP and WithClientIP consult. Each entry is either CIDR notation
+// ("10.0.0.0/8") or a bare IP address ("192.168.1.5", "::1"), a bare address
+// being treated as a single host (/32 for IPv4, /128 for IPv6). Surrounding
+// whitespace is trimmed and blank entries are skipped.
+//
+// It returns the successfully parsed networks and, separately, the list of
+// entries that were neither a valid CIDR nor a valid IP. Returning both (rather
+// than failing on the first bad entry) lets a strict caller reject the input —
+// e.g. config-file validation surfacing the offending entry — while a lenient
+// caller logs the bad entries and proceeds with the valid subset, e.g. reading
+// a TRUSTED_PROXIES environment variable where one typo should not disable proxy
+// awareness entirely. Both usages share this one parser instead of each app
+// reimplementing the CIDR/bare-IP handling. The returned slice is passed
+// straight to ClientIP(r, nets...) or WithClientIP(nets...); an empty result
+// means "trust nothing", the spoof-proof default that logs the socket peer.
+func ParseCIDRs(entries []string) (nets []*net.IPNet, invalid []string) {
+	for _, e := range entries {
+		s := strings.TrimSpace(e)
+		if s == "" {
+			continue
+		}
+		if _, n, err := net.ParseCIDR(s); err == nil {
+			nets = append(nets, n)
+			continue
+		}
+		if ip := net.ParseIP(s); ip != nil {
+			bits := 8 * net.IPv4len
+			if ip.To4() == nil {
+				bits = 8 * net.IPv6len
+			}
+			nets = append(nets, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+			continue
+		}
+		invalid = append(invalid, s)
+	}
+	return nets, invalid
+}
+
 // jsonTimeoutWriter labels a 503 response that carries no Content-Type as JSON,
 // so the timeout envelope written by http.TimeoutHandler is served as
 // application/json (with nosniff) instead of being content-sniffed as
