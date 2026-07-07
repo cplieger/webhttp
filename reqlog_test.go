@@ -478,3 +478,44 @@ func TestRequestLogger_withClientIPResolvesTrustedXFF(t *testing.T) {
 		t.Errorf("client_ip = %v, want the forwarded client 203.0.113.5", got)
 	}
 }
+
+// WithClientIPFunc logs the result of the caller-supplied resolver verbatim
+// (for a dynamic/hot-reloaded trusted set), instead of the fixed-set ClientIP.
+func TestRequestLogger_withClientIPFunc(t *testing.T) {
+	logCap := &captureHandler{}
+	h := webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(slog.New(logCap)),
+		webhttp.WithClientIPFunc(func(*http.Request) string { return "resolved-by-func" }))
+
+	serveWithPeer(h, "192.0.2.1:1234", "203.0.113.5")
+
+	if got := attrsOf(logCap.snapshot()[0])["client_ip"]; got != "resolved-by-func" {
+		t.Errorf("client_ip = %v, want the func result %q", got, "resolved-by-func")
+	}
+}
+
+// WithClientIP and WithClientIPFunc are mutually exclusive; the last one applied
+// wins (the earlier one's state is cleared).
+func TestRequestLogger_clientIPOptionsMutuallyExclusive(t *testing.T) {
+	// Func applied last → func wins.
+	cap1 := &captureHandler{}
+	h1 := webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(slog.New(cap1)),
+		webhttp.WithClientIP(mustCIDR(t, "192.0.2.0/24")),
+		webhttp.WithClientIPFunc(func(*http.Request) string { return "func-wins" }))
+	serveWithPeer(h1, "192.0.2.1:1234", "203.0.113.5")
+	if got := attrsOf(cap1.snapshot()[0])["client_ip"]; got != "func-wins" {
+		t.Errorf("client_ip = %v, want func-wins", got)
+	}
+
+	// WithClientIP applied last → trusted-set path wins (func cleared).
+	cap2 := &captureHandler{}
+	h2 := webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(slog.New(cap2)),
+		webhttp.WithClientIPFunc(func(*http.Request) string { return "func-loses" }),
+		webhttp.WithClientIP(mustCIDR(t, "192.0.2.0/24")))
+	serveWithPeer(h2, "192.0.2.1:1234", "203.0.113.5")
+	if got := attrsOf(cap2.snapshot()[0])["client_ip"]; got != "203.0.113.5" {
+		t.Errorf("client_ip = %v, want the trusted-XFF client 203.0.113.5", got)
+	}
+}

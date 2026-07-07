@@ -74,8 +74,9 @@ type logConfig struct {
 	skipPaths       map[string]struct{}
 	skipFunc        func(*http.Request) bool
 	recordMetric    func(method, path string, status int, d time.Duration)
-	logClientIP     bool
+	clientIPFunc    func(*http.Request) string
 	clientIPTrusted []*net.IPNet
+	logClientIP     bool
 }
 
 // LogOption configures RequestLogger.
@@ -136,6 +137,55 @@ func WithClientIP(trusted ...*net.IPNet) LogOption {
 	return func(c *logConfig) {
 		c.logClientIP = true
 		c.clientIPTrusted = trusted
+		c.clientIPFunc = nil
+	}
+}
+
+// WithClientIPFunc is like WithClientIP but resolves the "client_ip" attribute
+// with a caller-supplied function instead of a fixed trusted-proxy set. Use it
+// when the trusted set is not known at construction — e.g. it is reloaded from
+// config at runtime behind a hot-reloadable resolver — or when client-IP
+// resolution is otherwise app-specific: fn is called once per logged request
+// (never on a skipped path), and its result is logged verbatim as "client_ip".
+// It composes with WithRecordMetric. WithClientIP and WithClientIPFunc both
+// enable the attribute and are mutually exclusive; whichever is applied last
+// wins.
+func WithClientIPFunc(fn func(*http.Request) string) LogOption {
+	return func(c *logConfig) {
+		c.logClientIP = true
+		c.clientIPFunc = fn
+		c.clientIPTrusted = nil
+	}
+}
+
+// resolveClientIP returns the value logged as "client_ip": the caller's resolver
+// when WithClientIPFunc was supplied, otherwise the spoof-proof ClientIP over the
+// fixed trusted-proxy set.
+func (c *logConfig) resolveClientIP(r *http.Request) string {
+	if c.clientIPFunc != nil {
+		return c.clientIPFunc(r)
+	}
+	return ClientIP(r, c.clientIPTrusted...)
+}
+
+// emitAccessLog writes the single access-log line and fires the optional metric
+// hook. RequestLogger defers it, so a panicking handler is still logged with its
+// recorded status (rec is read when the deferred call runs).
+func (c *logConfig) emitAccessLog(rec *StatusRecorder, r *http.Request, path, id string, start time.Time) {
+	d := time.Since(start)
+	args := []any{
+		"method", r.Method,
+		"path", path,
+		"status", rec.Status(),
+		"duration_ms", d.Milliseconds(),
+		"request_id", id,
+	}
+	if c.logClientIP {
+		args = append(args, "client_ip", c.resolveClientIP(r))
+	}
+	c.logger.Info("http", args...)
+	if c.recordMetric != nil {
+		c.recordMetric(r.Method, path, rec.Status(), d)
 	}
 }
 
@@ -149,7 +199,8 @@ func WithClientIP(trusted ...*net.IPNet) LogOption {
 //
 // With WithClientIP the line additionally carries a "client_ip" attribute
 // resolved by ClientIP (spoof-proof, honoring only the trusted proxy ranges
-// passed to the option).
+// passed to the option); WithClientIPFunc is the variant that resolves it with
+// a caller-supplied function, for a dynamic (e.g. config-reloaded) trusted set.
 //
 // It records the status via a StatusRecorder that stays transparent to
 // http.ResponseController, so wrapped handlers can still Flush and Hijack. An
@@ -193,23 +244,7 @@ func RequestLogger(next http.Handler, opts ...LogOption) http.Handler {
 		}
 
 		rec := NewStatusRecorder(w)
-		defer func() {
-			d := time.Since(start)
-			args := []any{
-				"method", r.Method,
-				"path", path,
-				"status", rec.Status(),
-				"duration_ms", d.Milliseconds(),
-				"request_id", id,
-			}
-			if c.logClientIP {
-				args = append(args, "client_ip", ClientIP(r, c.clientIPTrusted...))
-			}
-			c.logger.Info("http", args...)
-			if c.recordMetric != nil {
-				c.recordMetric(r.Method, path, rec.Status(), d)
-			}
-		}()
+		defer c.emitAccessLog(rec, r, path, id, start)
 		next.ServeHTTP(rec, r)
 	})
 }
