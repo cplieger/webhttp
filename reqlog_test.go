@@ -2,6 +2,7 @@ package webhttp_test
 
 import (
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -402,5 +403,78 @@ func TestRequestLogger_rejectsCRLFInjectionInboundID(t *testing.T) {
 	}
 	if seen != echoed {
 		t.Errorf("context id %q != echoed header %q", seen, echoed)
+	}
+}
+
+// mustCIDR parses a CIDR for a test trusted-proxy set, failing the test on a
+// malformed literal.
+func mustCIDR(t *testing.T, s string) *net.IPNet {
+	t.Helper()
+	_, n, err := net.ParseCIDR(s)
+	if err != nil {
+		t.Fatalf("ParseCIDR(%q): %v", s, err)
+	}
+	return n
+}
+
+// serveWithPeer drives h with a request whose RemoteAddr and optional
+// X-Forwarded-For are set, so the client-IP resolution can be exercised.
+func serveWithPeer(h http.Handler, remoteAddr, xff string) {
+	req := httptest.NewRequest(http.MethodGet, "/api/thing", nil)
+	req.RemoteAddr = remoteAddr
+	if xff != "" {
+		req.Header.Set("X-Forwarded-For", xff)
+	}
+	h.ServeHTTP(httptest.NewRecorder(), req)
+}
+
+// Without WithClientIP the access line carries no client_ip attribute (the
+// default output is unchanged).
+func TestRequestLogger_noClientIPAttrByDefault(t *testing.T) {
+	logCap := &captureHandler{}
+	h := webhttp.RequestLogger(okHandler(), webhttp.WithLogger(slog.New(logCap)))
+
+	serveWithPeer(h, "192.0.2.1:1234", "203.0.113.5")
+
+	recs := logCap.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("got %d log records, want 1", len(recs))
+	}
+	if _, ok := attrsOf(recs[0])["client_ip"]; ok {
+		t.Error("client_ip attr present without WithClientIP; want absent")
+	}
+}
+
+// With WithClientIP and no trusted ranges, the socket peer host is logged and
+// an X-Forwarded-For is IGNORED (the spoof-proof default).
+func TestRequestLogger_withClientIPLogsPeerByDefault(t *testing.T) {
+	logCap := &captureHandler{}
+	h := webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(slog.New(logCap)),
+		webhttp.WithClientIP())
+
+	// A spoofed XFF must not be honored when no proxy range is trusted.
+	serveWithPeer(h, "192.0.2.1:1234", "203.0.113.5")
+
+	m := attrsOf(logCap.snapshot()[0])
+	if got := m["client_ip"]; got != "192.0.2.1" {
+		t.Errorf("client_ip = %v, want the socket peer 192.0.2.1 (XFF ignored)", got)
+	}
+}
+
+// With WithClientIP and the peer inside a trusted proxy range, the real client
+// is resolved from X-Forwarded-For (right-to-left, skipping trusted hops).
+func TestRequestLogger_withClientIPResolvesTrustedXFF(t *testing.T) {
+	logCap := &captureHandler{}
+	h := webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(slog.New(logCap)),
+		webhttp.WithClientIP(mustCIDR(t, "192.0.2.0/24")))
+
+	// Peer 192.0.2.1 is a trusted proxy; it appended the client it saw.
+	serveWithPeer(h, "192.0.2.1:1234", "203.0.113.5")
+
+	m := attrsOf(logCap.snapshot()[0])
+	if got := m["client_ip"]; got != "203.0.113.5" {
+		t.Errorf("client_ip = %v, want the forwarded client 203.0.113.5", got)
 	}
 }

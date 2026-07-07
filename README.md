@@ -132,7 +132,8 @@ With **no** trusted ranges (or when the direct peer is not inside one), `X-Forwa
 - `NewRequestID() string` — 16 random bytes hex-encoded, with a charset-safe timestamp fallback
 - `WithRequestID(ctx, id)` / `RequestIDFromContext(ctx) string`
 - `RequestLogger(next, opts...) http.Handler` — mints/echoes/threads the id, records status via a `StatusRecorder`, emits one `Info` access-log line per request
-- Options: `WithLogger(l)`, `WithSkipPaths(paths...)`, `WithSkipFunc(fn)`, `WithRecordMetric(fn)`
+- Options: `WithLogger(l)`, `WithSkipPaths(paths...)`, `WithSkipFunc(fn)`, `WithRecordMetric(fn)`, `WithClientIP(trusted...)`
+- `WithClientIP(trusted ...*net.IPNet)` adds a `client_ip` attribute resolved by `ClientIP` (spoof-proof; honors `X-Forwarded-For` only from the trusted proxy ranges you pass, else logs the socket peer). Omitted entirely unless the option is supplied, so the default access line is unchanged.
 
 An inbound `X-Request-ID` is reused when it satisfies `ValidRequestID`, otherwise a fresh id is minted. Skip-path requests still get an id minted, echoed, and threaded, but are served through the raw writer with no access-log line and no metric hook (a stream's open-to-close duration paired with a synthetic status would be misleading, which is why the path is skipped).
 
