@@ -2,6 +2,7 @@ package webhttp_test
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -167,5 +168,77 @@ func TestLimitBody_withinLimitReadsFully(t *testing.T) {
 	}
 	if string(b) != "abc" {
 		t.Errorf("read %q, want abc", b)
+	}
+}
+
+// DecodeJSONInto is the mechanism behind DecodeBody, exposed for apps with their
+// own error taxonomy / cap: it writes NOTHING and returns a typed error.
+func TestDecodeJSONInto_success(t *testing.T) {
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"name":"morpheus"}`))
+	var p payload
+	if err := webhttp.DecodeJSONInto(rr, req, &p, webhttp.MaxJSONBody); err != nil {
+		t.Fatalf("DecodeJSONInto err = %v, want nil", err)
+	}
+	if p.Name != "morpheus" {
+		t.Errorf("Name = %q, want morpheus", p.Name)
+	}
+	if rr.Body.Len() != 0 {
+		t.Errorf("DecodeJSONInto wrote a response: %s", rr.Body.String())
+	}
+}
+
+func TestDecodeJSONInto_malformedReturnsError(t *testing.T) {
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{not json`))
+	var p payload
+	err := webhttp.DecodeJSONInto(rr, req, &p, webhttp.MaxJSONBody)
+	if err == nil {
+		t.Fatal("DecodeJSONInto err = nil, want a decode error")
+	}
+	if rr.Body.Len() != 0 {
+		t.Errorf("DecodeJSONInto wrote a response on error: %s", rr.Body.String())
+	}
+}
+
+func TestDecodeJSONInto_trailingDataIsErrTrailingData(t *testing.T) {
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"name":"a"}{"name":"b"}`))
+	var p payload
+	err := webhttp.DecodeJSONInto(rr, req, &p, webhttp.MaxJSONBody)
+	if !errors.Is(err, webhttp.ErrTrailingData) {
+		t.Fatalf("err = %v, want ErrTrailingData", err)
+	}
+}
+
+// The oversize case surfaces as a *http.MaxBytesError so a caller can map it to
+// 413 (as vibekit does) while a malformed body maps to 400.
+func TestDecodeJSONInto_oversizeIsMaxBytesError(t *testing.T) {
+	// A VALID JSON body that exceeds the cap: the decoder reads past maxBytes
+	// while parsing, so the MaxBytesReader trips. (A non-JSON body would fail
+	// with a syntax error at byte 0, before the cap ever matters.)
+	body := `{"name":"` + strings.Repeat("x", 64) + `"}`
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	var p payload
+	err := webhttp.DecodeJSONInto(rr, req, &p, 16)
+	var maxErr *http.MaxBytesError
+	if !errors.As(err, &maxErr) {
+		t.Fatalf("err = %v (%T), want a *http.MaxBytesError", err, err)
+	}
+}
+
+// The cap is the caller's, not the fixed MaxJSONBody — a body under the given
+// cap decodes even when it would exceed a smaller one.
+func TestDecodeJSONInto_customCap(t *testing.T) {
+	body := `{"name":"` + strings.Repeat("y", 200) + `"}`
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	var p payload
+	if err := webhttp.DecodeJSONInto(rr, req, &p, 4096); err != nil {
+		t.Fatalf("DecodeJSONInto err = %v, want nil under a 4 KiB cap", err)
+	}
+	if len(p.Name) != 200 {
+		t.Errorf("Name len = %d, want 200", len(p.Name))
 	}
 }
