@@ -110,8 +110,11 @@ Put `Recoverer` **inside** `Logging` (logging outermost, e.g. `Chain(mux, Loggin
 ### Client IP
 
 - `ClientIP(r, trusted...) string` — the best-effort client IP
+- `ParseCIDRs(entries) (nets, invalid)` — parse a config/env list of CIDRs or bare IPs into the trusted-proxy `[]*net.IPNet` for `ClientIP`/`WithClientIP`
 
 With **no** trusted ranges (or when the direct peer is not inside one), `X-Forwarded-For` is ignored entirely and the host part of `r.RemoteAddr` (the TCP peer, unspoofable at this layer) is returned — the spoof-proof default, past which no client-sent header can move the result. Only when the direct peer **is** a trusted proxy is `X-Forwarded-For` consulted, and then it is walked **right-to-left**: each entry that is itself a trusted proxy (one of your own hops, which appended the address it saw) is skipped, and the first untrusted entry from the right is returned as the client. This is the only correct reading when the proxy _appends_ the peer it observed to the header (as Caddy and most reverse proxies do): the **leftmost** entry is then whatever the client _sent_ and is attacker-controlled. The trusted set must therefore contain **every** proxy hop between the client and the server; if a hop is missing the walk stops there and that hop's address is returned. `X-Real-IP` is **not** consulted — it is client-settable and Caddy does not overwrite it, so honoring it would reintroduce a spoof vector (it may return later as an explicit opt-in for a proxy that overwrites it). The caller supplies the trusted CIDRs (typically the reverse proxy's range); the library hardcodes none.
+
+`ParseCIDRs(entries []string) (nets []*net.IPNet, invalid []string)` turns an operator-supplied list (a config-file array or a comma-split env var) into that trusted set: each entry is a CIDR (`10.0.0.0/8`) or a bare IP (`192.168.1.5`, treated as a `/32`/`/128`), blanks are skipped, and malformed entries are returned separately so a strict caller can reject them (config validation) while a lenient one can log and use the valid subset (an env var). It exists so every consumer shares one parser instead of reimplementing the CIDR/bare-IP handling; feed its result straight to `ClientIP`/`WithClientIP`.
 
 ### Status recorder
 
