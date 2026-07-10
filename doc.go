@@ -10,9 +10,10 @@
 //     sendfile fast path) keep working (StatusRecorder),
 //   - a composable middleware set: an ordering combinator (Chain), a panic
 //     recoverer (Recoverer), baseline response security headers
-//     (SecurityHeaders), access logging as middleware (Logging), and a JSON
-//     per-route timeout (RouteTimeout), plus a spoof-aware client-IP resolver
-//     that reads X-Forwarded-For only from trusted proxy hops (ClientIP),
+//     (SecurityHeaders), access logging as middleware (Logging), a JSON
+//     per-route timeout (RouteTimeout), and a shared token-bucket rate
+//     limiter (RateLimiter), plus a spoof-aware client-IP resolver that
+//     reads X-Forwarded-For only from trusted proxy hops (ClientIP),
 //   - JSON response and error helpers (WriteJSON, WriteJSONStatus, Ok,
 //     WriteError),
 //   - request-prelude helpers for body limiting, method gating, and JSON
