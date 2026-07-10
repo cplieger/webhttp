@@ -13,8 +13,8 @@ few small, independent pieces:
 - `StatusRecorder` — a status-capturing `http.ResponseWriter` wrapper,
 - `RequestLogger` — request-id middleware with one-line access logging,
 - a composable middleware set — `Chain`, `Recoverer`, `SecurityHeaders`,
-  `Logging`, and `RouteTimeout`, plus the `ClientIP` resolver and the
-  `DefaultStack` correct-order convenience constructor,
+  `Logging`, `RouteTimeout`, and the shared-bucket `RateLimiter`, plus the
+  `ClientIP` resolver and the `DefaultStack` correct-order convenience constructor,
 - JSON helpers — `WriteJSON`, `WriteJSONStatus`, `Ok`, `WriteError`,
 - request-prelude helpers — `LimitBody`, `RequireMethod`, `DecodeBody`,
 - a readiness gate — `Ready`, `ReadinessHandler`,
@@ -72,6 +72,14 @@ A few properties are load-bearing. Keep them when you change the code.
   off unless `WithHSTS` is passed.
 - **Functional options skip nil.** Every `...Option` loop, and `Chain` itself,
   ignores a nil entry so callers can pass conditionally-built values.
+- **`RateLimiter`'s non-positive contract is "off", not "unlimited".** A `burst`
+  or `refillPerSec` `<= 0` returns the next handler unwrapped (no bucket
+  allocated), so a config-driven zero means "no limit" without the caller
+  special-casing it — the same off contract as `RouteTimeout`. The bucket is a
+  single process-wide instance shared across all clients (it bounds the
+  aggregate rate of the wrapped route, not per-client fairness), and the empty-
+  bucket 429 flows through `WriteError` so the throttled response stays the
+  standard JSON envelope. Keep all three properties if you touch it.
 
 ## Local development
 
