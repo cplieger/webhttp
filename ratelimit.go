@@ -9,11 +9,13 @@ import (
 // RateLimitOption configures RateLimiter.
 type RateLimitOption func(*rateLimitConfig)
 
-// rateLimitConfig holds resolved RateLimiter configuration.
+// rateLimitConfig holds resolved RateLimiter configuration. Field order is
+// fieldalignment-optimal (the func pointer precedes the two strings so the
+// GC-scanned pointer range ends earlier), not semantic.
 type rateLimitConfig struct {
+	when func(*http.Request) bool
 	code string
 	msg  string
-	when func(*http.Request) bool
 }
 
 // WithRateLimitError sets the error code and message written in the 429 JSON
