@@ -670,3 +670,92 @@ func firstMessage(recs []slog.Record) string {
 	}
 	return recs[0].Message
 }
+
+// WriteError is the canonical ErrorResponder and the Recoverer default; this
+// assertion locks that the default's signature matches the exported type.
+var _ webhttp.ErrorResponder = webhttp.WriteError
+
+func TestRecoverer_customResponderRendersNonJSON(t *testing.T) {
+	logCap := &captureHandler{}
+	// A non-JSON endpoint supplies an ErrorResponder that writes its own content
+	// type and body; Recoverer must use it for the 500 in place of the JSON default.
+	responder := func(w http.ResponseWriter, _ *http.Request, status int, code, msg string) {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(`<error code="` + code + `">` + msg + `</error>`))
+	}
+	panicky := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic("boom") })
+	h := webhttp.Recoverer(
+		webhttp.WithRecoverLogger(slog.New(logCap)),
+		webhttp.WithRecoverResponder(responder),
+	)(panicky)
+
+	rr := serve(h, http.MethodGet, "/x", nil)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", rr.Code)
+	}
+	if ct := rr.Header().Get("Content-Type"); ct != "application/xml" {
+		t.Errorf("Content-Type = %q, want application/xml (custom responder)", ct)
+	}
+	if got, want := rr.Body.String(), `<error code="internal_error">internal server error</error>`; got != want {
+		t.Errorf("body = %q, want %q", got, want)
+	}
+	// The panic is still logged regardless of the responder.
+	if recs := logCap.snapshot(); len(recs) != 1 || recs[0].Level != slog.LevelError {
+		t.Errorf("got %d records (want exactly 1 at Error) for the recovered panic", len(recs))
+	}
+}
+
+func TestRecoverer_nilResponderKeepsJSONDefault(t *testing.T) {
+	// A nil responder is ignored, so the JSON WriteError default stands.
+	panicky := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic("boom") })
+	h := webhttp.Recoverer(
+		webhttp.WithRecoverLogger(discardLogger()),
+		webhttp.WithRecoverResponder(nil),
+	)(panicky)
+
+	rr := serve(h, http.MethodGet, "/x", nil)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", rr.Code)
+	}
+	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json (nil responder keeps the default)", ct)
+	}
+	var body webhttp.ErrorResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.Code != "internal_error" || body.Error != "internal server error" {
+		t.Errorf("body = %+v, want the default internal_error envelope", body)
+	}
+}
+
+func TestRecoverer_customResponderNotCalledOnCommittedResponse(t *testing.T) {
+	// The commit gate applies to a custom responder too: a handler that commits
+	// then panics must not have the responder write a second status or body.
+	var responderCalls int
+	responder := func(w http.ResponseWriter, r *http.Request, status int, code, msg string) {
+		responderCalls++
+		webhttp.WriteError(w, r, status, code, msg)
+	}
+	panicky := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("partial"))
+		panic("boom after commit")
+	})
+	h := webhttp.Recoverer(
+		webhttp.WithRecoverLogger(discardLogger()),
+		webhttp.WithRecoverResponder(responder),
+	)(panicky)
+
+	rr := serve(h, http.MethodGet, "/x", nil)
+
+	if responderCalls != 0 {
+		t.Errorf("responder called %d times on a committed response, want 0", responderCalls)
+	}
+	if rr.Body.String() != "partial" {
+		t.Errorf("body = %q, want %q (committed response left untouched)", rr.Body.String(), "partial")
+	}
+}

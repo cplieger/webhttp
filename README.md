@@ -96,7 +96,7 @@ All middleware share the standard `func(http.Handler) http.Handler` shape (the `
 - `Middleware` — alias for `func(http.Handler) http.Handler`
 - `Chain(h, mw...) http.Handler` — wraps `h`; the **first** middleware listed is the **outermost** wrapper (first to see the request, last to touch the response), so `Chain(h, A, B, C)` is `A(B(C(h)))`. A nil entry is skipped.
 - `DefaultStack(h, opts...) http.Handler` — the batteries-included counterpart to `Chain`: it composes `Logging`, `Recoverer`, and `SecurityHeaders` in the one correct order (Logging outermost) so the common observability-safe stack is correct-by-construction. Configure each layer with `WithLoggingOptions`, `WithRecovererOptions`, and `WithSecurityHeadersOptions`; the free functions stay the primary API for any custom stack.
-- `Recoverer(opts...) Middleware` — recovers a downstream panic, logs it at `Error` with the stack and request id, fires an optional hook, then writes `WriteError(w, r, 500, "internal_error", "internal server error")`. Re-panics `http.ErrAbortHandler` per the net/http contract. Options: `WithRecoverLogger(l)`, `WithPanicHook(fn)`
+- `Recoverer(opts...) Middleware` — recovers a downstream panic, logs it at `Error` with the stack and request id, fires an optional hook, then writes a 500 via the configured `ErrorResponder` (the JSON `WriteError(w, r, 500, "internal_error", "internal server error")` by default; override with `WithRecoverResponder` to render the 500 on another content type). Re-panics `http.ErrAbortHandler` per the net/http contract. Options: `WithRecoverLogger(l)`, `WithPanicHook(fn)`, `WithRecoverResponder(fn)`
 - `SecurityHeaders(opts...) Middleware` — sets baseline response headers before the next handler. Always `X-Content-Type-Options: nosniff`; defaults `X-Frame-Options: DENY` and `Referrer-Policy: strict-origin-when-cross-origin`. Options: `WithCSP`, `WithFrameOptions`, `WithReferrerPolicy`, `WithPermissionsPolicy`, `WithCOOP`, `WithHSTS(maxAge, includeSubDomains, preload)`
 - `Logging(opts...) Middleware` — `RequestLogger` in `Chain`-composable form; takes the same `LogOption` values. `RequestLogger(next, opts...)` stays available for direct use
 - `RouteTimeout(h, d, msg) http.Handler` — wraps `http.TimeoutHandler`; on timeout emits a 503 JSON `ErrorResponse` (`code: "timeout"`) as `application/json` instead of the plain-text/HTML default
@@ -150,6 +150,7 @@ An inbound `X-Request-ID` is reused when it satisfies `ValidRequestID`, otherwis
 - `Ok(w)` — 200 `{"ok":true}`
 - `WriteError(w, r, status, code, msg)` — writes `ErrorResponse`; nil-safe when `r` is nil
 - `ErrorResponse{Error, Code, RequestID}` — `Code` and `RequestID` omitted when empty
+- `ErrorResponder` — `func(w, r, status, code, msg)`, the signature of `WriteError` (its canonical instance and the default). Middleware that emits an error body takes one so a non-JSON endpoint can render its error on its own content type; `Recoverer` accepts it via `WithRecoverResponder`
 
 `WriteError` pulls the request id from the request context so a client can correlate a failure with the access log. It ships the mechanism; keep your own named-helper and error-code taxonomy on top.
 
