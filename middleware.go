@@ -47,8 +47,9 @@ func Chain(h http.Handler, mw ...Middleware) http.Handler {
 
 // recoverConfig holds resolved Recoverer configuration.
 type recoverConfig struct {
-	logger *slog.Logger
-	hook   func(v any, stack []byte)
+	logger    *slog.Logger
+	hook      func(v any, stack []byte)
+	responder ErrorResponder
 }
 
 // RecoverOption configures Recoverer.
@@ -68,12 +69,28 @@ func WithPanicHook(fn func(v any, stack []byte)) RecoverOption {
 	return func(c *recoverConfig) { c.hook = fn }
 }
 
+// WithRecoverResponder sets the ErrorResponder that writes the 500 body after a
+// recovered panic (only when the response is not already committed). It defaults
+// to WriteError - the JSON envelope; supply one to render the 500 on a different
+// content type, for example an XML endpoint returning its own error document.
+// The responder owns writing the status and headers. A nil responder is ignored,
+// keeping the default.
+func WithRecoverResponder(fn ErrorResponder) RecoverOption {
+	return func(c *recoverConfig) {
+		if fn != nil {
+			c.responder = fn
+		}
+	}
+}
+
 // Recoverer returns middleware that recovers a panic from a downstream handler,
 // logs it at Error with the stack and the request id (via
 // RequestIDFromContext), fires any WithPanicHook callback, and writes a 500
-// JSON error via WriteError(w, r, 500, "internal_error", "internal server
-// error"). Without it, a handler panic unwinds to net/http, which closes the
-// connection abruptly with no response body.
+// error via the configured ErrorResponder - WriteError by default, i.e. the
+// JSON envelope {"error":"internal server error","code":"internal_error"}.
+// Override the responder with WithRecoverResponder to render the 500 on another
+// content type. Without it, a handler panic unwinds to net/http, which closes
+// the connection abruptly with no response body.
 //
 // The http.ErrAbortHandler sentinel is deliberately NOT recovered: per the
 // net/http contract it is re-panicked so the server aborts the response the way
@@ -103,6 +120,9 @@ func Recoverer(opts ...RecoverOption) Middleware {
 	}
 	if c.logger == nil {
 		c.logger = slog.Default()
+	}
+	if c.responder == nil {
+		c.responder = WriteError
 	}
 
 	return func(next http.Handler) http.Handler {
@@ -134,7 +154,8 @@ type committedResponse interface {
 // recoverPanic is the deferred recovery body for the Recoverer middleware. It
 // re-panics http.ErrAbortHandler untouched (the net/http silent-abort contract)
 // and otherwise logs the panic with its stack and request id, fires any hook,
-// and writes the 500 JSON error unless the response was already committed.
+// and writes the 500 error via the configured responder unless the response was
+// already committed.
 func (c *recoverConfig) recoverPanic(w http.ResponseWriter, committed committedResponse, r *http.Request) {
 	v := recover()
 	if v == nil {
@@ -156,7 +177,7 @@ func (c *recoverConfig) recoverPanic(w http.ResponseWriter, committed committedR
 	// an already-started response corrupts the body and, under an outer Logging,
 	// would mislog the status as the handler's first (e.g. 200) rather than 500.
 	if !committed.Wrote() {
-		WriteError(w, r, http.StatusInternalServerError, "internal_error", "internal server error")
+		c.responder(w, r, http.StatusInternalServerError, "internal_error", "internal server error")
 	}
 }
 

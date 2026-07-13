@@ -66,3 +66,12 @@ func WriteError(w http.ResponseWriter, r *http.Request, status int, code, msg st
 	}
 	WriteJSONStatus(w, status, resp)
 }
+
+// ErrorResponder renders an error response body. It has the exact signature of
+// WriteError, which is its canonical instance and the library-wide default, so
+// the JSON envelope is the zero-config behavior. Middleware that emits an error
+// body (currently Recoverer, via WithRecoverResponder) accepts one so a non-JSON
+// endpoint - an XML or plain-text service - can keep its error body on its own
+// content type instead of the default JSON. A responder owns writing the status
+// and any headers, and is invoked only when the response has not been committed.
+type ErrorResponder func(w http.ResponseWriter, r *http.Request, status int, code, msg string)
