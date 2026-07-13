@@ -66,7 +66,11 @@ func WithRecoverLogger(l *slog.Logger) RecoverOption {
 // an error tracker. It runs after the panic is logged and before the 500
 // response is written; a nil hook is ignored.
 func WithPanicHook(fn func(v any, stack []byte)) RecoverOption {
-	return func(c *recoverConfig) { c.hook = fn }
+	return func(c *recoverConfig) {
+		if fn != nil {
+			c.hook = fn
+		}
+	}
 }
 
 // WithRecoverResponder sets the ErrorResponder that writes the 500 body after a
@@ -165,20 +169,49 @@ func (c *recoverConfig) recoverPanic(w http.ResponseWriter, committed committedR
 		panic(v)
 	}
 	stack := debug.Stack()
+	requestID := RequestIDFromContext(r.Context())
 	c.logger.Error("webhttp: recovered from panic",
 		"panic", v,
 		"stack", string(stack),
-		"request_id", RequestIDFromContext(r.Context()),
+		"request_id", requestID,
 	)
 	if c.hook != nil {
-		c.hook(v, stack)
+		c.fireHook(v, stack, requestID)
 	}
 	// Only write the 500 when the response has not been committed. Writing onto
 	// an already-started response corrupts the body and, under an outer Logging,
 	// would mislog the status as the handler's first (e.g. 200) rather than 500.
 	if !committed.Wrote() {
-		c.responder(w, r, http.StatusInternalServerError, "internal_error", "internal server error")
+		c.writeRecoverResponse(w, r, committed, requestID)
 	}
+}
+
+// fireHook runs the caller-supplied panic hook in isolation: a panic inside it
+// is logged as a secondary failure (carrying the original request id) and
+// swallowed, so it cannot abort recovery before the 500 is written.
+func (c *recoverConfig) fireHook(v any, stack []byte, requestID string) {
+	defer func() {
+		if hv := recover(); hv != nil {
+			c.logger.Error("webhttp: panic hook failed", "panic", hv, "stack", string(debug.Stack()), "request_id", requestID)
+		}
+	}()
+	c.hook(v, stack)
+}
+
+// writeRecoverResponse writes the 500 via the configured responder in isolation:
+// a pre-commit responder panic falls back to the default JSON 500 (re-guarded by
+// !Wrote() so it never double-writes), while a post-commit responder panic can
+// only be logged.
+func (c *recoverConfig) writeRecoverResponse(w http.ResponseWriter, r *http.Request, committed committedResponse, requestID string) {
+	defer func() {
+		if rv := recover(); rv != nil {
+			c.logger.Error("webhttp: recover responder failed", "panic", rv, "stack", string(debug.Stack()), "request_id", requestID)
+			if !committed.Wrote() {
+				WriteError(w, r, http.StatusInternalServerError, "internal_error", "internal server error")
+			}
+		}
+	}()
+	c.responder(w, r, http.StatusInternalServerError, "internal_error", "internal server error")
 }
 
 // securityConfig holds resolved SecurityHeaders configuration. An empty field
@@ -352,7 +385,11 @@ func ClientIP(r *http.Request, trusted ...*net.IPNet) string {
 		return host
 	}
 
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+	if xff := strings.Join(r.Header.Values("X-Forwarded-For"), ","); xff != "" {
+		// Values (not Get) so multiple X-Forwarded-For header LINES are treated
+		// as the single comma-joined value RFC 7230 defines, closing a spoof gap
+		// where a proxy that adds a separate line instead of comma-appending
+		// would otherwise leave Get reading only the client's spoofed first line.
 		// Walk right-to-left, skipping our own trusted hops; the first untrusted
 		// entry from the right is the client.
 		for _, part := range slices.Backward(strings.Split(xff, ",")) {

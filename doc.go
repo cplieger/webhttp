@@ -8,7 +8,8 @@
 //     also implements http.Flusher/http.Hijacker/io.ReaderFrom passthroughs, so
 //     both ResponseController-based and direct-type-assertion callers (plus the
 //     sendfile fast path) keep working (StatusRecorder),
-//   - a composable middleware set: an ordering combinator (Chain), a panic
+//   - a composable middleware set: an ordering combinator (Chain) plus its
+//     batteries-included correct-order convenience (DefaultStack), a panic
 //     recoverer (Recoverer), baseline response security headers
 //     (SecurityHeaders), access logging as middleware (Logging), a JSON
 //     per-route timeout (RouteTimeout), and a shared token-bucket rate

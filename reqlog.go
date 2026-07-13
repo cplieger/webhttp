@@ -7,6 +7,9 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"runtime/debug"
+	"strconv"
+	"sync/atomic"
 	"time"
 )
 
@@ -41,14 +44,33 @@ func ValidRequestID(s string) bool {
 	return true
 }
 
+// fallbackCounter supplies per-request uniqueness for the NewRequestID
+// degraded path. It is advanced only when crypto/rand fails, so under normal
+// operation it stays at zero and costs nothing.
+var fallbackCounter atomic.Uint64
+
+// fallbackRequestID builds the crypto/rand-failure fallback id: a UTC timestamp
+// in the "20060102T150405" layout joined by a hyphen to a process-local base36
+// counter ("20060102T150405-<counter>"). The counter gives each fallback id
+// per-request uniqueness so multiple degraded requests within the same second
+// do not collide. Both components stay within the ValidRequestID charset
+// (base36 is [0-9a-z], the hyphen is allowed) and the result is well under 64
+// bytes.
+func fallbackRequestID() string {
+	n := fallbackCounter.Add(1)
+	return time.Now().UTC().Format("20060102T150405") + "-" + strconv.FormatUint(n, 36)
+}
+
 // NewRequestID returns a fresh request id: 16 cryptographically random bytes,
 // hex-encoded to 32 characters. If the system random source fails, it falls
-// back to a UTC timestamp in the "20060102T150405" layout, which contains no
-// dot and stays within the ValidRequestID character set.
+// back to fallbackRequestID — a UTC timestamp joined to a process-local base36
+// counter — which contains no dot, stays within the ValidRequestID character
+// set, and is unique per request so a sustained entropy failure does not
+// produce colliding ids that break log/response correlation.
 func NewRequestID() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		return time.Now().UTC().Format("20060102T150405")
+		return fallbackRequestID()
 	}
 	return hex.EncodeToString(b[:])
 }
@@ -149,9 +171,14 @@ func WithClientIP(trusted ...*net.IPNet) LogOption {
 // (never on a skipped path), and its result is logged verbatim as "client_ip".
 // It composes with WithRecordMetric. WithClientIP and WithClientIPFunc both
 // enable the attribute and are mutually exclusive; whichever is applied last
-// wins.
+// wins. A nil fn is ignored (matching the package's skip-nil option
+// convention), so a trailing WithClientIPFunc(nil) neither enables the
+// attribute nor clears a prior WithClientIP.
 func WithClientIPFunc(fn func(*http.Request) string) LogOption {
 	return func(c *logConfig) {
+		if fn == nil {
+			return
+		}
 		c.logClientIP = true
 		c.clientIPFunc = fn
 		c.clientIPTrusted = nil
@@ -171,22 +198,78 @@ func (c *logConfig) resolveClientIP(r *http.Request) string {
 // emitAccessLog writes the single access-log line and fires the optional metric
 // hook. RequestLogger defers it, so a panicking handler is still logged with its
 // recorded status (rec is read when the deferred call runs).
+//
+// Both caller-supplied observability callbacks — the WithClientIPFunc resolver
+// and the WithRecordMetric hook — run through recover guards. This defer sits in
+// the outer Logging layer, OUTSIDE Recoverer (Logging is outermost so it can log
+// the recovered 500), so a panic raised here happens after Recoverer has already
+// returned and would escape to net/http and close the connection. Isolating each
+// callback keeps a buggy resolver or metric hook from turning an otherwise
+// completed request into a connection reset; it degrades gracefully instead —
+// the client_ip attribute is omitted, or the metric is skipped — mirroring
+// Recoverer's isolation of its WithPanicHook.
 func (c *logConfig) emitAccessLog(rec *StatusRecorder, r *http.Request, path, id string, start time.Time) {
 	d := time.Since(start)
+	status := rec.Status()
 	args := []any{
 		"method", r.Method,
 		"path", path,
-		"status", rec.Status(),
+		"status", status,
 		"duration_ms", d.Milliseconds(),
 		"request_id", id,
 	}
 	if c.logClientIP {
-		args = append(args, "client_ip", c.resolveClientIP(r))
+		if ip, ok := c.safeClientIP(r, id, path); ok {
+			args = append(args, "client_ip", ip)
+		}
 	}
 	c.logger.Info("http", args...)
 	if c.recordMetric != nil {
-		c.recordMetric(r.Method, path, rec.Status(), d)
+		c.safeRecordMetric(r, path, status, d, id)
 	}
+}
+
+// safeClientIP resolves the "client_ip" value in isolation. A panic in the
+// caller-supplied WithClientIPFunc resolver (or in ClientIP) is logged as a hook
+// failure and reported as ok=false, so emitAccessLog omits ONLY the client_ip
+// attribute and the access line still emits, rather than letting the panic
+// escape the outer Logging defer and close the connection.
+func (c *logConfig) safeClientIP(r *http.Request, id, path string) (ip string, ok bool) {
+	defer func() {
+		if v := recover(); v != nil {
+			c.logger.Error("webhttp: client_ip resolver failed",
+				"panic", v,
+				"stack", string(debug.Stack()),
+				"request_id", id,
+				"method", r.Method,
+				"path", path,
+			)
+			ip, ok = "", false
+		}
+	}()
+	return c.resolveClientIP(r), true
+}
+
+// safeRecordMetric fires the caller-supplied WithRecordMetric hook in isolation.
+// A panic in the hook is logged as a hook failure and swallowed — the metric for
+// this request is skipped — so it cannot escape the outer Logging defer (which
+// runs outside Recoverer) and turn a completed request into a net/http
+// connection-closing panic.
+func (c *logConfig) safeRecordMetric(r *http.Request, path string, status int, d time.Duration, id string) {
+	defer func() {
+		if v := recover(); v != nil {
+			c.logger.Error("webhttp: metric hook failed",
+				"panic", v,
+				"stack", string(debug.Stack()),
+				"request_id", id,
+				"method", r.Method,
+				"path", path,
+				"status", status,
+				"duration_ms", d.Milliseconds(),
+			)
+		}
+	}()
+	c.recordMetric(r.Method, path, status, d)
 }
 
 // RequestLogger returns middleware that gives each request a request id, echoes

@@ -159,6 +159,25 @@ func TestRecoverer_panicHookFires(t *testing.T) {
 	}
 }
 
+func TestRecoverer_nilPanicHookKeepsPriorHook(t *testing.T) {
+	var hookCalls int
+	hook := func(any, []byte) { hookCalls++ }
+	panicky := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic("boom") })
+	h := webhttp.Recoverer(
+		webhttp.WithRecoverLogger(discardLogger()),
+		webhttp.WithPanicHook(hook),
+		webhttp.WithPanicHook(nil),
+	)(panicky)
+
+	rr := serve(h, http.MethodGet, "/x", nil)
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", rr.Code)
+	}
+	if hookCalls != 1 {
+		t.Errorf("hook called %d times, want 1 (nil hook option must be ignored)", hookCalls)
+	}
+}
+
 func TestRecoverer_noPanicPassesThrough(t *testing.T) {
 	logCap := &captureHandler{}
 	var hookCalls int
@@ -522,6 +541,29 @@ func TestClientIP(t *testing.T) {
 	}
 }
 
+// TestClientIP_multiLineXFF proves ClientIP treats multiple X-Forwarded-For
+// header LINES as the single comma-joined value RFC 7230 defines, rather than
+// reading only the first line (the old Header.Get behavior). A client sends a
+// spoofed first XFF line; a trusted proxy that appends the peer it observed as
+// a SEPARATE header line (instead of comma-appending) must not let the spoofed
+// first line win. The right-to-left walk must still select the real appended
+// entry, closing the spoof gap.
+func TestClientIP_multiLineXFF(t *testing.T) {
+	_, trusted, err := net.ParseCIDR("10.0.0.0/8")
+	if err != nil {
+		t.Fatalf("bad test CIDR: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "10.0.0.1:9999" // immediate peer is a trusted proxy
+	// Two separate X-Forwarded-For header lines: the client's spoofed value
+	// first, then the real client the trusted proxy observed and appended.
+	req.Header.Add("X-Forwarded-For", "1.2.3.4")      // spoofed by the client
+	req.Header.Add("X-Forwarded-For", "198.51.100.9") // real peer, added by proxy
+	if got := webhttp.ClientIP(req, trusted); got != "198.51.100.9" {
+		t.Errorf("ClientIP() with multi-line XFF = %q, want 198.51.100.9 (rightmost untrusted entry, not the spoofed first line)", got)
+	}
+}
+
 func TestRouteTimeout_fastHandlerPasses(t *testing.T) {
 	h := webhttp.RouteTimeout(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
@@ -757,5 +799,138 @@ func TestRecoverer_customResponderNotCalledOnCommittedResponse(t *testing.T) {
 	}
 	if rr.Body.String() != "partial" {
 		t.Errorf("body = %q, want %q (committed response left untouched)", rr.Body.String(), "partial")
+	}
+}
+
+func TestRecoverer_panicHookPanicIsIsolated(t *testing.T) {
+	logCap := &captureHandler{}
+	// The caller's panic hook itself panics. That secondary failure must be
+	// isolated: logged with the original request id, and recovery continues so
+	// the client still receives the 500 rather than an aborted connection.
+	panicHook := func(any, []byte) { panic("hook boom") }
+	panicky := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic("boom") })
+
+	// Logging outermost so the deferred access line's recorded status can be
+	// asserted; both the recoverer and the logger write into logCap, so records
+	// are filtered by message.
+	h := webhttp.Chain(panicky,
+		webhttp.Logging(webhttp.WithLogger(slog.New(logCap))),
+		webhttp.Recoverer(
+			webhttp.WithRecoverLogger(slog.New(logCap)),
+			webhttp.WithPanicHook(panicHook),
+		),
+	)
+
+	rr := serve(h, http.MethodGet, "/x", nil)
+
+	// The client still receives the JSON 500 despite the hook panicking.
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500 (a hook panic must not abort the 500)", rr.Code)
+	}
+	var body webhttp.ErrorResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v (body=%q)", err, rr.Body.String())
+	}
+	if body.Code != "internal_error" || body.Error != "internal server error" {
+		t.Errorf("body = %+v, want the default internal_error envelope", body)
+	}
+
+	// The secondary hook failure is logged with the original request id, and the
+	// outer access line records the 500 the client received.
+	var accessStatus any
+	var hookFailID, recoveredID string
+	sawHookFail := false
+	for _, rec := range logCap.snapshot() {
+		m := attrsOf(rec)
+		switch rec.Message {
+		case "http":
+			accessStatus = m["status"]
+		case "webhttp: panic hook failed":
+			sawHookFail = true
+			hookFailID, _ = m["request_id"].(string)
+			if m["panic"] != "hook boom" {
+				t.Errorf("hook-failure panic attr = %v, want 'hook boom'", m["panic"])
+			}
+		case "webhttp: recovered from panic":
+			recoveredID, _ = m["request_id"].(string)
+		}
+	}
+	if !sawHookFail {
+		t.Fatal("no 'webhttp: panic hook failed' log record; the hook panic was not isolated")
+	}
+	if accessStatus != int64(http.StatusInternalServerError) {
+		t.Errorf("access line status = %v, want 500 (Recoverer inside Logging)", accessStatus)
+	}
+	echoed := rr.Header().Get(webhttp.HeaderRequestID)
+	if hookFailID == "" || hookFailID != recoveredID || hookFailID != echoed {
+		t.Errorf("hook-failure request_id = %q, want the recovered/echoed id (recovered=%q echoed=%q)",
+			hookFailID, recoveredID, echoed)
+	}
+}
+
+func TestRecoverer_responderPanicBeforeCommitFallsBackToJSON500(t *testing.T) {
+	logCap := &captureHandler{}
+	// A custom responder that panics BEFORE writing any header or body
+	// (pre-commit). The response is still uncommitted, so the recovery must fall
+	// back to the default JSON 500 and the client still receives a 500.
+	responder := func(http.ResponseWriter, *http.Request, int, string, string) {
+		panic("responder boom")
+	}
+	panicky := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic("boom") })
+
+	h := webhttp.Chain(panicky,
+		webhttp.Logging(webhttp.WithLogger(slog.New(logCap))),
+		webhttp.Recoverer(
+			webhttp.WithRecoverLogger(slog.New(logCap)),
+			webhttp.WithRecoverResponder(responder),
+		),
+	)
+
+	rr := serve(h, http.MethodGet, "/x", nil)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500 (pre-commit responder panic falls back to JSON 500)", rr.Code)
+	}
+	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json (fallback default responder)", ct)
+	}
+	var body webhttp.ErrorResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v (body=%q)", err, rr.Body.String())
+	}
+	if body.Code != "internal_error" || body.Error != "internal server error" {
+		t.Errorf("body = %+v, want the default internal_error envelope", body)
+	}
+
+	// The secondary responder failure is logged with the original request id, and
+	// the outer access line records the 500 the client received.
+	var accessStatus any
+	var responderFailID, recoveredID string
+	sawResponderFail := false
+	for _, rec := range logCap.snapshot() {
+		m := attrsOf(rec)
+		switch rec.Message {
+		case "http":
+			accessStatus = m["status"]
+		case "webhttp: recover responder failed":
+			sawResponderFail = true
+			responderFailID, _ = m["request_id"].(string)
+			if m["panic"] != "responder boom" {
+				t.Errorf("responder-failure panic attr = %v, want 'responder boom'", m["panic"])
+			}
+		case "webhttp: recovered from panic":
+			recoveredID, _ = m["request_id"].(string)
+		}
+	}
+	if !sawResponderFail {
+		t.Fatal("no 'webhttp: recover responder failed' log record; the responder panic was not isolated")
+	}
+	if accessStatus != int64(http.StatusInternalServerError) {
+		t.Errorf("access line status = %v, want 500 (Recoverer inside Logging)", accessStatus)
+	}
+	echoed := rr.Header().Get(webhttp.HeaderRequestID)
+	if responderFailID == "" || responderFailID != recoveredID || responderFailID != echoed {
+		t.Errorf("responder-failure request_id = %q, want the recovered/echoed id (recovered=%q echoed=%q)",
+			responderFailID, recoveredID, echoed)
 	}
 }

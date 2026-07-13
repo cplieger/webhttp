@@ -519,3 +519,124 @@ func TestRequestLogger_clientIPOptionsMutuallyExclusive(t *testing.T) {
 		t.Errorf("client_ip = %v, want the trusted-XFF client 203.0.113.5", got)
 	}
 }
+
+// WithClientIPFunc(nil) is a no-op (matching the package's nil-option
+// convention), so no client_ip attribute is emitted.
+func TestRequestLogger_withClientIPFuncNilIsNoOp(t *testing.T) {
+	logCap := &captureHandler{}
+	h := webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(slog.New(logCap)),
+		webhttp.WithClientIPFunc(nil))
+
+	serveWithPeer(h, "192.0.2.1:1234", "203.0.113.5")
+
+	recs := logCap.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("got %d log records, want 1", len(recs))
+	}
+	if _, ok := attrsOf(recs[0])["client_ip"]; ok {
+		t.Error("client_ip attr present after WithClientIPFunc(nil); want absent")
+	}
+}
+
+// A nil WithClientIPFunc applied after WithClientIP does not clear the prior
+// trusted-set resolver: the nil callback is ignored, not last-wins.
+func TestRequestLogger_withClientIPFuncNilKeepsPriorTrustedSet(t *testing.T) {
+	logCap := &captureHandler{}
+	h := webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(slog.New(logCap)),
+		webhttp.WithClientIP(mustCIDR(t, "192.0.2.0/24")),
+		webhttp.WithClientIPFunc(nil))
+
+	serveWithPeer(h, "192.0.2.1:1234", "203.0.113.5")
+
+	if got := attrsOf(logCap.snapshot()[0])["client_ip"]; got != "203.0.113.5" {
+		t.Errorf("client_ip = %v, want the trusted-XFF client 203.0.113.5 (nil func ignored)", got)
+	}
+}
+
+// A panicking WithClientIPFunc resolver must not escape the outer Logging defer
+// (which sits outside Recoverer): the request still completes, the access line
+// is still emitted, and only the client_ip attribute is omitted.
+func TestRequestLogger_panickingClientIPResolverStillEmitsAccessLine(t *testing.T) {
+	logCap := &captureHandler{}
+	h := webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(slog.New(logCap)),
+		webhttp.WithClientIPFunc(func(*http.Request) string { panic("resolver boom") }))
+
+	// A panic in the resolver must be contained, not propagated out of ServeHTTP.
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("client-IP resolver panic escaped RequestLogger: %v", r)
+			}
+		}()
+		serveWithPeer(h, "192.0.2.1:1234", "203.0.113.5")
+	}()
+
+	recs := logCap.snapshot()
+	// Expect the resolver-failure log AND the access line.
+	var access *slog.Record
+	var sawFailure bool
+	for i := range recs {
+		switch recs[i].Message {
+		case "http":
+			access = &recs[i]
+		case "webhttp: client_ip resolver failed":
+			sawFailure = true
+		}
+	}
+	if !sawFailure {
+		t.Error("expected a 'client_ip resolver failed' log record, got none")
+	}
+	if access == nil {
+		t.Fatal("access line was not emitted after resolver panic")
+	}
+	if _, ok := attrsOf(*access)["client_ip"]; ok {
+		t.Error("client_ip attr present after resolver panic; want omitted")
+	}
+	if m := attrsOf(*access); m["status"] != int64(http.StatusOK) {
+		t.Errorf("access line status = %v, want 200", m["status"])
+	}
+}
+
+// A panicking WithRecordMetric hook must not escape the outer Logging defer: the
+// request still completes and the access line is still emitted (the metric for
+// this request is simply skipped).
+func TestRequestLogger_panickingMetricHookStillEmitsAccessLine(t *testing.T) {
+	logCap := &captureHandler{}
+	h := webhttp.RequestLogger(statusHandler(http.StatusAccepted),
+		webhttp.WithLogger(slog.New(logCap)),
+		webhttp.WithRecordMetric(func(_, _ string, _ int, _ time.Duration) { panic("metric boom") }))
+
+	// A panic in the metric hook must be contained, not propagated out of ServeHTTP.
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("metric hook panic escaped RequestLogger: %v", r)
+			}
+		}()
+		serve(h, http.MethodPut, "/metric", nil)
+	}()
+
+	recs := logCap.snapshot()
+	var access *slog.Record
+	var sawFailure bool
+	for i := range recs {
+		switch recs[i].Message {
+		case "http":
+			access = &recs[i]
+		case "webhttp: metric hook failed":
+			sawFailure = true
+		}
+	}
+	if !sawFailure {
+		t.Error("expected a 'metric hook failed' log record, got none")
+	}
+	if access == nil {
+		t.Fatal("access line was not emitted after metric hook panic")
+	}
+	if m := attrsOf(*access); m["status"] != int64(http.StatusAccepted) {
+		t.Errorf("access line status = %v, want %d", m["status"], http.StatusAccepted)
+	}
+}
