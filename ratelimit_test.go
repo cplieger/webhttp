@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -60,8 +62,8 @@ func TestTokenBucketAllowLocked(t *testing.T) {
 // requests are admitted and the rest get 429.
 func TestRateLimiterAllowsBurstThenLimits(t *testing.T) {
 	hits := 0
-	// refillPerSec 0.01 => one token every 100s, far longer than the test.
-	h := RateLimiter(2, 0.01)(okHandler(&hits))
+	// interval 100s => one token every 100s, far longer than the test.
+	h := RateLimiter(2, 100*time.Second)(okHandler(&hits))
 
 	codes := make([]int, 0, 5)
 	for range 5 {
@@ -85,7 +87,7 @@ func TestRateLimiterAllowsBurstThenLimits(t *testing.T) {
 // WriteError JSON envelope and that WithRateLimitError overrides code+message.
 func TestRateLimiter429Envelope(t *testing.T) {
 	hits := 0
-	h := RateLimiter(1, 0.01, WithRateLimitError("session_rate", "too many sessions"))(okHandler(&hits))
+	h := RateLimiter(1, 100*time.Second, WithRateLimitError("session_rate", "too many sessions"))(okHandler(&hits))
 
 	// Drain the single token, then trip the limit.
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/x", nil))
@@ -107,12 +109,46 @@ func TestRateLimiter429Envelope(t *testing.T) {
 	}
 }
 
+// TestRateLimiter429SetsRetryAfter pins the conservative whole-second
+// Retry-After header on throttled 429s: a fractional interval rounds up (ceil),
+// and a sub-second interval clamps to the 1s floor.
+func TestRateLimiter429SetsRetryAfter(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		interval time.Duration
+		want     string
+	}{
+		{"fractional interval rounds up", 2500 * time.Millisecond, "3"},
+		{"sub-second interval clamps to one second", 10 * time.Millisecond, "1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hits := 0
+			h := RateLimiter(1, tc.interval)(okHandler(&hits))
+
+			// Drain the single token, then trip the limit.
+			h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/x", nil))
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/x", nil))
+
+			if rec.Code != http.StatusTooManyRequests {
+				t.Fatalf("status = %d, want 429", rec.Code)
+			}
+			if got := rec.Header().Get("Retry-After"); got != tc.want {
+				t.Errorf("Retry-After = %q, want %q", got, tc.want)
+			}
+			if hits != 1 {
+				t.Errorf("next handler ran %d times, want 1 (throttled request must not reach it)", hits)
+			}
+		})
+	}
+}
+
 // TestRateLimiterWithRateLimitWhenPassesThrough verifies the predicate gate:
 // only matching requests draw from the bucket; non-matching ones always pass,
 // even after the bucket is empty.
 func TestRateLimiterWithRateLimitWhenPassesThrough(t *testing.T) {
 	hits := 0
-	limited := RateLimiter(1, 0.01, WithRateLimitWhen(func(r *http.Request) bool {
+	limited := RateLimiter(1, 100*time.Second, WithRateLimitWhen(func(r *http.Request) bool {
 		return r.Method == http.MethodPost
 	}))(okHandler(&hits))
 
@@ -134,21 +170,22 @@ func TestRateLimiterWithRateLimitWhenPassesThrough(t *testing.T) {
 	}
 }
 
-// TestRateLimiterNonPositiveDisables confirms a non-positive burst or refill
+// TestRateLimiterNonPositiveDisables confirms a non-positive burst or interval
 // returns the handler unwrapped: every request passes, none is throttled.
 func TestRateLimiterNonPositiveDisables(t *testing.T) {
 	for _, tc := range []struct {
-		name              string
-		burst, refillRate float64
+		name     string
+		burst    int
+		interval time.Duration
 	}{
-		{"zero burst", 0, 1},
-		{"negative burst", -1, 1},
-		{"zero refill", 5, 0},
-		{"negative refill", 5, -1},
+		{"zero burst", 0, time.Second},
+		{"negative burst", -1, time.Second},
+		{"zero interval", 5, 0},
+		{"negative interval", 5, -time.Second},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			hits := 0
-			h := RateLimiter(tc.burst, tc.refillRate)(okHandler(&hits))
+			h := RateLimiter(tc.burst, tc.interval)(okHandler(&hits))
 			for range 10 {
 				rec := httptest.NewRecorder()
 				h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/x", nil))
@@ -160,5 +197,38 @@ func TestRateLimiterNonPositiveDisables(t *testing.T) {
 				t.Errorf("next handler ran %d times, want 10 (no throttling)", hits)
 			}
 		})
+	}
+}
+
+func TestRateLimiter_concurrentAdmitsAtMostBurst(t *testing.T) {
+	const burst = 50
+	// The interval is far longer than the test window, so no extra token
+	// accrues: the bucket holds exactly burst tokens for the whole run.
+	h := RateLimiter(burst, 3*time.Hour)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	const goroutines = 200
+	var admitted atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for range goroutines {
+		go func() {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/x", nil))
+			if rec.Code == http.StatusOK {
+				admitted.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Under correct locking exactly burst requests win a token regardless of
+	// concurrency; a dropped or wrongly-scoped lock lets two goroutines both
+	// observe tokens>=1 and both decrement (check-then-act race), over-admitting.
+	if got := admitted.Load(); got != burst {
+		t.Errorf("admitted %d requests concurrently, want exactly burst=%d "+
+			"(a dropped lock over-admits via a check-then-act race)", got, burst)
 	}
 }

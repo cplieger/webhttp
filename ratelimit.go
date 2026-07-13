@@ -1,7 +1,9 @@
 package webhttp
 
 import (
+	"math"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -9,9 +11,7 @@ import (
 // RateLimitOption configures RateLimiter.
 type RateLimitOption func(*rateLimitConfig)
 
-// rateLimitConfig holds resolved RateLimiter configuration. Field order is
-// fieldalignment-optimal (the func pointer precedes the two strings so the
-// GC-scanned pointer range ends earlier), not semantic.
+// rateLimitConfig holds resolved RateLimiter configuration.
 type rateLimitConfig struct {
 	when func(*http.Request) bool
 	code string
@@ -42,12 +42,14 @@ func WithRateLimitWhen(pred func(*http.Request) bool) RateLimitOption {
 
 // RateLimiter returns middleware that throttles requests through a single
 // shared token bucket (standard library only, no external dependency). burst is
-// the maximum number of tokens and the initial fill; refillPerSec is the steady
-// refill rate in tokens per second. Each admitted request consumes one token; a
-// request that arrives with the bucket empty is answered with a 429 via
-// WriteError(w, r, http.StatusTooManyRequests, "rate_limited", "rate limit
+// the maximum number of tokens and the initial fill; interval is the time to
+// accrue one token (the refill cadence). Each admitted request consumes one
+// token; a request that arrives with the bucket empty is answered with a 429
+// via WriteError(w, r, http.StatusTooManyRequests, "rate_limited", "rate limit
 // exceeded") (code and message overridable with WithRateLimitError) and does
-// not reach the next handler.
+// not reach the next handler. The 429 carries a conservative Retry-After hint:
+// the whole seconds to accrue one token, i.e. ceil(interval), clamped to at
+// least 1s.
 //
 // The bucket is process-wide for the middleware instance — shared across all
 // requests and all clients — so it bounds the AGGREGATE rate of the wrapped
@@ -56,21 +58,22 @@ func WithRateLimitWhen(pred func(*http.Request) bool) RateLimitOption {
 // fairness. Per-client limiting is intentionally out of scope; a caller behind
 // a trusted proxy that needs it can key its own buckets on ClientIP.
 //
-// A non-positive burst or refillPerSec disables limiting: the middleware
-// returns the next handler unwrapped (mirroring RouteTimeout's non-positive
-// "off" contract), so a config-driven zero cleanly means "no limit".
+// A non-positive burst or a non-positive interval disables limiting: the
+// middleware returns the next handler unwrapped (mirroring RouteTimeout's
+// non-positive "off" contract), so a config-driven zero cleanly means "no
+// limit".
 //
 // Apply it to the specific handler you want to throttle, and pair it with
 // WithRateLimitWhen to gate only the expensive method+path when the handler
 // serves several:
 //
-//	sessions := webhttp.RateLimiter(6, 1,
+//	sessions := webhttp.RateLimiter(6, time.Second,
 //		webhttp.WithRateLimitWhen(func(r *http.Request) bool {
 //			return r.Method == http.MethodPost
 //		}),
 //	)(sessionsHandler)
-func RateLimiter(burst, refillPerSec float64, opts ...RateLimitOption) Middleware {
-	if burst <= 0 || refillPerSec <= 0 {
+func RateLimiter(burst int, interval time.Duration, opts ...RateLimitOption) Middleware {
+	if burst <= 0 || interval <= 0 {
 		// "Off": return the handler untouched, so a zero from config means
 		// "no limit" without the caller special-casing it.
 		return func(next http.Handler) http.Handler { return next }
@@ -81,7 +84,12 @@ func RateLimiter(burst, refillPerSec float64, opts ...RateLimitOption) Middlewar
 			o(c)
 		}
 	}
-	b := &tokenBucket{burst: burst, refillPerSec: refillPerSec}
+	// Convert at the seam, leaving the tokenBucket internals in refillPerSec
+	// terms: interval > 0 and finite (an int64 duration) and burst >= 1, so
+	// refillPerSec is always finite and positive and float64(burst) >= 1 — no
+	// guard or clamp is needed.
+	refillPerSec := 1 / interval.Seconds()
+	b := &tokenBucket{burst: float64(burst), refillPerSec: refillPerSec}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if c.when != nil && !c.when(r) {
@@ -89,6 +97,7 @@ func RateLimiter(burst, refillPerSec float64, opts ...RateLimitOption) Middlewar
 				return
 			}
 			if !b.allow() {
+				w.Header().Set("Retry-After", strconv.Itoa(b.retryAfterSeconds()))
 				WriteError(w, r, http.StatusTooManyRequests, c.code, c.msg)
 				return
 			}
@@ -137,4 +146,14 @@ func (b *tokenBucket) allowLocked(now time.Time) bool {
 		return true
 	}
 	return false
+}
+
+// retryAfterSeconds returns a conservative whole-second Retry-After hint: the time to
+// accrue a single token at the refill rate, clamped to at least 1s.
+func (b *tokenBucket) retryAfterSeconds() int {
+	secs := int(math.Ceil(1 / b.refillPerSec))
+	if secs < 1 {
+		return 1
+	}
+	return secs
 }
