@@ -310,3 +310,73 @@ func TestRun_holdsRequestOpenAcrossShutdown(t *testing.T) {
 			span, grace, grace+blockFor)
 	}
 }
+
+func TestRun_returnsShutdownDeadlineExceeded(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var released atomic.Bool
+	releaseHandler := func() {
+		if released.CompareAndSwap(false, true) {
+			close(release)
+		}
+	}
+
+	srv := webhttp.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(entered)
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(func() {
+		releaseHandler()
+		_ = srv.Close()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- webhttp.Run(ctx, srv, ln, nil, webhttp.WithShutdownGrace(25*time.Millisecond))
+	}()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	requestDone := make(chan error, 1)
+	go func() {
+		resp, err := client.Get("http://" + ln.Addr().String() + "/")
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+		requestDone <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("handler never became in-flight")
+	}
+
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Run = nil, want shutdown deadline exceeded when in-flight requests outlive the grace period")
+		}
+		if got, want := err.Error(), context.DeadlineExceeded.Error(); got != want {
+			t.Fatalf("Run error = %q, want %q", got, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after shutdown grace expired")
+	}
+
+	releaseHandler()
+	select {
+	case <-requestDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight request did not finish after release")
+	}
+}

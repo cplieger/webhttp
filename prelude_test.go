@@ -202,12 +202,28 @@ func TestDecodeJSONInto_malformedReturnsError(t *testing.T) {
 }
 
 func TestDecodeJSONInto_trailingDataIsErrTrailingData(t *testing.T) {
-	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"name":"a"}{"name":"b"}`))
-	var p payload
-	err := webhttp.DecodeJSONInto(rr, req, &p, webhttp.MaxJSONBody)
-	if !errors.Is(err, webhttp.ErrTrailingData) {
-		t.Fatalf("err = %v, want ErrTrailingData", err)
+	// Any well-formed second JSON value — object, scalar, array, or null —
+	// following the first must classify as ErrTrailingData, not a json type
+	// error, so a consumer's errors.Is(err, ErrTrailingData) check is reliable.
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"object", `{"name":"a"}{"name":"b"}`},
+		{"scalar", `{"name":"a"}42`},
+		{"array", `{"name":"a"}[1]`},
+		{"null", `{"name":"a"}null`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(tc.body))
+			var p payload
+			err := webhttp.DecodeJSONInto(rr, req, &p, webhttp.MaxJSONBody)
+			if !errors.Is(err, webhttp.ErrTrailingData) {
+				t.Fatalf("err = %v, want ErrTrailingData", err)
+			}
+		})
 	}
 }
 

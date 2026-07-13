@@ -73,7 +73,7 @@ A few properties are load-bearing. Keep them when you change the code.
 - **Functional options skip nil.** Every `...Option` loop, and `Chain` itself,
   ignores a nil entry so callers can pass conditionally-built values.
 - **`RateLimiter`'s non-positive contract is "off", not "unlimited".** A `burst`
-  or `refillPerSec` `<= 0` returns the next handler unwrapped (no bucket
+  or `interval` `<= 0` returns the next handler unwrapped (no bucket
   allocated), so a config-driven zero means "no limit" without the caller
   special-casing it — the same off contract as `RouteTimeout`. The bucket is a
   single process-wide instance shared across all clients (it bounds the

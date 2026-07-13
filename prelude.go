@@ -65,13 +65,15 @@ func DecodeJSONInto(w http.ResponseWriter, r *http.Request, v any, maxBytes int6
 	if err := dec.Decode(v); err != nil {
 		return err
 	}
-	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		if err != nil {
-			return err
-		}
-		return ErrTrailingData
+	var extra json.RawMessage
+	switch err := dec.Decode(&extra); {
+	case errors.Is(err, io.EOF):
+		return nil // exactly one value: the body held no trailing data
+	case err != nil:
+		return err // a malformed second value
+	default:
+		return ErrTrailingData // any well-formed second JSON value followed the first
 	}
-	return nil
 }
 
 // DecodeBody limits the body to MaxJSONBody and decodes exactly one JSON value
