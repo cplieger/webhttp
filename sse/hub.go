@@ -137,6 +137,20 @@ func (h *Hub) ClientCount() int {
 	return len(h.subscribers)
 }
 
+// SetMaxClients replaces the concurrent-subscriber cap at runtime (0 or
+// negative = unlimited), for applications whose cap is hot-reloadable
+// configuration: rebuilding the hub for a new cap would drop the replay ring
+// and cancel every connected client. The cap is enforced atomically at
+// admission (same critical section as subscribe), so a burst of concurrent
+// connects cannot overshoot it. Lowering the cap does not evict
+// already-connected clients; natural churn brings the count down. Safe for
+// concurrent use.
+func (h *Hub) SetMaxClients(n int) {
+	h.mu.Lock()
+	h.cfg.maxClients = max(n, 0)
+	h.mu.Unlock()
+}
+
 // Shutdown flips the hub into draining mode and cancels every connected
 // subscriber. Subsequent Serve calls are answered 503 immediately, so a
 // last-instant reconnect cannot register after the cancel sweep. Safe to
