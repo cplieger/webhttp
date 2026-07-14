@@ -181,6 +181,31 @@ This is the HTTP serving-state gate (lowercase `"ok"`), for a load balancer aski
 
 Streaming apps (SSE, WebSocket, long responses) MUST omit `WithWriteTimeout`, since a write deadline would cut off an in-progress stream. Bind the listener up front (for example with `net.ListenConfig.Listen`) so a port-in-use error surfaces synchronously before `Run`, and pass application teardown as `onShutdown`.
 
+### Server-sent events (`sse` subpackage)
+
+`github.com/cplieger/webhttp/sse` is a broadcast hub for SSE endpoints — the streaming counterpart to the request/response helpers above (`RouteTimeout` deliberately cannot wrap a stream).
+
+```go
+hub := sse.NewHub(sse.WithMaxClients(64))
+
+mux.HandleFunc("GET /api/events", func(w http.ResponseWriter, r *http.Request) {
+	hub.Serve(w, r,
+		sse.WithTopic(r.URL.Query().Get("chat_id")),
+		sse.OnConnect(func(w *sse.Writer, floor, head uint64) error {
+			return w.Event(head, "connected", fmt.Appendf(nil, `{"floor":%d,"head":%d}`, floor, head))
+		}))
+})
+
+hub.Publish(sse.Event{Name: "notify", Topic: chatID, Data: payload})
+// on shutdown, before srv.Shutdown:
+hub.Shutdown()
+```
+
+- `NewHub(opts...)` — options `WithReplay(n)` (ring size, default 256; every event gets a monotonic ID and a reconnect with `Last-Event-ID` replays what the client missed, gap-free and overlap-free), `WithClientBuffer(n)`, `WithMaxClients(n)` (503 beyond the cap; 0 = unlimited), `WithKeepalive(d)` (`: keepalive` comments, default 15s, below common proxy idle timeouts), `WithLogger(l)`.
+- `(*Hub).Publish(Event)` — fan-out; assigns the ID, appends to the replay ring, evicts (cancels) a subscriber whose buffer is full rather than blocking, relying on EventSource auto-reconnect + replay. Nil-safe.
+- `(*Hub).Serve(w, r, opts...)` — owns the proxy-defensive headers (`no-transform`, `X-Accel-Buffering: no`), deadline clearing, `Last-Event-ID` replay, keepalives, and frame encoding (`id:` / optional `event:` / spec-correct multi-line `data:`). Options: `WithTopic(t)` (receive broadcasts + events scoped to `t`), `OnConnect(fn)` (write a handshake carrying the replay bounds `(floor, head)` — a client whose last-seen ID is below `floor` missed events and should refetch state — plus any initial per-client frames; default is a `: connected` comment).
+- `(*Hub).Bounds() (floor, head uint64)`, `(*Hub).ClientCount() int`, `(*Hub).Shutdown()` (drain gate: cancels every client, subsequent `Serve` calls get 503).
+
 ## Disclaimer
 
 This project is built with care and follows security best practices, but it is intended for personal / self-hosted use. No guarantees of fitness for production environments. Use at your own risk.
