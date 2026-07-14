@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/cplieger/webhttp"
 )
 
 // config carries hub-level settings; assembled by NewHub from Options.
@@ -132,7 +134,7 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, opts ...ServeOption)
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		writeJSONError(w, http.StatusInternalServerError, "streaming not supported")
+		webhttp.WriteError(w, r, http.StatusInternalServerError, "streaming_unsupported", "streaming not supported")
 		return
 	}
 
@@ -142,7 +144,7 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, opts ...ServeOption)
 	lastID := parseLastEventID(h.logger, r.Header.Get("Last-Event-ID"))
 	sub, replay, ok := h.subscribe(sc.topic, lastID, cancel)
 	if !ok {
-		writeJSONError(w, http.StatusServiceUnavailable, "sse unavailable")
+		webhttp.WriteError(w, r, http.StatusServiceUnavailable, "sse_unavailable", "sse unavailable")
 		return
 	}
 	defer h.unsubscribe(sub)
@@ -277,13 +279,4 @@ func parseLastEventID(logger *slog.Logger, raw string) uint64 {
 		return 0
 	}
 	return n
-}
-
-// writeJSONError emits the minimal error envelope shared by the refusal
-// paths; kept dependency-free of the parent package's helpers so sse stands
-// alone.
-func writeJSONError(w http.ResponseWriter, status int, msg string) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	fmt.Fprintf(w, `{"error":%q}`, msg)
 }

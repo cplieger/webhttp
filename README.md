@@ -204,7 +204,7 @@ hub.Shutdown()
 - `NewHub(opts...)` — options `WithReplay(n)` (ring size, default 256; every event gets a monotonic ID and a reconnect with `Last-Event-ID` replays what the client missed, gap-free and overlap-free), `WithClientBuffer(n)`, `WithMaxClients(n)` (503 beyond the cap; 0 = unlimited), `WithKeepalive(d)` (`: keepalive` comments, default 15s, below common proxy idle timeouts), `WithLogger(l)`.
 - `(*Hub).Publish(Event)` — fan-out; assigns the ID, appends to the replay ring, evicts (cancels) a subscriber whose buffer is full rather than blocking, relying on EventSource auto-reconnect + replay. Nil-safe.
 - `(*Hub).Serve(w, r, opts...)` — owns the proxy-defensive headers (`no-transform`, `X-Accel-Buffering: no`), deadline clearing, `Last-Event-ID` replay, keepalives, and frame encoding (`id:` / optional `event:` / spec-correct multi-line `data:`). Options: `WithTopic(t)` (receive broadcasts + events scoped to `t`), `OnConnect(fn)` (write a handshake carrying the replay bounds `(floor, head)` — a client whose last-seen ID is below `floor` missed events and should refetch state — plus any initial per-client frames; default is a `: connected` comment).
-- `(*Hub).Bounds() (floor, head uint64)`, `(*Hub).ClientCount() int`, `(*Hub).Shutdown()` (drain gate: cancels every client, subsequent `Serve` calls get 503).
+- `(*Hub).Bounds() (floor, head uint64)`, `(*Hub).ClientCount() int`, `(*Hub).Buffered() []ReplayEvent` (a snapshot of the replay window, for diagnostics endpoints and tests), `(*Hub).Shutdown()` (drain gate: cancels every client, subsequent `Serve` calls get 503). Refusal responses use the standard `ErrorResponse` envelope (codes `sse_unavailable`, `streaming_unsupported`).
 
 ## Disclaimer
 

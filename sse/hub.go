@@ -109,20 +109,19 @@ func (h *Hub) Bounds() (floor, head uint64) {
 }
 
 // ReplayEvent is one buffered event with its assigned ID, as returned by
-// Replay.
+// Buffered.
 type ReplayEvent struct {
 	Event Event
 	ID    uint64
 }
 
-// Replay returns the buffered events with ID greater than sinceID that a
-// subscriber filtered to topic would receive, oldest first. Replay(0, "")
-// is the full buffered window. Intended for diagnostics and for
-// applications that deliver initial state over a side channel; the
+// Buffered returns a snapshot of the replay ring, oldest first — the
+// inspection surface for diagnostics (a debug endpoint, a test asserting
+// what was published). Callers filter by ID or Topic themselves; the
 // Last-Event-ID replay in Serve does not go through this method.
-func (h *Hub) Replay(sinceID uint64, topic string) []ReplayEvent {
+func (h *Hub) Buffered() []ReplayEvent {
 	h.mu.Lock()
-	envs := h.ring.since(sinceID, topic)
+	envs := h.ring.since(0, "")
 	h.mu.Unlock()
 	out := make([]ReplayEvent, len(envs))
 	for i, e := range envs {
