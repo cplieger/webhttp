@@ -184,10 +184,13 @@ func TestServeDraining503(t *testing.T) {
 	h := NewHub()
 	h.Shutdown()
 	srv := startServer(t, h)
-	resp, _ := openStream(t, srv.URL, nil)
+	resp, sc := openStream(t, srv.URL, nil)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503 while draining", resp.StatusCode)
+	}
+	if sc.Scan(); !strings.Contains(sc.Text(), "sse_unavailable") {
+		t.Errorf("body = %q, want the standard coded envelope", sc.Text())
 	}
 }
 

@@ -262,7 +262,7 @@ func TestWriterComment(t *testing.T) {
 	}
 }
 
-func TestHubReplayPublicWindow(t *testing.T) {
+func TestHubBufferedWindow(t *testing.T) {
 	h := NewHub(WithReplay(4))
 	for i := 1; i <= 6; i++ {
 		topic := ""
@@ -271,9 +271,9 @@ func TestHubReplayPublicWindow(t *testing.T) {
 		}
 		h.Publish(Event{Topic: topic, Data: []byte{byte('0' + i)}})
 	}
-	all := h.Replay(0, "")
+	all := h.Buffered()
 	if len(all) != 4 { // ring keeps the newest 4 (ids 3..6)
-		t.Fatalf("Replay(0) len = %d, want 4", len(all))
+		t.Fatalf("Buffered len = %d, want 4", len(all))
 	}
 	// IDs strictly monotonic, oldest first — the resume-ordering property.
 	for i := 1; i < len(all); i++ {
@@ -284,11 +284,10 @@ func TestHubReplayPublicWindow(t *testing.T) {
 	if all[0].ID != 3 || all[3].ID != 6 {
 		t.Errorf("window = [%d..%d], want [3..6]", all[0].ID, all[3].ID)
 	}
-	// Topic filter: broadcasts (odd ids here) + matching topic.
-	evens := h.Replay(3, "even")
-	for _, e := range evens {
-		if e.Event.Topic != "even" && e.Event.Topic != "" {
-			t.Errorf("foreign topic in filtered replay: %+v", e)
+	// Topics ride along for caller-side filtering.
+	for _, e := range all {
+		if e.ID%2 == 0 && e.Event.Topic != "even" {
+			t.Errorf("event %d lost its topic: %+v", e.ID, e)
 		}
 	}
 }
