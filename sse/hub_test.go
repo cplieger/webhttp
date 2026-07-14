@@ -163,6 +163,46 @@ func TestHubMaxClients(t *testing.T) {
 	}
 }
 
+func TestHubSetMaxClients(t *testing.T) {
+	h := NewHub(WithMaxClients(1))
+	sub, _, ok := h.subscribe("", 0, func() {})
+	if !ok {
+		t.Fatal("first subscribe refused")
+	}
+	if _, _, ok := h.subscribe("", 0, func() {}); ok {
+		t.Fatal("second subscribe admitted past initial cap")
+	}
+
+	// Raising the cap admits the next connection without rebuilding the hub.
+	h.SetMaxClients(2)
+	sub2, _, ok := h.subscribe("", 0, func() {})
+	if !ok {
+		t.Error("subscribe refused after cap raise")
+	}
+
+	// Lowering below the current count evicts nobody but refuses new admissions.
+	h.SetMaxClients(1)
+	if got := h.ClientCount(); got != 2 {
+		t.Errorf("ClientCount() = %d after lowering cap, want 2 (no eviction)", got)
+	}
+	if _, _, ok := h.subscribe("", 0, func() {}); ok {
+		t.Error("subscribe admitted past lowered cap")
+	}
+
+	// Zero (or negative) means unlimited.
+	h.SetMaxClients(0)
+	if _, _, ok := h.subscribe("", 0, func() {}); !ok {
+		t.Error("subscribe refused with unlimited cap")
+	}
+	h.SetMaxClients(-3)
+	if _, _, ok := h.subscribe("", 0, func() {}); !ok {
+		t.Error("subscribe refused with negative (=unlimited) cap")
+	}
+
+	h.unsubscribe(sub)
+	h.unsubscribe(sub2)
+}
+
 func TestHubShutdown(t *testing.T) {
 	h := NewHub()
 	cancelled := false
