@@ -36,4 +36,10 @@
 // The package has zero dependencies beyond the standard library. It ships the
 // mechanism only; each consuming application layers its own route table, error
 // taxonomy, and named helpers on top.
+//
+// The sse subpackage (github.com/cplieger/webhttp/sse) adds a broadcast hub
+// for Server-Sent Events: replay ring with Last-Event-ID resume, topic
+// filtering, keepalives, client caps, and a shutdown drain gate. It is the
+// streaming counterpart to the request/response helpers here (RouteTimeout
+// deliberately cannot wrap a stream; the sse handler owns its own deadlines).
 package webhttp
