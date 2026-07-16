@@ -13,8 +13,16 @@
 //     recoverer (Recoverer), baseline response security headers
 //     (SecurityHeaders), access logging as middleware (Logging), a JSON
 //     per-route timeout (RouteTimeout), and a shared token-bucket rate
-//     limiter (RateLimiter), plus a spoof-aware client-IP resolver that
+//     limiter (RateLimiter, with the SessionCreateRateLimit preset for
+//     heavy-child-spawning create endpoints), plus a spoof-aware client-IP
+//     resolver that
 //     reads X-Forwarded-For only from trusted proxy hops (ClientIP),
+//   - an embedded-static file handler with construction-time content-hash
+//     ETags and precomputed gzip, with per-path cache policy left to the app
+//     (StaticHandler, WithStaticCacheControl),
+//   - a CSP inline-script hash extractor for pinning script-src to the exact
+//     embedded page bytes instead of 'unsafe-inline' (InlineScriptHashes;
+//     the policy string itself stays app-owned, passed via WithCSP),
 //   - JSON response and error helpers (WriteJSON, WriteJSONStatus, Ok,
 //     WriteError),
 //   - request-prelude helpers for body limiting, method gating, and JSON

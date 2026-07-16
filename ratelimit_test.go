@@ -232,3 +232,55 @@ func TestRateLimiter_concurrentAdmitsAtMostBurst(t *testing.T) {
 			"(a dropped lock over-admits via a check-then-act race)", got, burst)
 	}
 }
+
+// TestSessionCreateRateLimit pins the preset's contract: exactly the shared
+// burst of POSTs to the configured path is admitted (the 7th gets the preset's
+// 429 envelope with a Retry-After of the 1s refill), while non-POST methods on
+// the path and POSTs to other paths never draw from the bucket.
+func TestSessionCreateRateLimit(t *testing.T) {
+	hits := 0
+	h := SessionCreateRateLimit("/api/sessions")(okHandler(&hits))
+
+	// The preset's burst is 6: six immediate POSTs are admitted, the seventh
+	// is throttled. The 1s refill is long enough that no token accrues
+	// mid-loop on any plausible test host.
+	for i := range 6 {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/sessions", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("POST %d status = %d, want 200 (inside burst)", i+1, rec.Code)
+		}
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/sessions", nil))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("POST 7 status = %d, want 429 (burst exhausted)", rec.Code)
+	}
+	var env ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("429 body is not the JSON error envelope: %v (body=%q)", err, rec.Body.String())
+	}
+	if env.Code != "rate_limited" || env.Error != "session creation rate exceeded" {
+		t.Errorf("envelope = %+v, want code=rate_limited error=%q", env, "session creation rate exceeded")
+	}
+	if got := rec.Header().Get("Retry-After"); got != "1" {
+		t.Errorf("Retry-After = %q, want %q (1s refill)", got, "1")
+	}
+
+	// With the bucket empty, requests the predicate exempts still pass: GET
+	// and DELETE on the path (list/close), and POST to any other path.
+	exempt := []struct {
+		method, path string
+	}{
+		{http.MethodGet, "/api/sessions"},
+		{http.MethodDelete, "/api/sessions/abc"},
+		{http.MethodPost, "/api/other"},
+	}
+	for _, tc := range exempt {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s %s status = %d, want 200 (predicate exempts it even when the bucket is empty)", tc.method, tc.path, rec.Code)
+		}
+	}
+}
