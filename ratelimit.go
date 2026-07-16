@@ -157,3 +157,34 @@ func (b *tokenBucket) retryAfterSeconds() int {
 	}
 	return secs
 }
+
+// Session-create preset tuning: a small burst absorbs a user opening several
+// tabs at once; the steady one-per-second refill throttles sustained create
+// churn. One home for the numbers so the web-terminal family's servers cannot
+// drift apart.
+const (
+	sessionCreateBurst    = 6
+	sessionCreateInterval = time.Second // time to accrue one create token
+)
+
+// SessionCreateRateLimit returns middleware gating POST requests to path (an
+// exact match, e.g. "/api/sessions") behind the standard session-create token
+// bucket: burst 6, one token accrued per second, and a 429 envelope of code
+// "rate_limited" / message "session creation rate exceeded". Non-POST methods
+// and other paths pass through without consuming a token, so a handler that
+// multiplexes list (GET) and close (DELETE) on the same path stays
+// unthrottled.
+//
+// This is a preset over RateLimiter for the create-a-heavy-child endpoint
+// shape, where each admitted request forks an expensive process (a PTY, an
+// agent subprocess) and what needs bounding is aggregate create churn. The
+// tuning lives here once; an app needing different numbers or a different
+// predicate composes RateLimiter directly.
+func SessionCreateRateLimit(path string) Middleware {
+	return RateLimiter(sessionCreateBurst, sessionCreateInterval,
+		WithRateLimitWhen(func(r *http.Request) bool {
+			return r.Method == http.MethodPost && r.URL.Path == path
+		}),
+		WithRateLimitError("rate_limited", "session creation rate exceeded"),
+	)
+}
