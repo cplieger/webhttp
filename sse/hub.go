@@ -56,11 +56,14 @@ type Hub struct {
 	draining    bool
 }
 
-// NewHub returns a Hub configured by the supplied options.
+// NewHub returns a Hub configured by the supplied options. A nil option is
+// skipped, matching the root package's option convention.
 func NewHub(opts ...Option) *Hub {
 	cfg := defaultConfig()
 	for _, opt := range opts {
-		opt(&cfg)
+		if opt != nil {
+			opt(&cfg)
+		}
 	}
 	return &Hub{
 		subscribers: make(map[*subscriber]struct{}),
@@ -170,6 +173,11 @@ func (h *Hub) Shutdown() {
 // replay + live delivery gap-free and overlap-free: everything at or below
 // the snapshot head arrives from the returned replay slice, everything
 // after it through the channel.
+//
+// Replay happens only for a resuming client (lastID > 0): a first connect
+// deliberately starts from live traffic, and the OnConnect handshake's
+// Bounds are what tell that client whether state predates its connection
+// (see Serve and Bounds).
 //
 // It returns ok=false when the hub is draining or the client cap is reached.
 func (h *Hub) subscribe(topic string, lastID uint64, cancel context.CancelFunc) (sub *subscriber, replay []envelope, ok bool) {

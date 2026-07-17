@@ -239,3 +239,30 @@ type noFlushRecorder struct {
 func (r *noFlushRecorder) Header() http.Header         { return r.header }
 func (r *noFlushRecorder) Write(b []byte) (int, error) { return len(b), nil }
 func (r *noFlushRecorder) WriteHeader(code int)        { r.status = code }
+
+// unwrapOnlyWriter exposes streaming only via Unwrap, never implementing
+// http.Flusher itself — the shape of middleware built for
+// http.ResponseController discovery. Interface embedding promotes only the
+// three ResponseWriter methods, so the wrapper genuinely has no Flush.
+type unwrapOnlyWriter struct{ http.ResponseWriter }
+
+func (u *unwrapOnlyWriter) Unwrap() http.ResponseWriter { return u.ResponseWriter }
+
+func TestServeFlushesThroughUnwrapChain(t *testing.T) {
+	h := NewHub()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.Serve(&unwrapOnlyWriter{ResponseWriter: w}, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	resp, sc := openStream(t, srv.URL, nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (flusher reachable via Unwrap must stream)", resp.StatusCode)
+	}
+	readUntil(t, sc, func(l string) bool { return l == ": connected" })
+
+	waitForClients(t, h, 1)
+	h.Publish(Event{Data: []byte("via-unwrap")})
+	readUntil(t, sc, func(l string) bool { return l == "data: via-unwrap" })
+}
