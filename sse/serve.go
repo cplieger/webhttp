@@ -125,18 +125,23 @@ func OnConnect(fn func(w *Writer, floor, head uint64) error) ServeOption {
 // keepalive comments, and frame encoding.
 //
 // It answers 503 while the hub is draining or over the client cap, and 500
-// when the ResponseWriter cannot stream (no http.Flusher).
+// when the ResponseWriter cannot stream: no http.Flusher reachable either
+// directly or through an Unwrap() chain (the http.ResponseController
+// discovery rule), so wrapping middleware that forwards flushes via Unwrap
+// keeps streaming intact.
 func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, opts ...ServeOption) {
 	var sc serveConfig
 	for _, opt := range opts {
-		opt(&sc)
+		if opt != nil {
+			opt(&sc)
+		}
 	}
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	if !canFlush(w) {
 		webhttp.WriteError(w, r, http.StatusInternalServerError, "streaming_unsupported", "streaming not supported")
 		return
 	}
+	rc := http.NewResponseController(w)
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -150,7 +155,7 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, opts ...ServeOption)
 	defer h.unsubscribe(sub)
 
 	writeStreamHeaders(w)
-	clearDeadlines(h.logger, w)
+	clearDeadlines(h.logger, rc)
 
 	// Replay precedes the handshake so the OnConnect hook's bounds are
 	// consistent with what the client has already been sent.
@@ -169,14 +174,34 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, opts ...ServeOption)
 	} else if err := sw.Comment("connected"); err != nil {
 		return
 	}
-	flusher.Flush()
+	if rc.Flush() != nil {
+		return
+	}
 
-	h.stream(ctx, w, flusher, sub)
+	h.stream(ctx, w, rc, sub)
+}
+
+// canFlush reports whether w can flush, either by implementing http.Flusher
+// itself or by exposing one through an Unwrap() http.ResponseWriter chain —
+// the same discovery http.ResponseController performs. The probe never
+// writes, so a non-streamable writer can still receive the JSON 500 refusal.
+func canFlush(w http.ResponseWriter) bool {
+	for {
+		switch t := w.(type) {
+		case http.Flusher:
+			return true
+		case interface{ Unwrap() http.ResponseWriter }:
+			w = t.Unwrap()
+		default:
+			return false
+		}
+	}
 }
 
 // stream is the live delivery loop: channel events, keepalives, and
-// context/eviction termination.
-func (h *Hub) stream(ctx context.Context, w io.Writer, flusher http.Flusher, sub *subscriber) {
+// context/eviction termination. A write or flush error inside either helper
+// ends the stream (the client is gone or the connection is unusable).
+func (h *Hub) stream(ctx context.Context, w io.Writer, rc *http.ResponseController, sub *subscriber) {
 	var keepaliveC <-chan time.Time
 	if h.cfg.keepalive > 0 {
 		t := time.NewTicker(h.cfg.keepalive)
@@ -188,22 +213,21 @@ func (h *Hub) stream(ctx context.Context, w io.Writer, flusher http.Flusher, sub
 		case <-ctx.Done():
 			return
 		case env := <-sub.ch:
-			if !writeBatch(w, sub, env) {
+			if !writeBatch(w, rc, sub, env) {
 				return
 			}
-			flusher.Flush()
 		case <-keepaliveC:
-			if _, err := fmt.Fprint(w, ": keepalive\n\n"); err != nil {
+			if !writeKeepalive(w, rc) {
 				return
 			}
-			flusher.Flush()
 		}
 	}
 }
 
-// writeBatch writes env plus everything already queued behind it, so a burst
-// is flushed once. Returns false on a write error (client gone).
-func writeBatch(w io.Writer, sub *subscriber, env envelope) bool {
+// writeBatch writes env plus everything already queued behind it, then
+// flushes once, so a burst reaches the client in a single flush. Returns
+// false on a write or flush error (client gone).
+func writeBatch(w io.Writer, rc *http.ResponseController, sub *subscriber, env envelope) bool {
 	if err := writeFrame(w, env.id, env.event.Name, env.event.Data); err != nil {
 		return false
 	}
@@ -214,9 +238,18 @@ func writeBatch(w io.Writer, sub *subscriber, env envelope) bool {
 				return false
 			}
 		default:
-			return true
+			return rc.Flush() == nil
 		}
 	}
+}
+
+// writeKeepalive emits one keepalive comment and flushes it. Returns false
+// on a write or flush error.
+func writeKeepalive(w io.Writer, rc *http.ResponseController) bool {
+	if _, err := fmt.Fprint(w, ": keepalive\n\n"); err != nil {
+		return false
+	}
+	return rc.Flush() == nil
 }
 
 // writeFrame emits one SSE frame: optional id and event fields, then the
@@ -257,8 +290,7 @@ func writeStreamHeaders(w http.ResponseWriter) {
 // long-lived connection; a per-connection deadline would sever the stream
 // mid-flight. Failure is logged and otherwise ignored (an http2 conn or a
 // test recorder may not support deadlines).
-func clearDeadlines(logger *slog.Logger, w http.ResponseWriter) {
-	rc := http.NewResponseController(w)
+func clearDeadlines(logger *slog.Logger, rc *http.ResponseController) {
 	if err := rc.SetWriteDeadline(time.Time{}); err != nil {
 		logger.Debug("sse: clear write deadline", "error", err)
 	}

@@ -194,7 +194,9 @@ func serveGzip(w http.ResponseWriter, r *http.Request, etag string, gz gzAsset) 
 }
 
 // acceptsGzip reports whether the request's Accept-Encoding header offers gzip
-// with a non-zero quality value.
+// with a non-zero quality value. A malformed quality value (an unparseable
+// q= parameter) is deliberately read as accepting: the client explicitly
+// named gzip, and a mangled parameter should not withdraw that offer.
 func acceptsGzip(r *http.Request) bool {
 	for part := range strings.SplitSeq(r.Header.Get("Accept-Encoding"), ",") {
 		token, qual := part, "1"
