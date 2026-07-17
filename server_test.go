@@ -6,6 +6,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -378,5 +380,103 @@ func TestRun_returnsShutdownDeadlineExceeded(t *testing.T) {
 	case <-requestDone:
 	case <-time.After(2 * time.Second):
 		t.Fatal("in-flight request did not finish after release")
+	}
+}
+
+func TestRun_preDrainRunsBeforeShutdownDrain(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	// The handler blocks until the pre-drain hook releases it, so the test
+	// discriminates on ordering: pre-drain before Shutdown lets the drain
+	// finish and Run return nil; pre-drain after Shutdown would leave the
+	// request in-flight for the whole grace window and Run would return
+	// context.DeadlineExceeded.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	srv := webhttp.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(entered)
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	var (
+		mu    sync.Mutex
+		order []string
+	)
+	record := func(phase string) {
+		mu.Lock()
+		order = append(order, phase)
+		mu.Unlock()
+	}
+
+	preDrain := func(ctx context.Context) {
+		if _, ok := ctx.Deadline(); !ok {
+			t.Error("pre-drain context has no deadline")
+		}
+		record("pre-drain")
+		close(release)
+	}
+	onShutdown := func(context.Context) { record("teardown") }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- webhttp.Run(ctx, srv, ln, onShutdown,
+			webhttp.WithPreDrain(preDrain), webhttp.WithShutdownGrace(2*time.Second))
+	}()
+
+	statusCh := make(chan int, 1)
+	go func() {
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Get("http://" + ln.Addr().String() + "/")
+		if err != nil {
+			statusCh <- 0
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		statusCh <- resp.StatusCode
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		cancel()
+		t.Fatal("handler never became in-flight")
+	}
+
+	cancel() // request is in-flight; only the pre-drain hook can unblock it
+
+	var runErr error
+	select {
+	case runErr = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return")
+	}
+	if runErr != nil {
+		t.Errorf("Run = %v, want nil (pre-drain must run before the drain)", runErr)
+	}
+
+	select {
+	case code := <-statusCh:
+		if code != http.StatusOK {
+			t.Errorf("in-flight request status = %d, want 200", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight request never completed")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{"pre-drain", "teardown"}; !slices.Equal(order, want) {
+		t.Errorf("phase order = %v, want %v", order, want)
+	}
+}
+
+func TestRun_nilPreDrainIgnored(t *testing.T) {
+	if err := runAndShutdown(t, webhttp.WithPreDrain(nil)); err != nil {
+		t.Errorf("Run with WithPreDrain(nil) = %v, want nil", err)
 	}
 }
