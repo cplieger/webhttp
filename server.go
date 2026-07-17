@@ -85,6 +85,7 @@ func NewServer(handler http.Handler, opts ...ServerOption) *http.Server {
 
 // runConfig holds resolved Run configuration.
 type runConfig struct {
+	preDrain      func(ctx context.Context)
 	shutdownGrace time.Duration
 }
 
@@ -92,21 +93,36 @@ type runConfig struct {
 type RunOption func(*runConfig)
 
 // WithShutdownGrace sets how long Run allows for graceful shutdown: the window
-// for in-flight requests to finish and for the onShutdown teardown to run.
-// Defaults to 5s.
+// for the pre-drain hook to run, for in-flight requests to finish, and for the
+// onShutdown teardown to run. Defaults to 5s.
 func WithShutdownGrace(d time.Duration) RunOption {
 	return func(c *runConfig) { c.shutdownGrace = d }
+}
+
+// WithPreDrain registers a hook Run invokes after ctx is cancelled and
+// strictly before srv.Shutdown starts draining in-flight requests. It is the
+// place for the release-the-streams phase a graceful stop needs ahead of the
+// drain: flip a readiness gate so a load balancer stops routing here, cancel
+// the server's BaseContext or shut down an SSE hub so long-lived connections
+// end (otherwise Shutdown waits its full grace period for them). fn receives
+// a context bounded by the SAME shutdown deadline that Shutdown and
+// onShutdown share; whatever budget it spends is no longer available to
+// them. A nil fn is ignored.
+func WithPreDrain(fn func(ctx context.Context)) RunOption {
+	return func(c *runConfig) { c.preDrain = fn }
 }
 
 // Run serves srv on ln until ctx is cancelled, then shuts down gracefully.
 //
 // It starts srv.Serve(ln) in a goroutine (treating http.ErrServerClosed as a
 // clean stop) and blocks until either ctx is cancelled or Serve returns on its
-// own. On cancellation it computes a single shutdown deadline (now + the shutdown
-// grace period) and calls srv.Shutdown with a context bounded by it, then, if
-// onShutdown is non-nil, calls it with a context bounded by that SAME deadline:
-// onShutdown runs within whatever grace budget REMAINS after Shutdown drains
-// in-flight requests, not a fresh full window. Run returns the first
+// own. On cancellation it computes a single shutdown deadline (now + the
+// shutdown grace period) and runs the shutdown sequence against it: first the
+// WithPreDrain hook if one is registered (readiness flips, stream releases —
+// see WithPreDrain), then srv.Shutdown with a context bounded by the deadline,
+// then, if onShutdown is non-nil, onShutdown with a context bounded by that
+// SAME deadline: each later phase runs within whatever grace budget REMAINS
+// after the earlier ones, not a fresh full window. Run returns the first
 // non-ErrServerClosed error it observes (a serve error, else a shutdown error),
 // or nil on a clean graceful stop.
 //
@@ -139,6 +155,11 @@ func Run(ctx context.Context, srv *http.Server, ln net.Listener, onShutdown func
 	}
 
 	deadline := time.Now().Add(c.shutdownGrace)
+	if c.preDrain != nil {
+		preCtx, preCancel := context.WithDeadline(context.Background(), deadline)
+		c.preDrain(preCtx)
+		preCancel()
+	}
 	shutdownCtx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	shutdownErr := srv.Shutdown(shutdownCtx)
