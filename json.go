@@ -9,10 +9,17 @@ import (
 // JSONHeaders sets the standard JSON response headers: an application/json
 // content type and the X-Content-Type-Options: nosniff guard against MIME
 // sniffing. Call it before WriteHeader.
+//
+// The nosniff guard is set only when the header is still unset, so a stack
+// that composes SecurityHeaders keeps that middleware as the header's single
+// writer while a stack without it still gets the guard on every JSON body
+// this library writes.
 func JSONHeaders(w http.ResponseWriter) {
 	h := w.Header()
 	h.Set("Content-Type", "application/json")
-	h.Set("X-Content-Type-Options", "nosniff")
+	if h.Get("X-Content-Type-Options") == "" {
+		h.Set("X-Content-Type-Options", "nosniff")
+	}
 }
 
 // WriteJSON writes v as a JSON body with a 200 status.
