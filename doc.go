@@ -8,8 +8,7 @@
 //     also implements http.Flusher/http.Hijacker/io.ReaderFrom passthroughs, so
 //     both ResponseController-based and direct-type-assertion callers (plus the
 //     sendfile fast path) keep working (StatusRecorder),
-//   - a composable middleware set: an ordering combinator (Chain) plus its
-//     batteries-included correct-order convenience (DefaultStack), a panic
+//   - a composable middleware set: an ordering combinator (Chain), a panic
 //     recoverer (Recoverer), baseline response security headers
 //     (SecurityHeaders), access logging as middleware (Logging), a JSON
 //     per-route timeout (RouteTimeout), and a shared token-bucket rate
@@ -27,6 +26,11 @@
 //     WriteError),
 //   - request-prelude helpers for body limiting, method gating, and JSON
 //     decoding (LimitBody, RequireMethod, DecodeBody),
+//   - a constant-time verifier for a single operator-configured static
+//     credential — an API key, bearer token, or basic-auth field — hashing
+//     the secret once at construction and comparing SHA-256 digests so no
+//     per-call timing varies with the secret, failing closed on an empty
+//     configured secret (NewStaticTokenVerifier),
 //   - an HTTP readiness gate for load balancers (Ready, ReadinessHandler),
 //   - a graceful server bootstrap (NewServer, Run).
 //
