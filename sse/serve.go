@@ -282,7 +282,6 @@ func writeStreamHeaders(w http.ResponseWriter) {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache, no-transform")
-	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no")
 }
 

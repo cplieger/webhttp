@@ -204,6 +204,12 @@ func acceptsGzip(r *http.Request) bool {
 			token = part[:i]
 			if j := strings.Index(part[i:], "q="); j >= 0 {
 				qual = part[i+j+2:]
+				// A q-value may be followed by further parameters
+				// (`gzip;q=0;foo=x`); cut at the next ';' so a well-formed
+				// q=0 refusal is not misread as malformed-and-accepting.
+				if k := strings.IndexByte(qual, ';'); k >= 0 {
+					qual = qual[:k]
+				}
 			}
 		}
 		if !strings.EqualFold(strings.TrimSpace(token), "gzip") {

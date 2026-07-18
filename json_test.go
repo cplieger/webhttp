@@ -20,6 +20,17 @@ func TestJSONHeaders(t *testing.T) {
 	if xo := rr.Header().Get("X-Content-Type-Options"); xo != "nosniff" {
 		t.Errorf("X-Content-Type-Options = %q, want nosniff", xo)
 	}
+
+	t.Run("defers to an upstream nosniff writer", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		// SecurityHeaders (or any upstream middleware) already set the guard;
+		// JSONHeaders must leave that single writer in charge, not re-set it.
+		rr.Header().Set("X-Content-Type-Options", "nosniff")
+		webhttp.JSONHeaders(rr)
+		if got := rr.Header().Values("X-Content-Type-Options"); len(got) != 1 || got[0] != "nosniff" {
+			t.Errorf("X-Content-Type-Options values = %q, want exactly [nosniff]", got)
+		}
+	})
 }
 
 func TestWriteJSON(t *testing.T) {

@@ -265,6 +265,10 @@ func TestAcceptsGzip(t *testing.T) {
 		{"empty header", "", false},
 		{"wildcard not treated as gzip", "*", false},
 		{"malformed q is permissive", "gzip;q=bogus", true},
+		{"q=0 with trailing parameter still refuses", "gzip;q=0;dummy=x", false},
+		{"q=0.0 with trailing parameter still refuses", "gzip;q=0.0;dummy=x", false},
+		{"non-zero q with trailing parameter accepts", "gzip;q=0.5;dummy=x", true},
+		{"malformed q with trailing parameter is permissive", "gzip;q=bogus;dummy=x", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
