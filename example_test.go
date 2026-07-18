@@ -32,3 +32,16 @@ func ExampleWriteError() {
 	// Output:
 	// {"error":"invalid payload","code":"bad_request"}
 }
+
+func ExampleNewStaticTokenVerifier() {
+	v := webhttp.NewStaticTokenVerifier("s3cr3t")
+	fmt.Println(v.Verify("s3cr3t"))
+	fmt.Println(v.Verify("wrong"))
+	// An unset secret fails closed: even an empty presented value is rejected.
+	unset := webhttp.NewStaticTokenVerifier("")
+	fmt.Println(unset.Verify(""))
+	// Output:
+	// true
+	// false
+	// false
+}
