@@ -194,31 +194,46 @@ func serveGzip(w http.ResponseWriter, r *http.Request, etag string, gz gzAsset) 
 }
 
 // acceptsGzip reports whether the request's Accept-Encoding header offers gzip
-// with a non-zero quality value. A malformed quality value (an unparseable
-// q= parameter) is deliberately read as accepting: the client explicitly
-// named gzip, and a mangled parameter should not withdraw that offer.
+// with a non-zero quality value, either by naming gzip or through the "*"
+// wildcard (RFC 9110 §12.5.3: the wildcard matches any coding not otherwise
+// named, so "*" alone offers gzip and an explicit gzip entry — acceptance or
+// q=0 refusal — always wins over it as the more specific match). A malformed
+// quality value (an unparseable q= parameter) is deliberately read as
+// accepting: the client explicitly named the coding, and a mangled parameter
+// should not withdraw that offer.
 func acceptsGzip(r *http.Request) bool {
+	wildcard := false
 	for part := range strings.SplitSeq(r.Header.Get("Accept-Encoding"), ",") {
-		token, qual := part, "1"
-		if i := strings.IndexByte(part, ';'); i >= 0 {
-			token = part[:i]
-			if j := strings.Index(part[i:], "q="); j >= 0 {
-				qual = part[i+j+2:]
-				// A q-value may be followed by further parameters
-				// (`gzip;q=0;foo=x`); cut at the next ';' so a well-formed
-				// q=0 refusal is not misread as malformed-and-accepting.
-				if k := strings.IndexByte(qual, ';'); k >= 0 {
-					qual = qual[:k]
-				}
+		name, offered := encodingOffer(part)
+		switch {
+		case strings.EqualFold(name, "gzip"):
+			return offered // explicit gzip is the most specific match
+		case name == "*":
+			wildcard = offered
+		}
+	}
+	return wildcard
+}
+
+// encodingOffer parses one Accept-Encoding list element into its coding name
+// and whether that coding is offered: true for a missing, non-zero, or
+// malformed q= parameter, false only for a well-formed q=0 refusal.
+func encodingOffer(part string) (name string, offered bool) {
+	token, qual := part, "1"
+	if i := strings.IndexByte(part, ';'); i >= 0 {
+		token = part[:i]
+		if j := strings.Index(part[i:], "q="); j >= 0 {
+			qual = part[i+j+2:]
+			// A q-value may be followed by further parameters
+			// (`gzip;q=0;foo=x`); cut at the next ';' so a well-formed
+			// q=0 refusal is not misread as malformed-and-accepting.
+			if k := strings.IndexByte(qual, ';'); k >= 0 {
+				qual = qual[:k]
 			}
 		}
-		if !strings.EqualFold(strings.TrimSpace(token), "gzip") {
-			continue
-		}
-		q, err := strconv.ParseFloat(strings.TrimSpace(qual), 64)
-		return err != nil || q != 0
 	}
-	return false
+	q, err := strconv.ParseFloat(strings.TrimSpace(qual), 64)
+	return strings.TrimSpace(token), err != nil || q != 0
 }
 
 // ifNoneMatchContains reports whether an If-None-Match header value matches the
