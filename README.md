@@ -9,7 +9,7 @@
 
 > Resilient server-side HTTP plumbing for Go
 
-A standalone Go library bundling the server-side pieces almost every service ends up hand-rolling: request-id injection with one-line access logging, a flush/hijack-safe status recorder, a composable middleware set (panic recovery, security headers, per-route JSON timeout, and a `Chain` combinator) with a spoof-aware client-IP resolver, JSON response and error helpers, request-prelude helpers, an HTTP readiness gate, and a graceful server bootstrap. Standard-library only, no external runtime dependencies.
+A standalone Go library bundling the server-side pieces almost every service ends up hand-rolling: request-id injection with one-line access logging, a flush/hijack-safe status recorder, a composable middleware set (panic recovery, security headers, per-route JSON timeout, a shared-bucket rate limiter, and a `Chain` combinator), a spoof-aware client-IP resolver, an exact-match Host allowlist against DNS rebinding, an embedded-static file handler with content-hash ETags and precomputed gzip, a CSP inline-script hash extractor, JSON response and error helpers, request-prelude helpers, a constant-time static-credential verifier, an HTTP readiness gate, a graceful server bootstrap, and a Server-Sent-Events broadcast hub (the `sse` subpackage). Standard-library only, no external runtime dependencies.
 
 webhttp is the inbound-server counterpart to [httpx](https://github.com/cplieger/httpx): httpx makes resilient requests going _out_, webhttp handles the requests coming _in_. The two are complementary and share no code. It ships the mechanism only; each application layers its own route table, error taxonomy, and named helpers on top.
 
@@ -50,6 +50,11 @@ func main() {
 		}
 		webhttp.WriteJSONStatus(w, http.StatusCreated, body)
 	})
+
+	// Browser-facing service? Decide your Host posture here: parse an
+	// operator allowlist with ParseHostList and add hostPolicy.Middleware()
+	// to the chain, placed before any cross-origin or CSRF check (see the
+	// Host allowlist section below). Machine-facing APIs can skip it.
 
 	// Compose middleware with Chain: the first listed is the outermost wrapper.
 	// Logging outermost means a panic recovered below it is logged as its 500,
@@ -238,7 +243,7 @@ hub.Shutdown()
 
 This project is built with care and follows security best practices, but it is intended for personal / self-hosted use. No guarantees of fitness for production environments. Use at your own risk.
 
-This project was built with AI-assisted tooling using [Claude Opus](https://www.anthropic.com/claude) and [Kiro](https://kiro.dev). The human maintainer defines architecture, supervises implementation, and makes all final decisions.
+This project was built with AI-assisted tooling using [Claude](https://claude.com), [GPT](https://openai.com), and [Kiro](https://kiro.dev). The human maintainer defines architecture, supervises implementation, and makes all final decisions.
 
 ## License
 

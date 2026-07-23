@@ -35,6 +35,13 @@ import (
 // ("127.0.0.001", "0177.0.0.1" — HTTP clients disagree on leading-zero and
 // octal IPv4 forms, so no single textual key can match them safely).
 //
+// The sibling ssrf library carries its own numeric-IPv4 heuristic
+// (looksLikeNumericIPv4) with a deliberately DIFFERENT reject set: ssrf feeds
+// a resolver, so it must also reject dotted-hex forms like "0x7f.0.0.1" that
+// this exact-match key safely accepts (the "x" makes the label a plain DNS
+// label, matchable only if explicitly allowlisted). The two must NOT be
+// unified — see that function's doc for the outbound rationale.
+//
 // Malformed input is REJECTED, never repaired. Deleting the offending syntax
 // instead (stripping stray brackets, truncating at a bad port) would let
 // distinct wire values collapse onto an allowlisted key — "[allowed.example]",
