@@ -37,6 +37,10 @@
 //     the secret once at construction and comparing SHA-256 digests so no
 //     per-call timing varies with the secret, failing closed on an empty
 //     configured secret (NewStaticTokenVerifier),
+//   - a configured-bind exposure classifier for boot-time policy — is this
+//     listen address loopback-only, exposed beyond loopback, or not
+//     host:port at all — with the malformed-input decision left to the app
+//     (ClassifyBind, ClassifyBindHost, BindClass),
 //   - an HTTP readiness gate for load balancers (Ready, ReadinessHandler),
 //   - a graceful server bootstrap (NewServer, Run).
 //
