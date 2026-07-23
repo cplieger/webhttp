@@ -38,7 +38,21 @@ func TestClassifyBind(t *testing.T) {
 		{name: "ipv6 global", addr: "[2001:db8::1]:9848", want: webhttp.BindExposed},
 		{name: "hostname is exposed without resolution", addr: "myhost:9848", want: webhttp.BindExposed},
 		{name: "localhost subdomain is a plain hostname", addr: "foo.localhost:80", want: webhttp.BindExposed},
+		{name: "localhost trailing dot is a plain hostname", addr: "localhost.:80", want: webhttp.BindExposed},
+		{name: "whitespace-padded localhost is a plain hostname", addr: " localhost :80", want: webhttp.BindExposed},
 		{name: "4in6 routable", addr: "[::ffff:192.0.2.1]:80", want: webhttp.BindExposed},
+
+		// SplitHostPort accepts a bracketed NAME (brackets are transparent,
+		// not IPv6-only syntax there), so the host inside still classifies.
+		{name: "bracketed localhost still classifies", addr: "[localhost]:80", want: webhttp.BindLoopback},
+		// The hex and uppercase spellings of 4-in-6 loopback are the same
+		// address; ParseIP canonicalizes before IsLoopback.
+		{name: "4in6 loopback hex form", addr: "[::ffff:7f00:1]:80", want: webhttp.BindLoopback},
+		{name: "4in6 loopback uppercase hex", addr: "[::FFFF:127.0.0.1]:9848", want: webhttp.BindLoopback},
+		// strings.EqualFold is Unicode SIMPLE folding, so the long-s fold of
+		// "localhost" matches — documented on BindLoopback, shared with the
+		// two origin apps that already folded (kiro, pg-autodump).
+		{name: "unicode simple fold of localhost matches", addr: "localho\u017ft:80", want: webhttp.BindLoopback},
 		// net.ParseIP rejects zoned literals, so the hostname path
 		// classifies them: fail-public, matching all three origin copies.
 		{name: "zoned ipv6 loopback is exposed", addr: "[::1%lo]:80", want: webhttp.BindExposed},
