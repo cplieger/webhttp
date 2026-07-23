@@ -16,6 +16,12 @@
 //     heavy-child-spawning create endpoints), plus a spoof-aware client-IP
 //     resolver that
 //     reads X-Forwarded-For only from trusted proxy hops (ClientIP),
+//   - an exact-match Host allowlist against DNS rebinding: an immutable
+//     parsed policy (ParseHostList, HostPolicy) applied as middleware or
+//     queried per request, built on a strict authority canonicalizer that
+//     rejects malformed Host values rather than repairing them
+//     (CanonicalHost), with an opt-in carve-out for loopback health checks
+//     and in-container clients (WithLoopbackExempt),
 //   - an embedded-static file handler with construction-time content-hash
 //     ETags and precomputed gzip, with per-path cache policy left to the app
 //     (StaticHandler, WithStaticCacheControl),
