@@ -28,8 +28,15 @@ const (
 	BindInvalid BindClass = iota
 	// BindLoopback means the host names the loopback interface explicitly:
 	// a 127.0.0.0/8 or ::1 literal (including 4-in-6 forms of 127/8), or
-	// the name "localhost" in any case. Only these are "safe" in the
-	// exposure sense: the listener is unreachable from other machines.
+	// the name "localhost", matched case-insensitively via
+	// strings.EqualFold (Unicode simple folding, so exotic folds like
+	// "localhoſt" match too — the two origin apps that folded already
+	// behaved this way). Only these are "safe" in the exposure sense: an
+	// IP-literal loopback bind is unreachable from other machines by
+	// kernel routing, and a "localhost" bind is loopback-only under the
+	// standard resolver mapping (RFC 6761 §6.3 — a SHOULD an operator's
+	// hosts file can override; the classifier reads the text, not the
+	// resolver).
 	BindLoopback
 	// BindExposed means the listener is (or may be) reachable beyond
 	// loopback: a wildcard bind (empty host, "0.0.0.0", "::"), any

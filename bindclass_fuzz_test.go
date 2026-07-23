@@ -12,9 +12,12 @@ import (
 // invariants:
 //
 //  1. Split agreement — ClassifyBind returns BindInvalid exactly when
-//     net.SplitHostPort rejects the input, so the "host:port" grammar the
-//     classifier accepts is precisely the one net.Listen parses (no private
-//     dialect on either side).
+//     net.SplitHostPort rejects the input: the STRUCTURAL host:port split is
+//     exactly stdlib's, with no private dialect on top. (Service-name lookup
+//     and port validation stay net.Listen's; a splittable addr can still fail
+//     to listen. This pin is deliberately implementation-adjacent — its job
+//     is to fail if the parser is ever swapped for one with a different
+//     grammar, not to re-derive the split.)
 //  2. Door agreement — for any splittable input, ClassifyBind(addr) equals
 //     ClassifyBindHost(host-part): the two public doors share one
 //     classification, so an app using the classify-the-unsplit-input
