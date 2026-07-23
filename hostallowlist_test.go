@@ -17,16 +17,39 @@ func TestCanonicalHost(t *testing.T) {
 		{"bare host", "example.com", "example.com"},
 		{"host with port", "example.com:9848", "example.com"},
 		{"uppercase + trailing dot", "Webterm.Example.COM.", "webterm.example.com"},
+		{"trailing dot with port", "example.com.:443", "example.com"},
+		{"underscore label (compose service name)", "my_service:9848", "my_service"},
+		{"punycode a-label", "xn--wbterm-bva.example", "xn--wbterm-bva.example"},
 		{"ipv4", "192.168.1.5", "192.168.1.5"},
 		{"ipv4 with port", "192.168.1.5:443", "192.168.1.5"},
 		{"ipv6 bracketed with port", "[::1]:9848", "::1"},
+		{"ipv6 bracketed without port", "[::1]", "::1"},
 		{"ipv6 expanded spelling", "0:0:0:0:0:0:0:1", "::1"},
+		{"v4-mapped v6 collapses to ipv4", "[::ffff:192.168.1.5]:443", "192.168.1.5"},
+		{"trailing-dot fqdn", "localhost.", "localhost"},
+
+		// Malformed authorities are rejected, never repaired. Each of the
+		// bracket/colon shapes below used to collapse onto a plausible
+		// allowlist key, silently widening an exact-match gate (the
+		// adversarial-review finding this pins).
 		{"lone port is empty", ":9848", ""},
 		{"empty is empty", "", ""},
 		{"empty brackets", "[]", ""},
-		{"trailing-dot fqdn", "localhost.", "localhost"},
-		{"stray bracket + colon collapses (idempotence guard)", "[:", ""},
-		{"bracketed colon garbage collapses", "[a:b]", "a"},
+		{"stray bracket + colon", "[:", ""},
+		{"bracketed non-ip", "[a:b]", ""},
+		{"bracketed hostname", "[allowed.example]", ""},
+		{"bracketed ipv4 (brackets are v6-only)", "[127.0.0.1]", ""},
+		{"interior bracket garbage", "allowed[.]example", ""},
+		{"multi-colon port garbage", "allowed.example:garbage:443", ""},
+		{"double port", "example.com:1:2", ""},
+		{"empty port", "example.com:", ""},
+		{"port out of range", "example.com:99999", ""},
+		{"double trailing dot", "example.com..", ""},
+		{"empty label", ".example.com", ""},
+		{"leading-zero ipv4 is not repaired", "127.0.0.001", ""},
+		{"octal-looking ipv4", "0177.0.0.1", ""},
+		{"all-numeric dotted non-ip", "1.2.3.4.5", ""},
+		{"non-ascii name (use punycode)", "wébterm.example", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -53,9 +76,15 @@ func TestParseHostList(t *testing.T) {
 		{"all blank is inactive", []string{"  ", "", " \t "}, false, 0, nil},
 		{"valid entries", []string{"localhost", "192.168.1.5", "Webterm.Example.COM."}, true, 3, nil},
 		{"duplicate canonicalizes to one", []string{"example.com", "EXAMPLE.com:80", "example.com."}, true, 1, nil},
-		{"slash entry reported, gate active", []string{"http://example.com"}, true, 0, []string{"http://example.com"}},
+		{"pasted url reported, gate active", []string{"http://example.com"}, true, 0, []string{"http://example.com"}},
 		{"lone port reported, gate active", []string{":9848"}, true, 0, []string{":9848"}},
 		{"mixed valid and invalid", []string{"good.example", "bad/entry", ":80", "  "}, true, 1, []string{"bad/entry", ":80"}},
+		{
+			"collision shapes reported, never repaired",
+			[]string{"[allowed.example]", "allowed[.]example", "allowed.example:garbage:443", "example.com.."},
+			true, 0,
+			[]string{"[allowed.example]", "allowed[.]example", "allowed.example:garbage:443", "example.com.."},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -76,15 +105,19 @@ func TestParseHostList(t *testing.T) {
 // TestHostPolicyMiddleware pins the gate through a real handler: the anti-DNS-
 // rebinding contract (a rebound Host with a matching Origin is still rejected
 // because the allowlist is checked on Host, not Origin), canonicalization,
-// that X-Forwarded-Host cannot smuggle an allowed name, the inactive
-// pass-through, and the loopback carve-out with each attack shape it must still
-// reject.
+// that a malformed Host spelling of an allowed name is rejected rather than
+// repaired into a match, that X-Forwarded-Host cannot smuggle an allowed name,
+// the inactive pass-through, and the loopback carve-out with each attack shape
+// it must still reject.
 func TestHostPolicyMiddleware(t *testing.T) {
 	ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 	do := func(h http.Handler, host, xfh, remoteAddr string) (int, string) {
-		req := httptest.NewRequest(http.MethodGet, "http://"+host+"/x", http.NoBody)
+		// The request URL is a fixed placeholder; the gate reads req.Host,
+		// assigned raw so malformed wire values reach it unrepaired (building
+		// a URL from them would panic in NewRequest before the gate ran).
+		req := httptest.NewRequest(http.MethodGet, "http://placeholder/x", http.NoBody)
 		req.Host = host
 		if xfh != "" {
 			req.Header.Set("X-Forwarded-Host", xfh)
@@ -114,6 +147,12 @@ func TestHostPolicyMiddleware(t *testing.T) {
 			{"case + trailing dot + port canonicalize", "WEBTERM.example.com:1234", "", "", http.StatusOK},
 			{"ipv6 spelling canonicalizes", "[0:0:0:0:0:0:0:1]:9848", "", "", http.StatusOK},
 			{"loopback rejected without the exempt option", "127.0.0.1:9848", "", "127.0.0.1:5000", http.StatusForbidden},
+			// Malformed spellings of an ALLOWED name must be rejected, not
+			// repaired into a match (the adversarial-review collision shapes).
+			{"bracket-wrapped allowed name rejected", "[webterm.example.com]", "", "", http.StatusForbidden},
+			{"interior-bracket spelling rejected", "webterm.example[.]com", "", "", http.StatusForbidden},
+			{"multi-colon port spelling rejected", "webterm.example.com:garbage:443", "", "", http.StatusForbidden},
+			{"double-trailing-dot spelling rejected", "webterm.example.com..", "", "", http.StatusForbidden},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
@@ -160,6 +199,7 @@ func TestHostPolicyMiddleware(t *testing.T) {
 			{"rebinding via same-host browser: loopback peer + attacker Host rejected", "attacker.evil:9848", "127.0.0.1:5000", http.StatusForbidden},
 			{"forged loopback Host from a remote peer rejected", "127.0.0.1:9848", "203.0.113.9:5000", http.StatusForbidden},
 			{"malformed peer fails closed", "127.0.0.1:9848", "not-an-addr", http.StatusForbidden},
+			{"portless loopback peer fails closed", "127.0.0.1:9848", "127.0.0.1", http.StatusForbidden},
 			{"allowlisted host from a remote peer still passes", "webterm.example.com:9848", "203.0.113.9:5000", http.StatusOK},
 		}
 		for _, tc := range cases {
