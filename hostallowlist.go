@@ -6,51 +6,131 @@ import (
 	"strings"
 )
 
-// CanonicalHost normalizes an HTTP Host header value (or a configured allowlist
-// entry) for exact comparison: strip an optional :port, strip IPv6 brackets,
-// lowercase, trim a trailing FQDN dot, and canonicalize IP literals through
-// net.ParseIP so textually different spellings of the same address (::1 vs
-// 0:0:0:0:0:0:0:1, 127.0.0.1 vs 127.0.0.001) compare equal.
+// CanonicalHost parses an HTTP Host header value (or a configured allowlist
+// entry) into its canonical host for exact comparison, returning "" when the
+// value is not a well-formed authority. Accepted shapes, per the RFC 3986
+// authority grammar:
 //
-// It returns "" for a value that carries no host — a lone port (":9848"), the
-// empty string, or "[]" — which HostPolicy treats as an unusable entry. The
-// function is idempotent: CanonicalHost(CanonicalHost(x)) == CanonicalHost(x).
+//   - a DNS name of ASCII labels (letters, digits, hyphens, and underscores —
+//     Docker Compose service names carry underscores — 63 bytes max per
+//     label), optionally ending in one FQDN dot, optionally followed by one
+//     ":port" (digits, at most 65535)
+//   - an IPv4 literal, with the same optional trailing dot and :port
+//   - a bare IPv6 literal (no port: an unbracketed colon-bearing value can
+//     only be an address, never host:port)
+//   - a bracketed IPv6 literal "[...]", optionally followed by ":port"
+//
+// The canonical form is lowercase with no port, no brackets, and no trailing
+// dot; IP literals are rendered through net.ParseIP so textually different
+// spellings of one address (::1 vs 0:0:0:0:0:0:0:1, [::ffff:192.0.2.1] vs
+// 192.0.2.1) compare equal. The function is idempotent:
+// CanonicalHost(CanonicalHost(x)) == CanonicalHost(x).
+//
+// Everything else returns "": stray or unmatched brackets, a bracketed
+// non-IPv6 ("[allowed.example]" — brackets are IPv6-only syntax), a
+// non-numeric, out-of-range, or empty port, a second port, more than one
+// trailing dot, an empty label, a non-ASCII name (configure the Punycode
+// A-label, "xn--...", instead — matching is byte-exact and no IDN mapping is
+// performed), and an all-numeric dotted name that net.ParseIP rejects
+// ("127.0.0.001", "0177.0.0.1" — HTTP clients disagree on leading-zero and
+// octal IPv4 forms, so no single textual key can match them safely).
+//
+// Malformed input is REJECTED, never repaired. Deleting the offending syntax
+// instead (stripping stray brackets, truncating at a bad port) would let
+// distinct wire values collapse onto an allowlisted key — "[allowed.example]",
+// "allowed[.]example", and "allowed.example:garbage:443" would all admit as
+// "allowed.example" — silently widening an exact-match allowlist.
 //
 // No name resolution is performed. Resolving a hostname to compare against the
 // request would reopen the very DNS-rebinding race a host allowlist exists to
 // close (the attacker controls what the name resolves to), so matching is
 // purely textual on the canonicalized Host.
 func CanonicalHost(hostport string) string {
+	if ip := net.ParseIP(hostport); ip != nil {
+		return ip.String() // bare IPv4/IPv6 literal
+	}
+	if strings.HasPrefix(hostport, "[") {
+		return canonicalBracketed(hostport)
+	}
 	host := hostport
-	if h, _, err := net.SplitHostPort(hostport); err == nil {
-		host = h
-	}
-	// Unwrap a bracketed IPv6 literal (SplitHostPort leaves "[::1]" bracketed
-	// when there was no :port to split).
-	host = strings.TrimPrefix(host, "[")
-	host = strings.TrimSuffix(host, "]")
-	host = strings.TrimRight(strings.ToLower(host), ".")
-	if ip := net.ParseIP(host); ip != nil {
-		return ip.String()
-	}
-	// Not an IP literal. A legal registered hostname carries no brackets and no
-	// colon (an IPv6 literal was caught by ParseIP above), so any that remain
-	// are malformed input ("[[", "[a:b]" -> "a:b", "0.:0"). Strip every stray
-	// bracket, drop the port-like colon suffix, and trim trailing dots the
-	// strips may expose, so canonicalization reaches a fixed point. Without this
-	// a second pass would strip the next leftover bracket, re-split the residual
-	// colon, or re-trim an exposed dot and return a different value, breaking
-	// idempotence (each variant found by fuzzing).
-	host = bracketStripper.Replace(host)
 	if i := strings.IndexByte(host, ':'); i >= 0 {
+		if !validPort(host[i+1:]) {
+			return "" // never repaired by truncating at the colon
+		}
 		host = host[:i]
 	}
-	return strings.TrimRight(host, ".")
+	host = strings.TrimSuffix(strings.ToLower(host), ".") // at most one FQDN dot
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.String() // IPv4 that carried a port or a trailing dot
+	}
+	if !validHostname(host) {
+		return ""
+	}
+	return host
 }
 
-// bracketStripper removes every square bracket from a malformed non-IP host
-// candidate (a well-formed bracketed IPv6 literal is handled before it runs).
-var bracketStripper = strings.NewReplacer("[", "", "]", "")
+// canonicalBracketed parses a "[IPv6]" or "[IPv6]:port" authority. Brackets
+// are IPv6-only syntax in RFC 3986, so a bracketed hostname or IPv4 literal is
+// rejected, as is anything after "]" that is not exactly one valid ":port".
+func canonicalBracketed(s string) string {
+	end := strings.IndexByte(s, ']')
+	if end < 0 {
+		return ""
+	}
+	if rest := s[end+1:]; rest != "" {
+		port, ok := strings.CutPrefix(rest, ":")
+		if !ok || !validPort(port) {
+			return ""
+		}
+	}
+	inner := s[1:end]
+	ip := net.ParseIP(inner)
+	if ip == nil || !strings.Contains(inner, ":") {
+		return ""
+	}
+	return ip.String()
+}
+
+// validPort reports whether a port string is all digits and at most 65535.
+func validPort(port string) bool {
+	if port == "" || len(port) > 5 {
+		return false
+	}
+	n := 0
+	for i := range len(port) {
+		c := port[i]
+		if c < '0' || c > '9' {
+			return false
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n <= 65535
+}
+
+// validHostname reports whether a lowercased, port- and dot-stripped candidate
+// is an acceptable DNS name: non-empty ASCII labels of letters, digits,
+// hyphens, and underscores, each at most 63 bytes. An all-numeric dotted
+// candidate is rejected — it reaches here only because net.ParseIP refused it,
+// and an IPv4-looking string that Go will not parse (leading zeros, five
+// octets) is a configuration error, not a hostname.
+func validHostname(host string) bool {
+	nonNumeric := false
+	for label := range strings.SplitSeq(host, ".") {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		for i := range len(label) {
+			switch c := label[i]; {
+			case c >= '0' && c <= '9':
+			case c >= 'a' && c <= 'z', c == '-', c == '_':
+				nonNumeric = true
+			default:
+				return false
+			}
+		}
+	}
+	return nonNumeric
+}
 
 // HostAllowlistOption configures a HostPolicy built by ParseHostList.
 type HostAllowlistOption func(*hostPolicyConfig)
@@ -115,10 +195,12 @@ type HostPolicy struct {
 //
 // Each entry is trimmed; a blank entry is skipped and does not engage the gate.
 // A usable entry is canonicalized via CanonicalHost and added to the allowlist.
-// An entry is reported as invalid (returned, never added) when it contains "/"
-// (a pasted URL like http://host, a path, or a CIDR confused with a proxy list)
-// or canonicalizes to the empty host (a lone ":9848" that belongs in the bind
-// address, ".", "[]").
+// An entry that is not a well-formed host[:port] under CanonicalHost's strict
+// grammar is reported as invalid (returned, never added): a pasted URL
+// ("http://example.com"), a lone port (":9848") that belongs in the bind
+// address, bracket or colon garbage, a non-ASCII name (configure the Punycode
+// A-label instead), or an IP-like numeric string that is not a valid address
+// ("127.0.0.001").
 //
 // Activation, and the fail-closed contract: the policy is INACTIVE only when no
 // non-blank entry was supplied at all (unset or all-whitespace configuration) —
@@ -155,7 +237,7 @@ func ParseHostList(entries []string, opts ...HostAllowlistOption) (policy *HostP
 		}
 		p.active = true // any non-blank entry engages the gate (fail closed)
 		key := CanonicalHost(s)
-		if key == "" || strings.Contains(s, "/") {
+		if key == "" {
 			invalid = append(invalid, s)
 			continue
 		}
@@ -186,7 +268,8 @@ func (p *HostPolicy) Size() int {
 // canonicalized Host is in the allowlist, or — when WithLoopbackExempt was set
 // — when both the socket peer and the Host are loopback. r.Host is the only
 // host value consulted; X-Forwarded-Host is deliberately ignored (it is
-// client-controlled and this check must hold on the direct-exposure path).
+// client-controlled and this check must hold on the direct-exposure path). A
+// malformed Host canonicalizes to "" and can never match.
 func (p *HostPolicy) Allows(r *http.Request) bool {
 	if p == nil || !p.active {
 		return true
@@ -240,12 +323,15 @@ func isLoopbackHost(canon string) bool {
 
 // isLoopbackPeer reports whether an http.Request.RemoteAddr belongs to a
 // loopback socket peer. RemoteAddr is set by the server from the accepted
-// connection, so it cannot be spoofed at this layer; forwarded headers play no
-// part. A malformed value fails closed (not loopback).
+// connection (net.Conn.RemoteAddr().String(), always "host:port"), so it
+// cannot be spoofed at this layer; forwarded headers play no part. Anything
+// that does not split cleanly as host:port fails CLOSED — a lenient portless
+// fallback would let a non-stdlib caller with a hand-built RemoteAddr widen
+// the loopback carve-out.
 func isLoopbackPeer(remoteAddr string) bool {
 	host, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
-		host = remoteAddr
+		return false
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
