@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -932,5 +933,79 @@ func TestRecoverer_responderPanicBeforeCommitFallsBackToJSON500(t *testing.T) {
 	if responderFailID == "" || responderFailID != recoveredID || responderFailID != echoed {
 		t.Errorf("responder-failure request_id = %q, want the recovered/echoed id (recovered=%q echoed=%q)",
 			responderFailID, recoveredID, echoed)
+	}
+}
+
+func TestRouteTimeout_envelopeCarriesContextRequestID(t *testing.T) {
+	slow := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	})
+	h := webhttp.RouteTimeout(slow, 20*time.Millisecond, "server too slow")
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req = req.WithContext(webhttp.WithRequestID(req.Context(), "corr-42"))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rr.Code)
+	}
+	var body webhttp.ErrorResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("timeout body is not JSON: %v (body=%q)", err, rr.Body.String())
+	}
+	if body.RequestID != "corr-42" {
+		t.Errorf("timeout envelope request_id = %q, want %q", body.RequestID, "corr-42")
+	}
+	if body.Code != "timeout" || body.Error != "server too slow" {
+		t.Errorf("body = %+v, want code=timeout error='server too slow'", body)
+	}
+}
+
+func TestRouteTimeout_envelopeOmitsRequestIDWithoutContext(t *testing.T) {
+	// Without an id in the request context (no RequestLogger upstream) the
+	// envelope omits the field entirely (omitempty wire shape), matching
+	// WriteError's behavior for an id-less request.
+	slow := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	})
+	h := webhttp.RouteTimeout(slow, 10*time.Millisecond, "")
+
+	rr := serve(h, http.MethodGet, "/", nil)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rr.Code)
+	}
+	if strings.Contains(rr.Body.String(), "request_id") {
+		t.Errorf("id-less timeout envelope contains request_id: %q", rr.Body.String())
+	}
+}
+
+func TestRouteTimeout_underRequestLoggerCorrelatesHeaderAndBody(t *testing.T) {
+	// The universal-correlation proof: composed under RequestLogger, the minted
+	// id on the X-Request-ID response header and the request_id in the timeout
+	// envelope are the same id.
+	slow := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	})
+	h := webhttp.RequestLogger(
+		webhttp.RouteTimeout(slow, 20*time.Millisecond, "server too slow"),
+		webhttp.WithLogger(discardLogger()))
+
+	rr := serve(h, http.MethodGet, "/", nil)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rr.Code)
+	}
+	id := rr.Header().Get(webhttp.HeaderRequestID)
+	if !webhttp.ValidRequestID(id) {
+		t.Fatalf("echoed header id %q is not valid", id)
+	}
+	var body webhttp.ErrorResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("timeout body is not JSON: %v (body=%q)", err, rr.Body.String())
+	}
+	if body.RequestID != id {
+		t.Errorf("envelope request_id = %q, header id = %q; want them equal", body.RequestID, id)
 	}
 }

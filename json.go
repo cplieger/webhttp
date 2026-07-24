@@ -67,11 +67,34 @@ type ErrorResponse struct {
 // WriteError ships the MECHANISM only. Each consuming application keeps its own
 // named-helper and error-code taxonomy on top of it.
 func WriteError(w http.ResponseWriter, r *http.Request, status int, code, msg string) {
+	WriteJSONStatus(w, status, errorEnvelope(r, code, msg))
+}
+
+// errorEnvelope builds the ErrorResponse for r under the package's universal
+// correlation scheme: the request id is pulled from the request context when
+// present (nil-safe on r) and omitted otherwise. It is the single home of the
+// scheme; every library error body — written live by WriteError or
+// pre-rendered by errorBodyJSON — goes through it.
+func errorEnvelope(r *http.Request, code, msg string) ErrorResponse {
 	resp := ErrorResponse{Error: msg, Code: code}
 	if r != nil {
 		resp.RequestID = RequestIDFromContext(r.Context())
 	}
-	WriteJSONStatus(w, status, resp)
+	return resp
+}
+
+// errorBodyJSON renders the exact ErrorResponse JSON that WriteError would
+// write for r, as a string, for APIs that require a pre-rendered body instead
+// of writing at request time (http.TimeoutHandler is the one such consumer
+// today). ErrorResponse is a fixed struct of plain strings, so marshaling
+// cannot fail; the fallback literal keeps the body valid JSON even if that
+// ever changes.
+func errorBodyJSON(r *http.Request, code, msg string) string {
+	b, err := json.Marshal(errorEnvelope(r, code, msg))
+	if err != nil {
+		return `{"error":"internal error"}`
+	}
+	return string(b)
 }
 
 // ErrorResponder renders an error response body. It has the exact signature of
