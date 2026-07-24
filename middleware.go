@@ -1,7 +1,6 @@
 package webhttp
 
 import (
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"runtime/debug"
@@ -379,9 +378,13 @@ func (w *jsonTimeoutWriter) WriteHeader(code int) {
 // use per-request deadlines (http.ResponseController.SetWriteDeadline) for
 // streaming routes instead.
 //
-// Because the timeout body is produced inside http.TimeoutHandler, outside
-// request scope, it carries no request_id (unlike WriteError). The 503 envelope
-// is otherwise identical to the package's other JSON errors.
+// The timeout envelope follows the package's universal request-id correlation
+// scheme, exactly like WriteError: it is rendered per request, so when the
+// request context carries an id (RouteTimeout composed under Logging /
+// RequestLogger) the 503 body includes request_id, and when it does not the
+// field is omitted. http.TimeoutHandler requires the body pre-rendered at
+// construction, which is why the handler is assembled per request around the
+// request-scoped envelope.
 func RouteTimeout(h http.Handler, d time.Duration, msg string) http.Handler {
 	if d <= 0 {
 		// A non-positive timeout means "no timeout": return h unwrapped so its
@@ -391,14 +394,8 @@ func RouteTimeout(h http.Handler, d time.Duration, msg string) http.Handler {
 	if msg == "" {
 		msg = "request timed out"
 	}
-	env, err := json.Marshal(ErrorResponse{Error: msg, Code: "timeout"})
-	if err != nil {
-		// ErrorResponse is a fixed struct of strings, so marshaling cannot fail;
-		// this keeps the timeout body valid JSON even if that ever changes.
-		env = []byte(`{"error":"request timed out","code":"timeout"}`)
-	}
-	th := http.TimeoutHandler(h, d, string(env))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		th := http.TimeoutHandler(h, d, errorBodyJSON(r, "timeout", msg))
 		th.ServeHTTP(&jsonTimeoutWriter{ResponseWriter: w}, r)
 	})
 }

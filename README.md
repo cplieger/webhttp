@@ -111,7 +111,7 @@ Put `Recoverer` **inside** `Logging` (logging outermost, e.g. `Chain(mux, Loggin
 
 `SecurityHeaders` does **not** build a Content-Security-Policy for you: a CSP is application-specific (it must match the app's own script/style sources), so pass the exact policy via `WithCSP`. Any header default can be omitted by passing an empty string (e.g. `WithFrameOptions("")` when a CSP `frame-ancestors` supersedes it). **HSTS is off by default**; enable it with `WithHSTS` only for a service reached exclusively over HTTPS, since the header makes browsers refuse plain-HTTP and untrusted-cert connections for the whole max-age.
 
-`RouteTimeout` **cannot wrap streaming or hijacking handlers**: `http.TimeoutHandler` buffers the entire response so it can discard it on timeout, so SSE, WebSocket upgrades, and flushing responses do not work through it. Use per-request deadlines (`http.ResponseController.SetWriteDeadline`) for those. Because the body is produced outside request scope, the timeout envelope carries no `request_id`.
+`RouteTimeout` **cannot wrap streaming or hijacking handlers**: `http.TimeoutHandler` buffers the entire response so it can discard it on timeout, so SSE, WebSocket upgrades, and flushing responses do not work through it. Use per-request deadlines (`http.ResponseController.SetWriteDeadline`) for those. The timeout envelope is rendered per request, so it carries the context's `request_id` when one is present (compose `RouteTimeout` under `Logging`), exactly like `WriteError`.
 
 ### Static assets and CSP
 
@@ -177,7 +177,7 @@ An inbound `X-Request-ID` is reused when it satisfies `ValidRequestID`, otherwis
 - `ErrorResponse{Error, Code, RequestID}` — `Code` and `RequestID` omitted when empty
 - `ErrorResponder` — `func(w, r, status, code, msg)`, the signature of `WriteError` (its canonical instance and the default). Middleware that emits an error body takes one so a non-JSON endpoint can render its error on its own content type; `Recoverer` accepts it via `WithRecoverResponder`
 
-`WriteError` pulls the request id from the request context so a client can correlate a failure with the access log. The one envelope outside that correlation scheme is `RouteTimeout`'s 503: `http.TimeoutHandler` produces the body outside request scope, so it carries no `request_id` (see Streaming below). It ships the mechanism; keep your own named-helper and error-code taxonomy on top.
+`WriteError` pulls the request id from the request context so a client can correlate a failure with the access log. Every library error envelope follows that scheme — including `RouteTimeout`'s 503, which is rendered per request for `http.TimeoutHandler` — with the field omitted when the context carries no id. It ships the mechanism; keep your own named-helper and error-code taxonomy on top.
 
 ### Request prelude
 
