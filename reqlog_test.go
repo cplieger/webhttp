@@ -819,3 +819,140 @@ func TestRequestLogger_panickingRequestAwareMetricHookStillEmitsAccessLine(t *te
 		t.Errorf("access line status = %v, want %d", m["status"], http.StatusAccepted)
 	}
 }
+
+func TestRequestLogger_withLogLevelMapsStatus(t *testing.T) {
+	// The canonical scrape-quiet policy: 2xx/3xx at Debug, 4xx Warn, 5xx Error.
+	policy := func(_ *http.Request, status int) slog.Level {
+		switch {
+		case status >= 500:
+			return slog.LevelError
+		case status >= 400:
+			return slog.LevelWarn
+		}
+		return slog.LevelDebug
+	}
+	cases := []struct {
+		status int
+		want   slog.Level
+	}{
+		{http.StatusAccepted, slog.LevelDebug},
+		{http.StatusNotFound, slog.LevelWarn},
+		{http.StatusInternalServerError, slog.LevelError},
+	}
+	for _, tc := range cases {
+		logCap := &captureHandler{}
+		h := webhttp.RequestLogger(statusHandler(tc.status),
+			webhttp.WithLogger(slog.New(logCap)),
+			webhttp.WithLogLevel(policy))
+
+		serve(h, http.MethodGet, "/x", nil)
+
+		recs := logCap.snapshot()
+		if len(recs) != 1 {
+			t.Fatalf("status %d: got %d records, want 1", tc.status, len(recs))
+		}
+		if recs[0].Level != tc.want {
+			t.Errorf("status %d: line level = %v, want %v", tc.status, recs[0].Level, tc.want)
+		}
+	}
+}
+
+func TestRequestLogger_defaultLineLevelIsInfo(t *testing.T) {
+	logCap := &captureHandler{}
+	h := webhttp.RequestLogger(okHandler(), webhttp.WithLogger(slog.New(logCap)))
+
+	serve(h, http.MethodGet, "/x", nil)
+
+	recs := logCap.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("got %d records, want 1", len(recs))
+	}
+	if recs[0].Level != slog.LevelInfo {
+		t.Errorf("default line level = %v, want Info", recs[0].Level)
+	}
+}
+
+func TestRequestLogger_withLogLevelNilIsNoOp(t *testing.T) {
+	logCap := &captureHandler{}
+	h := webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(slog.New(logCap)),
+		webhttp.WithLogLevel(nil))
+
+	serve(h, http.MethodGet, "/x", nil)
+
+	recs := logCap.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("got %d records, want 1", len(recs))
+	}
+	if recs[0].Level != slog.LevelInfo {
+		t.Errorf("line level with nil policy = %v, want Info", recs[0].Level)
+	}
+}
+
+// A panicking WithLogLevel policy must not lose the access line or escape the
+// outer Logging defer: the line falls back to Info and the failure is logged.
+func TestRequestLogger_panickingLogLevelHookStillEmitsAccessLine(t *testing.T) {
+	logCap := &captureHandler{}
+	h := webhttp.RequestLogger(statusHandler(http.StatusAccepted),
+		webhttp.WithLogger(slog.New(logCap)),
+		webhttp.WithLogLevel(func(*http.Request, int) slog.Level { panic("level boom") }))
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("log level hook panic escaped RequestLogger: %v", r)
+			}
+		}()
+		serve(h, http.MethodPut, "/x", nil)
+	}()
+
+	recs := logCap.snapshot()
+	var access *slog.Record
+	var sawFailure bool
+	for i := range recs {
+		switch recs[i].Message {
+		case "http":
+			access = &recs[i]
+		case "webhttp: log level hook failed":
+			sawFailure = true
+		}
+	}
+	if !sawFailure {
+		t.Error("expected a 'log level hook failed' record, got none")
+	}
+	if access == nil {
+		t.Fatal("access line was not emitted after log level hook panic")
+	}
+	if access.Level != slog.LevelInfo {
+		t.Errorf("access line level after hook panic = %v, want Info fallback", access.Level)
+	}
+}
+
+func TestRequestLogger_withLogLevelComposesWithRequestMetricHook(t *testing.T) {
+	// The level policy and the request-aware metric hook ride the same
+	// deferred emission: both must fire for one request.
+	var metricCalls int
+	logCap := &captureHandler{}
+	h := webhttp.RequestLogger(statusHandler(http.StatusNotFound),
+		webhttp.WithLogger(slog.New(logCap)),
+		webhttp.WithLogLevel(func(_ *http.Request, status int) slog.Level {
+			if status >= 400 {
+				return slog.LevelWarn
+			}
+			return slog.LevelDebug
+		}),
+		webhttp.WithRecordMetricRequest(func(*http.Request, int, time.Duration) { metricCalls++ }))
+
+	serve(h, http.MethodGet, "/missing", nil)
+
+	if metricCalls != 1 {
+		t.Errorf("metric hook fired %d times, want 1", metricCalls)
+	}
+	recs := logCap.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("got %d records, want 1", len(recs))
+	}
+	if recs[0].Level != slog.LevelWarn {
+		t.Errorf("line level = %v, want Warn", recs[0].Level)
+	}
+}
