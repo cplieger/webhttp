@@ -209,7 +209,9 @@ func WithRecordMetricRequest(fn func(r *http.Request, status int, d time.Duratio
 // is emitted at the returned level. The default without this option is
 // slog.LevelInfo, unchanged. The hook chooses the level only — the line's
 // attributes and emission rules (deferred emit, skip paths) are the logger's
-// fixed mechanism.
+// fixed mechanism. ProbeLogLevel is the named preset over this hook for the
+// routine-machine-probe case; reach for the raw hook only when a custom
+// policy is genuinely needed.
 //
 // The canonical use is scrape-noise control on a polled service: map 2xx/3xx
 // to slog.LevelDebug so a 15-second Prometheus scrape stays out of the log
@@ -228,6 +230,50 @@ func WithLogLevel(fn func(r *http.Request, status int) slog.Level) LogOption {
 			c.logLevel = fn
 		}
 	}
+}
+
+// ProbeLogLevel is the fleet-standard access-log level policy for routine
+// machine-probe endpoints — health checks, readiness probes, metrics scrapes
+// (Docker HEALTHCHECK curls, Gatus monitors, Prometheus). A request whose
+// r.URL.Path exactly matches one of paths logs at Debug when it succeeds
+// (status < 400), Warn on a 4xx, and Error on a 5xx; every other request
+// stays at the default Info.
+//
+// The point: a probe hitting a HEALTHY endpoint every 30 seconds is noise and
+// stays out of the shipped log stream (Debug is dropped below the operating
+// level — but becomes visible the moment an operator raises the level to
+// debug, when "is the probe even reaching me, from where" is the question),
+// while a FAILING probe — the readiness 503, the broken-install signal — is
+// exactly what an operator greps for and surfaces at Warn/Error with its
+// status, duration, and request id. Prefer this preset over skipping probe
+// paths entirely (a skip hides the failure too) and over leaving them at
+// Info (a line every 30s per prober). Skip lists remain the right tool for
+// STREAMS (SSE, WebSocket), where one open-to-close line is misleading by
+// shape, not merely noisy.
+//
+// It is a WithLogLevel policy under the hood, so the two are mutually
+// exclusive (last applied wins), it composes with the skip options (a
+// skipped path emits no line and never consults the policy), and a
+// panicking policy falls back to Info per the WithLogLevel contract. With
+// no paths every request logs at Info, as without the option.
+func ProbeLogLevel(paths ...string) LogOption {
+	probe := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		probe[p] = struct{}{}
+	}
+	return WithLogLevel(func(r *http.Request, status int) slog.Level {
+		if _, ok := probe[r.URL.Path]; !ok {
+			return slog.LevelInfo
+		}
+		switch {
+		case status >= 500:
+			return slog.LevelError
+		case status >= 400:
+			return slog.LevelWarn
+		default:
+			return slog.LevelDebug
+		}
+	})
 }
 
 // WithClientIP adds a "client_ip" attribute to the access-log line, set to the
