@@ -60,19 +60,6 @@ func TestNewRequestID_unique(t *testing.T) {
 	}
 }
 
-func TestNewRequestID_timestampFallbackIsValidCharset(t *testing.T) {
-	// NewRequestID falls back to this layout when the random source fails; the
-	// invariant is that the fallback stays within the ValidRequestID charset
-	// (no dot, no colon).
-	ts := time.Now().UTC().Format("20060102T150405")
-	if !webhttp.ValidRequestID(ts) {
-		t.Errorf("fallback timestamp %q is not a valid request id", ts)
-	}
-	if strings.ContainsAny(ts, ".:") {
-		t.Errorf("fallback timestamp %q contains a charset-invalid byte", ts)
-	}
-}
-
 func TestRequestID_contextRoundTrip(t *testing.T) {
 	ctx := webhttp.WithRequestID(t.Context(), "abc")
 	if got := webhttp.RequestIDFromContext(ctx); got != "abc" {

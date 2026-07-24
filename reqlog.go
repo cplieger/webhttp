@@ -8,8 +8,6 @@ import (
 	"net"
 	"net/http"
 	"runtime/debug"
-	"strconv"
-	"sync/atomic"
 	"time"
 )
 
@@ -44,34 +42,13 @@ func ValidRequestID(s string) bool {
 	return true
 }
 
-// fallbackCounter supplies per-request uniqueness for the NewRequestID
-// degraded path. It is advanced only when crypto/rand fails, so under normal
-// operation it stays at zero and costs nothing.
-var fallbackCounter atomic.Uint64
-
-// fallbackRequestID builds the crypto/rand-failure fallback id: a UTC timestamp
-// in the "20060102T150405" layout joined by a hyphen to a process-local base36
-// counter ("20060102T150405-<counter>"). The counter gives each fallback id
-// per-request uniqueness so multiple degraded requests within the same second
-// do not collide. Both components stay within the ValidRequestID charset
-// (base36 is [0-9a-z], the hyphen is allowed) and the result is well under 64
-// bytes.
-func fallbackRequestID() string {
-	n := fallbackCounter.Add(1)
-	return time.Now().UTC().Format("20060102T150405") + "-" + strconv.FormatUint(n, 36)
-}
-
 // NewRequestID returns a fresh request id: 16 cryptographically random bytes,
-// hex-encoded to 32 characters. If the system random source fails, it falls
-// back to fallbackRequestID — a UTC timestamp joined to a process-local base36
-// counter — which contains no dot, stays within the ValidRequestID character
-// set, and is unique per request so a sustained entropy failure does not
-// produce colliding ids that break log/response correlation.
+// hex-encoded to 32 characters. crypto/rand.Read never returns an error (since
+// Go 1.24 it crashes the program irrecoverably if the platform random source
+// fails), so id generation cannot degrade.
 func NewRequestID() string {
 	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return fallbackRequestID()
-	}
+	_, _ = rand.Read(b[:]) // never fails; crashes irrecoverably on entropy failure
 	return hex.EncodeToString(b[:])
 }
 
