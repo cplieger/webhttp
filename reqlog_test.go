@@ -1153,3 +1153,63 @@ func TestRequestLogger_levelHookPanicDiagnosticCarriesTransformedPath(t *testing
 		}
 	}
 }
+
+// probeLevelOf serves one request through a ProbeLogLevel-configured logger
+// and returns the level of the emitted access line.
+func probeLevelOf(t *testing.T, target string, status int, probePaths ...string) slog.Level {
+	t.Helper()
+	logCap := &captureHandler{}
+	h := webhttp.RequestLogger(statusHandler(status),
+		webhttp.WithLogger(slog.New(logCap)),
+		webhttp.ProbeLogLevel(probePaths...))
+	serve(h, http.MethodGet, target, nil)
+	recs := logCap.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("got %d log records, want exactly 1", len(recs))
+	}
+	return recs[0].Level
+}
+
+func TestProbeLogLevel_mapsProbeStatusesToLevels(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		want   slog.Level
+	}{
+		{"healthy probe at Debug", http.StatusOK, slog.LevelDebug},
+		{"redirect grouped with success", http.StatusNotModified, slog.LevelDebug},
+		{"client error at Warn", http.StatusNotFound, slog.LevelWarn},
+		{"server error at Error", http.StatusServiceUnavailable, slog.LevelError},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := probeLevelOf(t, "/api/health", tc.status, "/api/health"); got != tc.want {
+				t.Errorf("probe %d level = %v, want %v", tc.status, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestProbeLogLevel_nonProbePathStaysInfo(t *testing.T) {
+	if got := probeLevelOf(t, "/api/things", http.StatusInternalServerError, "/api/health"); got != slog.LevelInfo {
+		t.Errorf("non-probe 500 level = %v, want Info (the preset must not touch real traffic)", got)
+	}
+}
+
+func TestProbeLogLevel_emptySetLogsEverythingAtInfo(t *testing.T) {
+	if got := probeLevelOf(t, "/api/health", http.StatusOK); got != slog.LevelInfo {
+		t.Errorf("empty-set probe level = %v, want Info", got)
+	}
+}
+
+func TestProbeLogLevel_skippedPathStillEmitsNothing(t *testing.T) {
+	logCap := &captureHandler{}
+	h := webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(slog.New(logCap)),
+		webhttp.WithSkipPaths("/ws"),
+		webhttp.ProbeLogLevel("/ws"))
+	serve(h, http.MethodGet, "/ws", nil)
+	if n := len(logCap.snapshot()); n != 0 {
+		t.Errorf("skipped path emitted %d lines, want 0 (skip wins over the probe policy)", n)
+	}
+}
