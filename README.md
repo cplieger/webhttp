@@ -160,9 +160,10 @@ Activation is fail-closed: a nil or all-blank entry list leaves the policy **ina
 - `NewRequestID() string` — 16 random bytes hex-encoded, with a charset-safe timestamp fallback
 - `WithRequestID(ctx, id)` / `RequestIDFromContext(ctx) string`
 - `RequestLogger(next, opts...) http.Handler` — mints/echoes/threads the id, records status via a `StatusRecorder`, emits one `Info` access-log line per request
-- Options: `WithLogger(l)`, `WithSkipPaths(paths...)`, `WithSkipFunc(fn)`, `WithRecordMetric(fn)`, `WithClientIP(trusted...)`, `WithClientIPFunc(fn)`
+- Options: `WithLogger(l)`, `WithSkipPaths(paths...)`, `WithSkipFunc(fn)`, `WithRecordMetric(fn)`, `WithRecordMetricRequest(fn)`, `WithClientIP(trusted...)`, `WithClientIPFunc(fn)`
 - `WithClientIP(trusted ...*net.IPNet)` adds a `client_ip` attribute resolved by `ClientIP` (spoof-proof; honors `X-Forwarded-For` only from the trusted proxy ranges you pass, else logs the socket peer). Omitted entirely unless the option is supplied, so the default access line is unchanged.
 - `WithClientIPFunc(fn func(*http.Request) string)` is the same attribute but resolved by your own function — use it when the trusted set is dynamic (reloaded from config at runtime) or resolution is app-specific. Mutually exclusive with `WithClientIP`; the last one applied wins.
+- `WithRecordMetricRequest(fn func(r *http.Request, status int, d time.Duration))` is the request-aware variant of `WithRecordMetric`: the hook receives the request itself, so it can key bounded-cardinality metrics on the matched route template via `r.Pattern` (empty on an unmatched request — collapse those to one label) instead of the raw, scanner-controlled URL path. Same deferred emission (a panicking handler is still recorded) and skip-path exclusion; mutually exclusive with `WithRecordMetric`, the last one applied wins. Middleware between the logger and the mux that clones the request (`r.WithContext` and friends) hides the mux-populated fields from the hook.
 
 An inbound `X-Request-ID` is reused when it satisfies `ValidRequestID`, otherwise a fresh id is minted. Skip-path requests still get an id minted, echoed, and threaded, but are served through the raw writer with no access-log line and no metric hook (a stream's open-to-close duration paired with a synthetic status would be misleading, which is why the path is skipped).
 
@@ -176,7 +177,7 @@ An inbound `X-Request-ID` is reused when it satisfies `ValidRequestID`, otherwis
 - `ErrorResponse{Error, Code, RequestID}` — `Code` and `RequestID` omitted when empty
 - `ErrorResponder` — `func(w, r, status, code, msg)`, the signature of `WriteError` (its canonical instance and the default). Middleware that emits an error body takes one so a non-JSON endpoint can render its error on its own content type; `Recoverer` accepts it via `WithRecoverResponder`
 
-`WriteError` pulls the request id from the request context so a client can correlate a failure with the access log. It ships the mechanism; keep your own named-helper and error-code taxonomy on top.
+`WriteError` pulls the request id from the request context so a client can correlate a failure with the access log. The one envelope outside that correlation scheme is `RouteTimeout`'s 503: `http.TimeoutHandler` produces the body outside request scope, so it carries no `request_id` (see Streaming below). It ships the mechanism; keep your own named-helper and error-code taxonomy on top.
 
 ### Request prelude
 
@@ -239,6 +240,11 @@ hub.Shutdown()
 - `(*Hub).Serve(w, r, opts...)` — owns the proxy-defensive headers (`no-transform`, `X-Accel-Buffering: no`), deadline clearing, `Last-Event-ID` replay, keepalives, and frame encoding (`id:` / optional `event:` / spec-correct multi-line `data:`). Streaming support is discovered like `http.ResponseController` does: an `http.Flusher` reachable through an `Unwrap()` chain works, so wrapping middleware keeps streaming intact; the 500 `streaming_unsupported` refusal fires only when no flusher exists at any depth. Options: `WithTopic(t)` (receive broadcasts + events scoped to `t`), `OnConnect(fn)` (write a handshake carrying the replay bounds `(floor, head)` — a client whose last-seen ID is below `floor` missed events and should refetch state — plus any initial per-client frames; default is a `: connected` comment).
 - `(*Hub).Bounds() (floor, head uint64)`, `(*Hub).ClientCount() int`, `(*Hub).Buffered() []ReplayEvent` (a snapshot of the replay window, for diagnostics endpoints and tests), `(*Hub).Shutdown()` (drain gate: cancels every client, subsequent `Serve` calls get 503). Refusal responses use the standard `ErrorResponse` envelope (codes `sse_unavailable`, `streaming_unsupported`).
 
+## Contributing
+
+Issues and PRs are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
+conventions and how to run the checks locally.
+
 ## Disclaimer
 
 This project is built with care and follows security best practices, but it is intended for personal / self-hosted use. No guarantees of fitness for production environments. Use at your own risk.
@@ -247,4 +253,4 @@ This project was built with AI-assisted tooling using [Claude](https://claude.co
 
 ## License
 
-GPL-3.0 — see [LICENSE](LICENSE).
+GPL-3.0. See [LICENSE](LICENSE).
