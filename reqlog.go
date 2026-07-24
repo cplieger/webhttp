@@ -322,10 +322,13 @@ func (c *logConfig) emitAccessLog(rec *StatusRecorder, r *http.Request, path, id
 
 // safeLoggedPath resolves the recorded path via the caller-supplied
 // WithPathFunc transform in isolation, fail-closed on every failure shape: a
-// panicking fn is logged as a hook failure (with the raw path omitted from
-// that diagnostic too) and an empty return is coerced — both degrade to the
-// redactedPathFallback placeholder rather than the raw r.URL.Path, because a
-// broken transform must not reopen the credential leak it exists to close.
+// panicking fn is logged as a hook failure and an empty return is coerced —
+// both degrade to the redactedPathFallback placeholder rather than the raw
+// r.URL.Path, because a broken transform must not reopen the credential leak
+// it exists to close. The failure diagnostic carries only taint-free fields
+// (panic value, stack, request id): the raw path is withheld by design, and
+// the method is redundant with the paired access line (same request_id),
+// which always still emits.
 func (c *logConfig) safeLoggedPath(r *http.Request, id string) (path string) {
 	defer func() {
 		if v := recover(); v != nil {
@@ -333,11 +336,16 @@ func (c *logConfig) safeLoggedPath(r *http.Request, id string) (path string) {
 				"panic", v,
 				"stack", string(debug.Stack()),
 				"request_id", id,
-				"method", r.Method,
 			)
 			path = redactedPathFallback
 		}
 	}()
+	return c.resolvePathValue(r)
+}
+
+// resolvePathValue runs the transform and coerces an empty return to the
+// fail-closed placeholder.
+func (c *logConfig) resolvePathValue(r *http.Request) string {
 	if p := c.pathFunc(r); p != "" {
 		return p
 	}
