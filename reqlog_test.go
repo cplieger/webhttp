@@ -640,3 +640,195 @@ func TestRequestLogger_panickingMetricHookStillEmitsAccessLine(t *testing.T) {
 		t.Errorf("access line status = %v, want %d", m["status"], http.StatusAccepted)
 	}
 }
+
+func TestRequestLogger_requestAwareMetricHookSeesPattern(t *testing.T) {
+	var (
+		calls       int
+		gotPattern  string
+		gotStatus   int
+		gotDuration time.Duration
+	)
+	mux := http.NewServeMux()
+	mux.Handle("GET /things/{id}", statusHandler(http.StatusAccepted))
+	h := webhttp.RequestLogger(mux,
+		webhttp.WithLogger(discardLogger()),
+		webhttp.WithRecordMetricRequest(func(r *http.Request, status int, d time.Duration) {
+			calls++
+			gotPattern, gotStatus, gotDuration = r.Pattern, status, d
+		}))
+
+	serve(h, http.MethodGet, "/things/42", nil)
+
+	if calls != 1 {
+		t.Fatalf("hook called %d times, want 1", calls)
+	}
+	if gotPattern != "GET /things/{id}" {
+		t.Errorf("hook r.Pattern = %q, want %q", gotPattern, "GET /things/{id}")
+	}
+	if gotStatus != http.StatusAccepted {
+		t.Errorf("hook status = %d, want %d", gotStatus, http.StatusAccepted)
+	}
+	if gotDuration < 0 {
+		t.Errorf("hook duration = %v, want non-negative", gotDuration)
+	}
+}
+
+func TestRequestLogger_requestAwareMetricHookEmptyPatternOnUnmatched(t *testing.T) {
+	// No route matches, so the mux never assigns r.Pattern and answers 404. The
+	// hook must observe the empty pattern (the consumer's "collapse to
+	// unmatched" cardinality guard) with the real 404 status.
+	var (
+		calls      int
+		gotPattern string
+		gotStatus  int
+	)
+	mux := http.NewServeMux()
+	mux.Handle("GET /known", okHandler())
+	h := webhttp.RequestLogger(mux,
+		webhttp.WithLogger(discardLogger()),
+		webhttp.WithRecordMetricRequest(func(r *http.Request, status int, _ time.Duration) {
+			calls++
+			gotPattern, gotStatus = r.Pattern, status
+		}))
+
+	serve(h, http.MethodGet, "/unknown", nil)
+
+	if calls != 1 {
+		t.Fatalf("hook called %d times, want 1", calls)
+	}
+	if gotPattern != "" {
+		t.Errorf("hook r.Pattern = %q for an unmatched route, want empty", gotPattern)
+	}
+	if gotStatus != http.StatusNotFound {
+		t.Errorf("hook status = %d, want %d", gotStatus, http.StatusNotFound)
+	}
+}
+
+func TestRequestLogger_requestAwareMetricHookFiresOnPanic(t *testing.T) {
+	var (
+		calls     int
+		gotStatus int
+	)
+	next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		panic("boom")
+	})
+	h := webhttp.RequestLogger(next,
+		webhttp.WithLogger(discardLogger()),
+		webhttp.WithRecordMetricRequest(func(_ *http.Request, status int, _ time.Duration) {
+			calls++
+			gotStatus = status
+		}))
+
+	// RequestLogger does not recover; the panic propagates out of ServeHTTP.
+	// Recover it here so the test can assert the deferred hook still fired.
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Error("handler panic did not propagate through RequestLogger")
+			}
+		}()
+		serve(h, http.MethodGet, "/boom", nil)
+	}()
+
+	if calls != 1 {
+		t.Fatalf("hook called %d times after panic, want 1 (deferred emission)", calls)
+	}
+	if gotStatus != http.StatusOK {
+		t.Errorf("hook status = %d, want 200 (recorded default)", gotStatus)
+	}
+}
+
+func TestRequestLogger_requestAwareMetricHookSkippedOnSkipPath(t *testing.T) {
+	var calls int
+	h := webhttp.RequestLogger(statusHandler(http.StatusTeapot),
+		webhttp.WithLogger(discardLogger()),
+		webhttp.WithSkipPaths("/stream"),
+		webhttp.WithRecordMetricRequest(func(*http.Request, int, time.Duration) { calls++ }))
+
+	serve(h, http.MethodGet, "/stream", nil)
+
+	if calls != 0 {
+		t.Errorf("request-aware hook called %d times for a skip path, want 0", calls)
+	}
+}
+
+func TestRequestLogger_metricHookVariantsMutuallyExclusive(t *testing.T) {
+	// WithRecordMetric and WithRecordMetricRequest set the same hook slot; the
+	// last one applied wins, in either order.
+	var classic, reqAware int
+	last := webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(discardLogger()),
+		webhttp.WithRecordMetric(func(_, _ string, _ int, _ time.Duration) { classic++ }),
+		webhttp.WithRecordMetricRequest(func(*http.Request, int, time.Duration) { reqAware++ }))
+	serve(last, http.MethodGet, "/x", nil)
+	if classic != 0 || reqAware != 1 {
+		t.Errorf("request-aware applied last: classic=%d reqAware=%d, want 0 and 1", classic, reqAware)
+	}
+
+	classic, reqAware = 0, 0
+	first := webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(discardLogger()),
+		webhttp.WithRecordMetricRequest(func(*http.Request, int, time.Duration) { reqAware++ }),
+		webhttp.WithRecordMetric(func(_, _ string, _ int, _ time.Duration) { classic++ }))
+	serve(first, http.MethodGet, "/x", nil)
+	if classic != 1 || reqAware != 0 {
+		t.Errorf("classic applied last: classic=%d reqAware=%d, want 1 and 0", classic, reqAware)
+	}
+}
+
+func TestRequestLogger_requestAwareMetricHookNilIsNoOp(t *testing.T) {
+	// A nil fn is ignored per the package's skip-nil option convention: it
+	// neither enables the request-aware hook nor clears a prior WithRecordMetric.
+	var classic int
+	h := webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(discardLogger()),
+		webhttp.WithRecordMetric(func(_, _ string, _ int, _ time.Duration) { classic++ }),
+		webhttp.WithRecordMetricRequest(nil))
+
+	serve(h, http.MethodGet, "/x", nil)
+
+	if classic != 1 {
+		t.Errorf("classic hook called %d times after trailing WithRecordMetricRequest(nil), want 1", classic)
+	}
+}
+
+// A panicking WithRecordMetricRequest hook must not escape the outer Logging
+// defer: the request still completes and the access line is still emitted (the
+// metric for this request is simply skipped), mirroring the WithRecordMetric
+// containment contract.
+func TestRequestLogger_panickingRequestAwareMetricHookStillEmitsAccessLine(t *testing.T) {
+	logCap := &captureHandler{}
+	h := webhttp.RequestLogger(statusHandler(http.StatusAccepted),
+		webhttp.WithLogger(slog.New(logCap)),
+		webhttp.WithRecordMetricRequest(func(*http.Request, int, time.Duration) { panic("metric boom") }))
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("request-aware metric hook panic escaped RequestLogger: %v", r)
+			}
+		}()
+		serve(h, http.MethodPut, "/metric", nil)
+	}()
+
+	recs := logCap.snapshot()
+	var access *slog.Record
+	var sawFailure bool
+	for i := range recs {
+		switch recs[i].Message {
+		case "http":
+			access = &recs[i]
+		case "webhttp: metric hook failed":
+			sawFailure = true
+		}
+	}
+	if !sawFailure {
+		t.Error("expected a 'metric hook failed' log record, got none")
+	}
+	if access == nil {
+		t.Fatal("access line was not emitted after request-aware metric hook panic")
+	}
+	if m := attrsOf(*access); m["status"] != int64(http.StatusAccepted) {
+		t.Errorf("access line status = %v, want %d", m["status"], http.StatusAccepted)
+	}
+}

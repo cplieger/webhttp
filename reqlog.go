@@ -96,6 +96,7 @@ type logConfig struct {
 	skipPaths       map[string]struct{}
 	skipFunc        func(*http.Request) bool
 	recordMetric    func(method, path string, status int, d time.Duration)
+	recordMetricReq func(r *http.Request, status int, d time.Duration)
 	clientIPFunc    func(*http.Request) string
 	clientIPTrusted []*net.IPNet
 	logClientIP     bool
@@ -142,9 +143,41 @@ func WithSkipFunc(fn func(*http.Request) bool) LogOption {
 // panicking handler is still recorded. Requests skipped via WithSkipPaths or
 // WithSkipFunc are excluded from the hook as well as from access logging: a
 // stream's open-to-close duration paired with a synthetic status is misleading,
-// which is the whole reason the path is skipped.
+// which is the whole reason the path is skipped. WithRecordMetric and
+// WithRecordMetricRequest (the request-aware variant) are mutually exclusive;
+// whichever is applied last wins.
 func WithRecordMetric(fn func(method, path string, status int, d time.Duration)) LogOption {
-	return func(c *logConfig) { c.recordMetric = fn }
+	return func(c *logConfig) {
+		c.recordMetric = fn
+		c.recordMetricReq = nil
+	}
+}
+
+// WithRecordMetricRequest is the request-aware variant of WithRecordMetric:
+// fn is invoked once per logged request with the *http.Request itself, the
+// final status, and the latency. Because http.ServeMux assigns the matched
+// pattern to the request in place, fn observes a populated r.Pattern after
+// routing (empty when nothing matched, e.g. a 404), so a caller can key
+// bounded-cardinality metrics on the route TEMPLATE rather than the raw URL
+// path — the guard that keeps a scanner from minting unbounded label series.
+// Caveat: middleware between RequestLogger and the mux that replaces the
+// request (r.WithContext and friends return a clone) hides those fields — the
+// mux populates the clone, not the request this hook received.
+//
+// Like WithRecordMetric it fires from a deferred call (a panicking handler is
+// still recorded) and is excluded on paths skipped via WithSkipPaths or
+// WithSkipFunc. The two options are mutually exclusive; whichever is applied
+// last wins. A nil fn is ignored (the package's skip-nil option convention),
+// so a trailing WithRecordMetricRequest(nil) neither enables the hook nor
+// clears a prior WithRecordMetric.
+func WithRecordMetricRequest(fn func(r *http.Request, status int, d time.Duration)) LogOption {
+	return func(c *logConfig) {
+		if fn == nil {
+			return
+		}
+		c.recordMetricReq = fn
+		c.recordMetric = nil
+	}
 }
 
 // WithClientIP adds a "client_ip" attribute to the access-log line, set to the
@@ -224,7 +257,7 @@ func (c *logConfig) emitAccessLog(rec *StatusRecorder, r *http.Request, path, id
 		}
 	}
 	c.logger.Info("http", args...)
-	if c.recordMetric != nil {
+	if c.recordMetric != nil || c.recordMetricReq != nil {
 		c.safeRecordMetric(r, path, status, d, id)
 	}
 }
@@ -250,11 +283,12 @@ func (c *logConfig) safeClientIP(r *http.Request, id, path string) (ip string, o
 	return c.resolveClientIP(r), true
 }
 
-// safeRecordMetric fires the caller-supplied WithRecordMetric hook in isolation.
-// A panic in the hook is logged as a hook failure and swallowed — the metric for
-// this request is skipped — so it cannot escape the outer Logging defer (which
-// runs outside Recoverer) and turn a completed request into a net/http
-// connection-closing panic.
+// safeRecordMetric fires the caller-supplied metric hook (WithRecordMetric or
+// WithRecordMetricRequest — mutual exclusion means at most one is set) in
+// isolation. A panic in the hook is logged as a hook failure and swallowed —
+// the metric for this request is skipped — so it cannot escape the outer
+// Logging defer (which runs outside Recoverer) and turn a completed request
+// into a net/http connection-closing panic.
 func (c *logConfig) safeRecordMetric(r *http.Request, path string, status int, d time.Duration, id string) {
 	defer func() {
 		if v := recover(); v != nil {
@@ -269,6 +303,10 @@ func (c *logConfig) safeRecordMetric(r *http.Request, path string, status int, d
 			)
 		}
 	}()
+	if c.recordMetricReq != nil {
+		c.recordMetricReq(r, status, d)
+		return
+	}
 	c.recordMetric(r.Method, path, status, d)
 }
 
