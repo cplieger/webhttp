@@ -72,6 +72,7 @@ type logConfig struct {
 	logger          *slog.Logger
 	skipPaths       map[string]struct{}
 	skipFunc        func(*http.Request) bool
+	pathFunc        func(*http.Request) string
 	recordMetric    func(method, path string, status int, d time.Duration)
 	recordMetricReq func(r *http.Request, status int, d time.Duration)
 	logLevel        func(r *http.Request, status int) slog.Level
@@ -114,6 +115,51 @@ func WithSkipPaths(paths ...string) LogOption {
 // that an exact WithSkipPaths match cannot cover.
 func WithSkipFunc(fn func(*http.Request) bool) LogOption {
 	return func(c *logConfig) { c.skipFunc = fn }
+}
+
+// redactedPathFallback is the fail-closed placeholder recorded as the path
+// when a WithPathFunc transform fails (panics or returns ""). The raw
+// r.URL.Path is deliberately never the fallback: the transform exists because
+// the raw path may embed a secret, so a broken transform must not silently
+// reopen the leak it was installed to close.
+const redactedPathFallback = "(path-redaction-failed)"
+
+// WithPathFunc sets the PATH POLICY for the access-log line: fn is called once
+// per logged request, at emit time, and its return value replaces r.URL.Path
+// as the recorded path. Use it when a route embeds a credential or other
+// sensitive segment (e.g. "/api/sessions/{token}") that should be logged as a
+// token-free template or truncated form — the middle ground between logging
+// the raw path and losing the whole access record to WithSkipPaths or
+// WithSkipFunc.
+//
+// The returned value is "the path as recorded": it feeds the access line's
+// "path" attribute, the legacy WithRecordMetric hook's path argument, and the
+// "path" attribute of the package's hook-failure diagnostics. It does NOT
+// feed WithRecordMetricRequest — that hook receives the *http.Request itself
+// and owns its own representation (r.Pattern is the usual bounded-cardinality
+// choice).
+//
+// fn runs inside the deferred emit, after routing, so http.ServeMux has
+// already populated r.Pattern (empty when nothing matched) and a transform
+// may return the matched template with its own fail-closed fallback for
+// unmatched requests. The WithRecordMetricRequest caveat applies equally:
+// middleware between RequestLogger and the mux that replaces the request
+// (r.WithContext and friends return a clone) hides the populated fields.
+//
+// Skip predicates (WithSkipPaths, WithSkipFunc) always test the raw
+// r.URL.Path, and a skipped request never calls fn.
+//
+// Fail-closed: if fn panics or returns the empty string, the line records the
+// "(path-redaction-failed)" placeholder — never the raw path — and a panic is
+// additionally logged through the package's hook-isolation guard, whose own
+// diagnostic also omits the raw path. A nil fn is ignored (the skip-nil
+// option convention).
+func WithPathFunc(fn func(*http.Request) string) LogOption {
+	return func(c *logConfig) {
+		if fn != nil {
+			c.pathFunc = fn
+		}
+	}
 }
 
 // WithRecordMetric registers a hook invoked once per logged request with the
@@ -236,8 +282,9 @@ func (c *logConfig) resolveClientIP(r *http.Request) string {
 // hook. RequestLogger defers it, so a panicking handler is still logged with its
 // recorded status (rec is read when the deferred call runs).
 //
-// Both caller-supplied observability callbacks — the WithClientIPFunc resolver
-// and the WithRecordMetric hook — run through recover guards. This defer sits in
+// Both caller-supplied observability callbacks — the WithPathFunc transform,
+// the WithClientIPFunc resolver, the WithLogLevel policy, and the
+// WithRecordMetric hook — run through recover guards. This defer sits in
 // the outer Logging layer, OUTSIDE Recoverer (Logging is outermost so it can log
 // the recovered 500), so a panic raised here happens after Recoverer has already
 // returned and would escape to net/http and close the connection. Isolating each
@@ -248,6 +295,9 @@ func (c *logConfig) resolveClientIP(r *http.Request) string {
 func (c *logConfig) emitAccessLog(rec *StatusRecorder, r *http.Request, path, id string, start time.Time) {
 	d := time.Since(start)
 	status := rec.Status()
+	if c.pathFunc != nil {
+		path = c.safeLoggedPath(r, id)
+	}
 	args := []any{
 		"method", r.Method,
 		"path", path,
@@ -268,6 +318,30 @@ func (c *logConfig) emitAccessLog(rec *StatusRecorder, r *http.Request, path, id
 	if c.recordMetric != nil || c.recordMetricReq != nil {
 		c.safeRecordMetric(r, path, status, d, id)
 	}
+}
+
+// safeLoggedPath resolves the recorded path via the caller-supplied
+// WithPathFunc transform in isolation, fail-closed on every failure shape: a
+// panicking fn is logged as a hook failure (with the raw path omitted from
+// that diagnostic too) and an empty return is coerced — both degrade to the
+// redactedPathFallback placeholder rather than the raw r.URL.Path, because a
+// broken transform must not reopen the credential leak it exists to close.
+func (c *logConfig) safeLoggedPath(r *http.Request, id string) (path string) {
+	defer func() {
+		if v := recover(); v != nil {
+			c.logger.Error("webhttp: path transform failed",
+				"panic", v,
+				"stack", string(debug.Stack()),
+				"request_id", id,
+				"method", r.Method,
+			)
+			path = redactedPathFallback
+		}
+	}()
+	if p := c.pathFunc(r); p != "" {
+		return p
+	}
+	return redactedPathFallback
 }
 
 // safeClientIP resolves the "client_ip" value in isolation. A panic in the
@@ -353,6 +427,10 @@ func (c *logConfig) safeRecordMetric(r *http.Request, path string, status int, d
 // resolved by ClientIP (spoof-proof, honoring only the trusted proxy ranges
 // passed to the option); WithClientIPFunc is the variant that resolves it with
 // a caller-supplied function, for a dynamic (e.g. config-reloaded) trusted set.
+// With WithPathFunc the recorded path is fn's return instead of r.URL.Path —
+// the token-redaction middle ground between logging a credential-bearing path
+// raw and skipping its access record entirely (fail-closed placeholder when
+// the transform fails; see the option).
 //
 // It records the status via a StatusRecorder that stays transparent to
 // http.ResponseController, so wrapped handlers can still Flush and Hijack. An
