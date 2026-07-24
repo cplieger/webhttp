@@ -284,3 +284,72 @@ func TestSessionCreateRateLimit(t *testing.T) {
 		}
 	}
 }
+
+// TestTokenBucketAllowLockedClockSkewGuard pins the out-of-order-now guard
+// (x/time/rate advance semantics): a now earlier than the last observed time
+// counts as zero elapsed and re-anchors the timeline at now — the pool never
+// goes negative through a backwards reading, and refill resumes immediately on
+// the new timeline. Production reads the clock under the lock (monotonic), so
+// this is the totality guard for the injectable core.
+func TestTokenBucketAllowLockedClockSkewGuard(t *testing.T) {
+	b := &tokenBucket{burst: 2, refillPerSec: 1}
+	t0 := time.Unix(1_700_000_000, 0)
+
+	// Latch full and drain both tokens at t0.
+	if !b.allowLocked(t0) {
+		t.Fatal("first of the burst should be admitted at t0")
+	}
+	if !b.allowLocked(t0) {
+		t.Fatal("second of the burst should be admitted at t0")
+	}
+
+	// A backwards clock reading must be a plain deny: without the guard the
+	// negative elapsed would push tokens to -10 and stall recovery for 10
+	// extra seconds.
+	if b.allowLocked(t0.Add(-10 * time.Second)) {
+		t.Fatal("backwards now must not admit")
+	}
+	if b.tokens < 0 {
+		t.Fatalf("backwards now drove tokens negative: %v", b.tokens)
+	}
+
+	// The timeline is re-anchored at t0-10s: one second later on the NEW
+	// timeline exactly one token has accrued — refill resumes immediately
+	// rather than stalling until the clock re-passes the old anchor.
+	if !b.allowLocked(t0.Add(-9 * time.Second)) {
+		t.Fatal("1s after the re-anchor one token should have accrued")
+	}
+	if b.allowLocked(t0.Add(-9 * time.Second)) {
+		t.Fatal("only one token can have accrued in 1s on the re-anchored timeline")
+	}
+}
+
+// TestTokenBucketRetryAfterScalesToDeficit pins the deficit-scaled Retry-After
+// hint (the x/time/rate durationFromTokens approach): a freshly emptied bucket
+// hints the full interval, a partially refilled one hints only the remaining
+// deficit, and the whole-second floor holds.
+func TestTokenBucketRetryAfterScalesToDeficit(t *testing.T) {
+	// interval 2.5s per token (refillPerSec = 0.4).
+	b := &tokenBucket{burst: 1, refillPerSec: 0.4}
+	t0 := time.Unix(1_700_000_000, 0)
+
+	if !b.allowLocked(t0) {
+		t.Fatal("first call latches the full burst and admits")
+	}
+
+	// Empty bucket, zero elapsed: deficit 1 token => ceil(2.5s) = 3.
+	if b.allowLocked(t0) {
+		t.Fatal("bucket should be empty")
+	}
+	if got := b.retryAfterSecondsLocked(); got != 3 {
+		t.Errorf("full-deficit hint = %d, want 3 (ceil of the whole interval)", got)
+	}
+
+	// 1.5s later the bucket holds 0.6 tokens: deficit 0.4 => 1s, not 3.
+	if b.allowLocked(t0.Add(1500 * time.Millisecond)) {
+		t.Fatal("0.6 tokens must not admit")
+	}
+	if got := b.retryAfterSecondsLocked(); got != 1 {
+		t.Errorf("partial-deficit hint = %d, want 1 (only the remaining 0.4 tokens)", got)
+	}
+}
