@@ -48,8 +48,9 @@ func WithRateLimitWhen(pred func(*http.Request) bool) RateLimitOption {
 // via WriteError(w, r, http.StatusTooManyRequests, "rate_limited", "rate limit
 // exceeded") (code and message overridable with WithRateLimitError) and does
 // not reach the next handler. The 429 carries a conservative Retry-After hint:
-// the whole seconds to accrue one token, i.e. ceil(interval), clamped to at
-// least 1s.
+// the whole seconds for the CURRENT token deficit to refill at the configured
+// rate — at most ceil(interval) when the bucket was just emptied, less when it
+// is already partially refilled — clamped to at least 1s.
 //
 // The bucket is process-wide for the middleware instance — shared across all
 // requests and all clients — so it bounds the AGGREGATE rate of the wrapped
@@ -96,8 +97,8 @@ func RateLimiter(burst int, interval time.Duration, opts ...RateLimitOption) Mid
 				next.ServeHTTP(w, r)
 				return
 			}
-			if !b.allow() {
-				w.Header().Set("Retry-After", strconv.Itoa(b.retryAfterSeconds()))
+			if ok, retryAfter := b.allow(); !ok {
+				w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 				WriteError(w, r, http.StatusTooManyRequests, c.code, c.msg)
 				return
 			}
@@ -118,12 +119,17 @@ type tokenBucket struct {
 }
 
 // allow refills the bucket for the elapsed wall-clock time and consumes one
-// token, returning false when none is available. It reads the clock under the
-// lock and delegates the pure refill/consume math to allowLocked.
-func (b *tokenBucket) allow() bool {
+// token. It reads the clock under the lock and delegates the pure
+// refill/consume math to allowLocked. On a deny it also computes the
+// Retry-After hint from the same locked state, so the decision and the hint
+// are one consistent snapshot (retryAfter is 0 on an admit).
+func (b *tokenBucket) allow() (ok bool, retryAfterSecs int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.allowLocked(time.Now())
+	if b.allowLocked(time.Now()) {
+		return true, 0
+	}
+	return false, b.retryAfterSecondsLocked()
 }
 
 // allowLocked is the clock-injectable core of allow: it refills the bucket for
@@ -131,10 +137,21 @@ func (b *tokenBucket) allow() bool {
 // token, and reports whether a token was available. The caller must hold b.mu.
 // Taking now as a parameter keeps the refill/consume math deterministically
 // testable without sleeping.
+//
+// A now earlier than the last observed time counts as zero elapsed and
+// re-anchors the timeline at now (exactly x/time/rate's advance semantics): the
+// pool can never go negative through a backwards reading, and refill resumes
+// immediately on the new timeline instead of stalling until the clock
+// re-passes the old anchor. The production call site reads the clock under the
+// lock, so successive monotonic readings cannot go backwards; the guard makes
+// the math total over its input domain anyway.
 func (b *tokenBucket) allowLocked(now time.Time) bool {
 	if b.last.IsZero() {
 		b.tokens = b.burst
 	} else {
+		if now.Before(b.last) {
+			b.last = now
+		}
 		b.tokens += now.Sub(b.last).Seconds() * b.refillPerSec
 		if b.tokens > b.burst {
 			b.tokens = b.burst
@@ -148,10 +165,21 @@ func (b *tokenBucket) allowLocked(now time.Time) bool {
 	return false
 }
 
-// retryAfterSeconds returns a conservative whole-second Retry-After hint: the time to
-// accrue a single token at the refill rate, clamped to at least 1s.
-func (b *tokenBucket) retryAfterSeconds() int {
-	secs := int(math.Ceil(1 / b.refillPerSec))
+// retryAfterSecondsLocked returns the whole-second Retry-After hint for a
+// denied request: the time for the CURRENT deficit (the fraction of a token
+// still missing) to accrue at the refill rate, rounded up and clamped to at
+// least 1s. Scaling to the actual deficit rather than a full token is the
+// x/time/rate durationFromTokens approach: a bucket denied at 0.9 tokens hints
+// the seconds to accrue 0.1, not a full interval. The hint stays conservative
+// for the requesting client (rounded up, never below 1s); under contention on
+// the shared bucket it is best-effort either way. The caller must hold b.mu
+// so the deficit is read from the same state that produced the deny.
+func (b *tokenBucket) retryAfterSecondsLocked() int {
+	deficit := 1 - b.tokens
+	if deficit <= 0 {
+		return 1
+	}
+	secs := int(math.Ceil(deficit / b.refillPerSec))
 	if secs < 1 {
 		return 1
 	}
