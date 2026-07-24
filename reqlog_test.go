@@ -956,3 +956,200 @@ func TestRequestLogger_withLogLevelComposesWithRequestMetricHook(t *testing.T) {
 		t.Errorf("line level = %v, want Warn", recs[0].Level)
 	}
 }
+
+func TestRequestLogger_withPathFuncRewritesLoggedPath(t *testing.T) {
+	logCap := &captureHandler{}
+	h := webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(slog.New(logCap)),
+		webhttp.WithPathFunc(func(r *http.Request) string {
+			if strings.HasPrefix(r.URL.Path, "/api/sessions/") {
+				return "/api/sessions/{id}"
+			}
+			return r.URL.Path
+		}))
+
+	serve(h, http.MethodDelete, "/api/sessions/tok-secret-123", nil)
+
+	recs := logCap.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("got %d log records, want exactly 1", len(recs))
+	}
+	m := attrsOf(recs[0])
+	if m["path"] != "/api/sessions/{id}" {
+		t.Errorf("path attr = %v, want the transformed template", m["path"])
+	}
+	for _, rec := range recs {
+		mm := attrsOf(rec)
+		for k, v := range mm {
+			if s, ok := v.(string); ok && strings.Contains(s, "tok-secret-123") {
+				t.Errorf("raw path leaked through attr %q = %q", k, s)
+			}
+		}
+	}
+}
+
+func TestRequestLogger_withPathFuncFeedsLegacyMetricHook(t *testing.T) {
+	var gotPath string
+	h := webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(discardLogger()),
+		webhttp.WithPathFunc(func(*http.Request) string { return "/tmpl/{id}" }),
+		webhttp.WithRecordMetric(func(_, path string, _ int, _ time.Duration) {
+			gotPath = path
+		}))
+
+	serve(h, http.MethodGet, "/tmpl/abc123", nil)
+
+	if gotPath != "/tmpl/{id}" {
+		t.Errorf("legacy metric hook path = %q, want the transformed template", gotPath)
+	}
+}
+
+func TestRequestLogger_withPathFuncDoesNotAffectRequestMetricHook(t *testing.T) {
+	var gotPath string
+	h := webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(discardLogger()),
+		webhttp.WithPathFunc(func(*http.Request) string { return "/tmpl/{id}" }),
+		webhttp.WithRecordMetricRequest(func(r *http.Request, _ int, _ time.Duration) {
+			gotPath = r.URL.Path
+		}))
+
+	serve(h, http.MethodGet, "/tmpl/abc123", nil)
+
+	if gotPath != "/tmpl/abc123" {
+		t.Errorf("request-aware metric hook saw %q, want the raw request path", gotPath)
+	}
+}
+
+func TestRequestLogger_withPathFuncPanicFallsBackToPlaceholder(t *testing.T) {
+	logCap := &captureHandler{}
+	h := webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(slog.New(logCap)),
+		webhttp.WithPathFunc(func(*http.Request) string { panic("boom") }))
+
+	rr := serve(h, http.MethodGet, "/api/sessions/tok-secret-456", nil)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("response code = %d, want 200 (panicking transform must not break the request)", rr.Code)
+	}
+	recs := logCap.snapshot()
+	var accessLine bool
+	for _, rec := range recs {
+		m := attrsOf(rec)
+		if rec.Message == "http" {
+			accessLine = true
+			if m["path"] != "(path-redaction-failed)" {
+				t.Errorf("path attr = %v, want the fail-closed placeholder", m["path"])
+			}
+		}
+		for k, v := range m {
+			if s, ok := v.(string); ok && strings.Contains(s, "tok-secret-456") {
+				t.Errorf("raw path leaked through %q attr %q = %q", rec.Message, k, s)
+			}
+		}
+	}
+	if !accessLine {
+		t.Error("no access line emitted; the line must still emit when the transform panics")
+	}
+}
+
+func TestRequestLogger_withPathFuncEmptyReturnFallsBackToPlaceholder(t *testing.T) {
+	logCap := &captureHandler{}
+	h := webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(slog.New(logCap)),
+		webhttp.WithPathFunc(func(*http.Request) string { return "" }))
+
+	serve(h, http.MethodGet, "/api/sessions/tok-secret-789", nil)
+
+	recs := logCap.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("got %d log records, want exactly 1", len(recs))
+	}
+	if m := attrsOf(recs[0]); m["path"] != "(path-redaction-failed)" {
+		t.Errorf("path attr = %v, want the fail-closed placeholder", m["path"])
+	}
+}
+
+func TestRequestLogger_withPathFuncNotCalledOnSkippedPath(t *testing.T) {
+	var calls int
+	h := webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(discardLogger()),
+		webhttp.WithSkipFunc(func(r *http.Request) bool {
+			return strings.HasPrefix(r.URL.Path, "/api/sessions/")
+		}),
+		webhttp.WithPathFunc(func(*http.Request) string { calls++; return "/x" }))
+
+	serve(h, http.MethodGet, "/api/sessions/tok", nil)
+
+	if calls != 0 {
+		t.Errorf("transform called %d times on a skipped request, want 0", calls)
+	}
+}
+
+func TestRequestLogger_withPathFuncNilIgnored(t *testing.T) {
+	logCap := &captureHandler{}
+	h := webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(slog.New(logCap)),
+		webhttp.WithPathFunc(nil))
+
+	serve(h, http.MethodGet, "/plain", nil)
+
+	recs := logCap.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("got %d log records, want exactly 1", len(recs))
+	}
+	if m := attrsOf(recs[0]); m["path"] != "/plain" {
+		t.Errorf("path attr = %v, want the raw path when fn is nil", m["path"])
+	}
+}
+
+func TestRequestLogger_withPathFuncSeesPopulatedPattern(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.Handle("GET /api/sessions/{id}", okHandler())
+	logCap := &captureHandler{}
+	h := webhttp.RequestLogger(mux,
+		webhttp.WithLogger(slog.New(logCap)),
+		webhttp.WithPathFunc(func(r *http.Request) string {
+			if r.Pattern != "" {
+				return r.Pattern
+			}
+			return "(unmatched)"
+		}))
+
+	serve(h, http.MethodGet, "/api/sessions/tok-abc", nil)
+
+	recs := logCap.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("got %d log records, want exactly 1", len(recs))
+	}
+	if m := attrsOf(recs[0]); m["path"] != "GET /api/sessions/{id}" {
+		t.Errorf("path attr = %v, want the mux pattern (transform runs after routing)", m["path"])
+	}
+}
+
+func TestRequestLogger_levelHookPanicDiagnosticCarriesTransformedPath(t *testing.T) {
+	logCap := &captureHandler{}
+	h := webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(slog.New(logCap)),
+		webhttp.WithPathFunc(func(*http.Request) string { return "/tmpl/{id}" }),
+		webhttp.WithLogLevel(func(*http.Request, int) slog.Level { panic("level boom") }))
+
+	serve(h, http.MethodGet, "/tmpl/tok-secret-lvl", nil)
+
+	recs := logCap.snapshot()
+	if len(recs) < 2 {
+		t.Fatalf("got %d log records, want the hook-failure diagnostic plus the access line", len(recs))
+	}
+	for _, rec := range recs {
+		m := attrsOf(rec)
+		for k, v := range m {
+			if s, ok := v.(string); ok && strings.Contains(s, "tok-secret-lvl") {
+				t.Errorf("raw path leaked through %q attr %q = %q", rec.Message, k, s)
+			}
+		}
+		if rec.Message != "http" {
+			if m["path"] != "/tmpl/{id}" {
+				t.Errorf("diagnostic path attr = %v, want the transformed path", m["path"])
+			}
+		}
+	}
+}
