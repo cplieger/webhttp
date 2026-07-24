@@ -74,6 +74,7 @@ type logConfig struct {
 	skipFunc        func(*http.Request) bool
 	recordMetric    func(method, path string, status int, d time.Duration)
 	recordMetricReq func(r *http.Request, status int, d time.Duration)
+	logLevel        func(r *http.Request, status int) slog.Level
 	clientIPFunc    func(*http.Request) string
 	clientIPTrusted []*net.IPNet
 	logClientIP     bool
@@ -157,6 +158,32 @@ func WithRecordMetricRequest(fn func(r *http.Request, status int, d time.Duratio
 	}
 }
 
+// WithLogLevel sets the LEVEL POLICY for the access-log line: fn is called
+// once per logged request with the request and the final status, and the line
+// is emitted at the returned level. The default without this option is
+// slog.LevelInfo, unchanged. The hook chooses the level only — the line's
+// attributes and emission rules (deferred emit, skip paths) are the logger's
+// fixed mechanism.
+//
+// The canonical use is scrape-noise control on a polled service: map 2xx/3xx
+// to slog.LevelDebug so a 15-second Prometheus scrape stays out of the log
+// stream at the default level while staying visible under LOG_LEVEL=debug,
+// and raise 4xx to Warn / 5xx to Error so failures surface. Because fn also
+// receives the request, a policy can key on the path instead (quiet only the
+// scrape route, keep everything else at Info).
+//
+// A request suppressed by WithSkipPaths or WithSkipFunc emits no line at all,
+// so fn is never called for it. A panicking fn is contained: the failure is
+// logged and the line falls back to Info, mirroring the package's other
+// callback guards. A nil fn is ignored (the skip-nil option convention).
+func WithLogLevel(fn func(r *http.Request, status int) slog.Level) LogOption {
+	return func(c *logConfig) {
+		if fn != nil {
+			c.logLevel = fn
+		}
+	}
+}
+
 // WithClientIP adds a "client_ip" attribute to the access-log line, set to the
 // best-effort client IP resolved by ClientIP with the given trusted proxy
 // ranges. With no trusted ranges the immediate socket peer is logged (the
@@ -233,7 +260,11 @@ func (c *logConfig) emitAccessLog(rec *StatusRecorder, r *http.Request, path, id
 			args = append(args, "client_ip", ip)
 		}
 	}
-	c.logger.Info("http", args...)
+	lvl := slog.LevelInfo
+	if c.logLevel != nil {
+		lvl = c.safeLogLevel(r, status, id, path)
+	}
+	c.logger.Log(context.Background(), lvl, "http", args...)
 	if c.recordMetric != nil || c.recordMetricReq != nil {
 		c.safeRecordMetric(r, path, status, d, id)
 	}
@@ -258,6 +289,29 @@ func (c *logConfig) safeClientIP(r *http.Request, id, path string) (ip string, o
 		}
 	}()
 	return c.resolveClientIP(r), true
+}
+
+// safeLogLevel resolves the access-line level via the caller-supplied
+// WithLogLevel policy in isolation. A panic in the policy is logged as a hook
+// failure and the line falls back to Info — the access line itself must
+// always emit, so a buggy level policy degrades to the default level rather
+// than escaping the outer Logging defer (which runs outside Recoverer) and
+// closing the connection.
+func (c *logConfig) safeLogLevel(r *http.Request, status int, id, path string) (lvl slog.Level) {
+	defer func() {
+		if v := recover(); v != nil {
+			c.logger.Error("webhttp: log level hook failed",
+				"panic", v,
+				"stack", string(debug.Stack()),
+				"request_id", id,
+				"method", r.Method,
+				"path", path,
+				"status", status,
+			)
+			lvl = slog.LevelInfo
+		}
+	}()
+	return c.logLevel(r, status)
 }
 
 // safeRecordMetric fires the caller-supplied metric hook (WithRecordMetric or
