@@ -157,7 +157,7 @@ Activation is fail-closed: a nil or all-blank entry list leaves the policy **ina
 
 - `HeaderRequestID` — the `X-Request-ID` header constant
 - `ValidRequestID(s) bool` — 1 to 64 chars, each `[A-Za-z0-9_-]`
-- `NewRequestID() string` — 16 random bytes hex-encoded, with a charset-safe timestamp fallback
+- `NewRequestID() string` — 16 random bytes hex-encoded (`crypto/rand.Read` cannot fail on Go ≥ 1.24; it crashes the process rather than degrade)
 - `WithRequestID(ctx, id)` / `RequestIDFromContext(ctx) string`
 - `RequestLogger(next, opts...) http.Handler` — mints/echoes/threads the id, records status via a `StatusRecorder`, emits one `Info` access-log line per request
 - Options: `WithLogger(l)`, `WithSkipPaths(paths...)`, `WithSkipFunc(fn)`, `WithRecordMetric(fn)`, `WithRecordMetricRequest(fn)`, `WithClientIP(trusted...)`, `WithClientIPFunc(fn)`
