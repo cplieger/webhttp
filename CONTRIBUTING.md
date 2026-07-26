@@ -8,17 +8,28 @@ test suite that guards them.
 `webhttp` is a standard-library-only Go package of server-side HTTP plumbing.
 It has no external runtime dependencies, and it must stay that way: every
 dependency would be inherited by every consuming service. The package groups a
-few small, independent pieces:
+set of small, independent pieces:
 
-- `StatusRecorder` — a status-capturing `http.ResponseWriter` wrapper,
-- `RequestLogger` — request-id middleware with one-line access logging,
-- a composable middleware set — `Chain`, `Recoverer`, `SecurityHeaders`,
-  `Logging`, `RouteTimeout`, and the shared-bucket `RateLimiter`, plus the
-  `ClientIP` resolver,
-- JSON helpers — `WriteJSON`, `WriteJSONStatus`, `Ok`, `WriteError`,
-- request-prelude helpers — `LimitBody`, `RequireMethod`, `DecodeBody`,
-- a readiness gate — `Ready`, `ReadinessHandler`,
-- a graceful server bootstrap — `NewServer`, `Run`.
+- `StatusRecorder`: a status-capturing `http.ResponseWriter` wrapper,
+- `RequestLogger` / `Logging`: request-id middleware with one-line access
+  logging,
+- a composable middleware set: `Chain`, `Recoverer`, `SecurityHeaders`,
+  `RouteTimeout`, the shared-bucket `RateLimiter` and its
+  `SessionCreateRateLimit` preset,
+- the `ClientIP` resolver plus `ParseCIDRs`,
+- the exact-match Host allowlist: `ParseHostList`, `CanonicalHost`,
+  `HostPolicy`,
+- the bind-exposure classifier: `ClassifyBind`, `ClassifyBindHost`,
+  `BindClass`,
+- static assets and CSP: `StaticHandler`, `InlineScriptHashes`,
+- JSON helpers: `WriteJSON`, `WriteJSONStatus`, `Ok`, `WriteError`,
+- request-prelude helpers: `LimitBody`, `RequireMethod`, `DecodeBody`,
+  `DecodeJSONInto`,
+- the constant-time `StaticTokenVerifier`,
+- a readiness gate: `Ready`, `ReadinessHandler`,
+- a graceful server bootstrap: `NewServer`, `Run`,
+- the `sse` subpackage: a Server-Sent-Events broadcast hub with replay and
+  `Last-Event-ID` resume.
 
 ## Invariants to preserve
 
@@ -35,18 +46,18 @@ A few properties are load-bearing. Keep them when you change the code.
 - **`ValidRequestID` is the trust boundary for the echoed id.** The id is
   written back on a response header and into log lines, so it must reject any
   byte outside `[A-Za-z0-9_-]` and anything longer than 64 chars. That is what
-  stops log-forging newlines and header-splitting content. The `NewRequestID`
-  timestamp fallback must stay inside the same charset (no dot, no colon).
+  stops log-forging newlines and header-splitting content. `NewRequestID`
+  output (hex) must stay inside the same charset.
 - **`NewServer` defaults are streaming-safe.** `ReadTimeout` and `WriteTimeout`
   are deliberately left unset (0) so SSE, WebSocket, and long responses work
   out of the box; a `WriteTimeout` would cut an in-progress stream. Keep the
   slowloris guard (`ReadHeaderTimeout`) and the header-size cap.
-- **`Run`'s shutdown ordering.** On context cancellation `Run` calls
-  `srv.Shutdown` with a context bounded by a single shutdown deadline (now +
-  grace), then `onShutdown` with a context bounded by that SAME deadline (the
-  grace budget remaining after `Shutdown` drains), and treats
-  `http.ErrServerClosed` as a clean stop. A
-  real serve error takes precedence over a shutdown error in the return value.
+- **`Run`'s shutdown ordering.** On context cancellation `Run` computes one
+  shutdown deadline (now + grace) and runs the whole sequence against it: the
+  `WithPreDrain` hook first (if registered), then `srv.Shutdown`, then
+  `onShutdown`; each later phase gets whatever budget remains, not a fresh
+  window. `http.ErrServerClosed` is a clean stop, and a real serve error takes
+  precedence over a shutdown error in the return value.
 - **`WriteError` is nil-safe.** It must not panic when `r` is nil; the
   `RequestID` field simply stays empty.
 - **`Chain` order and `Recoverer` placement.** `Chain` applies middleware so the
@@ -57,27 +68,33 @@ A few properties are load-bearing. Keep them when you change the code.
 - **`ClientIP` trusts `X-Forwarded-For` only from a trusted peer, and walks it
   right-to-left.** With no trusted ranges (or an untrusted direct peer) it
   returns the `RemoteAddr` host and ignores `X-Forwarded-For`. Only when the
-  direct peer is inside a caller-supplied trusted range is the header consulted,
-  and then it is walked from the right, skipping trusted-proxy hops, down to the
-  first untrusted entry (the client). That is the correct reading when a proxy
-  appends the peer it saw (Caddy and most reverse proxies), which makes the
-  leftmost entry the attacker-controlled value the client sent; the trusted set
-  must therefore contain every proxy hop. `X-Real-IP` is deliberately not
-  consulted — it is client-settable and not overwritten by Caddy, so it would be
-  a spoof vector. The library hardcodes no CIDR.
+  direct peer is inside a caller-supplied trusted range is the header
+  consulted, and then it is walked from the right, skipping trusted-proxy
+  hops, down to the first untrusted entry (the client). That is the correct
+  reading when a proxy appends the peer it saw, which makes the leftmost entry
+  the attacker-controlled value the client sent; the trusted set must
+  therefore contain every proxy hop. `X-Real-IP` is deliberately not consulted
+  (client-settable, and not overwritten by common proxies, so it would be a
+  spoof vector). The library hardcodes no CIDR.
+- **`CanonicalHost` rejects malformed authorities, never repairs them.**
+  Repair (stripping stray brackets, truncating at a bad port) would collapse
+  distinct wire values onto allowlisted keys and silently widen an exact-match
+  gate; anything that does not parse strictly returns `""` and is rejected.
+  Matching stays purely textual: no name resolution, no IDN mapping.
 - **`SecurityHeaders` never builds a CSP.** A Content-Security-Policy is
-  application-owned; the middleware only sets what `WithCSP` is given. HSTS stays
-  off unless `WithHSTS` is passed.
+  application-owned; the middleware only sets what `WithCSP` is given. HSTS
+  stays off unless `WithHSTS` is passed.
 - **Functional options skip nil.** Every `...Option` loop, and `Chain` itself,
   ignores a nil entry so callers can pass conditionally-built values.
 - **`RateLimiter`'s non-positive contract is "off", not "unlimited".** A `burst`
   or `interval` `<= 0` returns the next handler unwrapped (no bucket
   allocated), so a config-driven zero means "no limit" without the caller
-  special-casing it — the same off contract as `RouteTimeout`. The bucket is a
-  single process-wide instance shared across all clients (it bounds the
-  aggregate rate of the wrapped route, not per-client fairness), and the empty-
-  bucket 429 flows through `WriteError` so the throttled response stays the
-  standard JSON envelope. Keep all three properties if you touch it.
+  special-casing it: the same off contract as `RouteTimeout` and an inactive
+  `HostPolicy`. The bucket is a single process-wide instance shared across all
+  clients (it bounds the aggregate rate of the wrapped route, not per-client
+  fairness), and the empty-bucket 429 flows through `WriteError` so the
+  throttled response stays the standard JSON envelope. Keep all three
+  properties if you touch it.
 
 ## Local development
 
@@ -114,34 +131,18 @@ gremlins unleash .
 
 ## Test suite conventions
 
-Tests are **standard library only** — `testing` plus `net/http/httptest`. Do
+Tests are **standard library only**: `testing` plus `net/http/httptest`. Do
 not add a third-party test dependency (no `testify`, no `rapid`); it would show
 up in `go.sum` and, for a zero-dependency library, that is a regression. Use
 plain `if got != want { t.Errorf(...) }`, table-driven subtests, and
 `httptest` throughout.
 
-Tests live beside the code, one file per source unit:
-
-- `recorder_test.go` — default-200, record-once, and the `Unwrap` flush/hijack
-  chain (both `httptest.ResponseRecorder` and a custom writer that exposes the
-  optional interface only through `Unwrap`).
-- `reqlog_test.go` — the `ValidRequestID` table, `NewRequestID`, and the
-  `RequestLogger` behaviors (mint, reuse, replace, echo, thread, skip-path,
-  metric hook, captured status).
-- `middleware_test.go` — `Chain` ordering (first = outermost, nil-skip),
-  `Recoverer` (panic → 500 JSON + log, `ErrAbortHandler` re-panic, hook, and the
-  status-500 access line when inside `Logging`), `SecurityHeaders` (defaults,
-  overrides, empty-omit, the HSTS table), `Logging` composing in a `Chain`,
-  `ClientIP` (the trust model), and `RouteTimeout` (fast pass, slow → 503 JSON).
-- `json_test.go` — JSON headers, `WriteJSON`/`WriteJSONStatus`/`Ok`, the
-  encode-failure `Warn`, and `WriteError` including the nil-request case.
-- `prelude_test.go` — `RequireMethod`, `DecodeBody` (200 / 405 / 400 / oversize),
-  and the request body-limit helpers.
-- `readiness_test.go` — `Ready` transitions and the 200/503 handler bodies.
-- `server_test.go` — `NewServer` defaults and overrides, and `Run`'s
-  serve/graceful-shutdown/onShutdown paths.
-- `helpers_test.go` — shared handlers and the capturing `slog.Handler`.
-- `example_test.go` — runnable `Example` functions kept compiling.
+Tests live beside the code, one `_test.go` file per source unit, in both the
+root package and `sse/`. Parser, validator, and encoder surfaces additionally
+carry fuzz targets in `*_fuzz_test.go` files; add one when you introduce a new
+input-parsing surface. `helpers_test.go` holds the shared handlers and the
+capturing `slog.Handler`; `example_test.go` keeps runnable `Example` functions
+compiling.
 
 Tests that capture `slog` output by swapping `slog.Default()` mutate
 process-global state, so they must run serially (no `t.Parallel()`); prefer
@@ -161,5 +162,5 @@ changelog line a consumer would read.
 By participating you agree to the org-wide
 [Code of Conduct](https://github.com/cplieger/.github/blob/main/CODE_OF_CONDUCT.md).
 Report security issues through the
-[security policy](https://github.com/cplieger/.github/blob/main/SECURITY.md) —
+[security policy](https://github.com/cplieger/.github/blob/main/SECURITY.md),
 never in a public issue.
