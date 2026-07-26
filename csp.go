@@ -29,24 +29,76 @@ import (
 // page is known to carry inline scripts should treat an empty result as a
 // malformed build and fail startup rather than degrade its policy.
 func InlineScriptHashes(html []byte) []string {
+	return inlineElementHashes(html, "script", hasSrcAttr)
+}
+
+// InlineStyleHashes scans HTML for inline <style> elements and returns a CSP
+// source token 'sha256-<base64>' for each, hashing the exact bytes between the
+// element's '>' and its '</style>' — precisely the content a browser hashes for
+// a Content-Security-Policy style-src hash.
+//
+// It is the style-src counterpart of InlineScriptHashes and shares its scanner
+// core, so the byte-boundary and malformed-tag behavior cannot drift between the
+// two. It exists for the same reason: an app serving a build-controlled embedded
+// page can pin style-src to exact hashes instead of 'unsafe-inline', computed at
+// startup from the very bytes it will serve. A pre-JS loading overlay whose CSS
+// must paint before the external stylesheet loads is the classic case — and one
+// a hash suits well, because that block is build-controlled.
+//
+// There is no skip rule, unlike the script scanner's external-src case: a <style>
+// element always carries its content inline (a stylesheet reference is
+// <link rel="stylesheet">, which style-src covers via 'self'). A media attribute
+// does not change what a browser hashes, so such blocks are hashed like any
+// other.
+//
+// Note what a style-src hash does NOT cover: inline style ATTRIBUTES
+// (style="..."), which are governed by style-src-attr and need 'unsafe-hashes'
+// rather than an element hash. This function is for <style> ELEMENTS only, so an
+// app whose markup or renderer sets style attributes cannot drop 'unsafe-inline'
+// on the strength of these tokens alone. A renderer driving CSSOM property
+// setters (element.style.color = …) emits no attribute and is unaffected.
+//
+// Same posture as the script scanner: an extractor for pages the APP controls,
+// not an HTML sanitizer for untrusted input. It returns an empty slice on
+// style-less or malformed input; a caller whose page is known to carry an inline
+// style block should treat an empty result as a malformed build and fail startup
+// rather than degrade its policy.
+func InlineStyleHashes(html []byte) []string {
+	return inlineElementHashes(html, "style", nil)
+}
+
+// inlineElementHashes is the shared scanner behind InlineScriptHashes and
+// InlineStyleHashes: it walks every `tag` element in html and hashes each one's
+// exact content bytes. `skip`, when non-nil, is consulted with the opening tag's
+// attribute bytes and suppresses the hash for that element (the script scanner's
+// external-src case); a nil skip hashes every element found.
+//
+// One core rather than one scanner per tag, because the delicate parts — where
+// the content starts and ends, quote-aware tag scanning, the fold-preserving
+// index arithmetic that keeps slices addressing the ORIGINAL bytes — are exactly
+// what a browser must agree with byte for byte. A second copy that drifted would
+// produce a policy that silently blocks the page it was meant to protect.
+func inlineElementHashes(html []byte, tag string, skip func(attrs []byte) bool) []string {
+	openTag := "<" + tag
+	closeTag := "</" + tag
 	var out []string
 	for i := 0; i < len(html); {
-		open := findScriptOpen(html, i)
+		open := findElementOpen(html, i, openTag)
 		if open < 0 {
 			break
 		}
-		gt := openTagEnd(html, open+len("<script"))
+		gt := openTagEnd(html, open+len(openTag))
 		if gt < 0 {
 			break
 		}
-		closeIdx := findScriptClose(html, gt+1)
+		closeIdx := indexFoldASCII(html, gt+1, closeTag)
 		if closeIdx < 0 {
 			break
 		}
-		if !hasSrcAttr(html[open+len("<script") : gt]) {
+		if skip == nil || !skip(html[open+len(openTag):gt]) {
 			out = append(out, cspHash(html[gt+1:closeIdx]))
 		}
-		i = closeIdx + len("</script")
+		i = closeIdx + len(closeTag)
 	}
 	return out
 }
@@ -57,27 +109,22 @@ func cspHash(content []byte) string {
 	return "'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'"
 }
 
-// findScriptOpen returns the index at or after `from` of the next "<script"
-// tag start — case-insensitive, and only where "<script" is followed by a tag
-// boundary so "<scriptfoo" does not match — or -1.
-func findScriptOpen(html []byte, from int) int {
+// findElementOpen returns the index at or after `from` of the next occurrence of
+// `openTag` (e.g. "<script", "<style") — case-insensitive, and only where the tag
+// name is followed by a tag boundary so "<scriptfoo" or "<styles" does not
+// match — or -1.
+func findElementOpen(html []byte, from int, openTag string) int {
 	for i := from; ; {
-		s := indexFoldASCII(html, i, "<script")
+		s := indexFoldASCII(html, i, openTag)
 		if s < 0 {
 			return -1
 		}
-		after := s + len("<script")
+		after := s + len(openTag)
 		if after >= len(html) || isTagNameBoundary(html[after]) {
 			return s
 		}
 		i = after
 	}
-}
-
-// findScriptClose returns the index at or after `from` of the next "</script"
-// (case-insensitive), or -1.
-func findScriptClose(html []byte, from int) int {
-	return indexFoldASCII(html, from, "</script")
 }
 
 // openTagEnd returns the index of the '>' that closes an opening tag starting

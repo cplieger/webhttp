@@ -49,6 +49,92 @@ func TestInlineScriptHashes(t *testing.T) {
 	}
 }
 
+func TestInlineStyleHashes(t *testing.T) {
+	cases := []struct {
+		name string
+		html string
+		want []string
+	}{
+		{"no styles", `<html><body>hi</body></html>`, nil},
+		{"single inline", `<head><style>body{margin:0}</style></head>`, []string{hashToken("body{margin:0}")}},
+		{
+			"two inline preserve order",
+			`<style>a{color:red}</style><style>b{color:blue}</style>`,
+			[]string{hashToken("a{color:red}"), hashToken("b{color:blue}")},
+		},
+		{"case-insensitive tag", `<STYLE>c{top:0}</STYLE>`, []string{hashToken("c{top:0}")}},
+		{"newlines hashed verbatim", "<style>\n  d{left:0}\n</style>", []string{hashToken("\n  d{left:0}\n")}},
+		{"styles is not a style tag", `<styles>nope</styles>`, nil},
+		{"unclosed style yields nothing", `<style>never closed`, nil},
+		{
+			"gt inside quoted attribute does not end the tag",
+			`<style media="all and (min-width:1px)" data-x="a>b">e{right:0}</style>`,
+			[]string{hashToken("e{right:0}")},
+		},
+		// A media attribute does not change what a browser hashes, and unlike the
+		// script scanner there is no external-reference form to skip: a stylesheet
+		// reference is <link rel="stylesheet">, which style-src covers via 'self'.
+		{"media attribute still hashed", `<style media="print">f{bottom:0}</style>`, []string{hashToken("f{bottom:0}")}},
+		{"src attribute is meaningless on style and does not skip it", `<style src="x">g{gap:0}</style>`, []string{hashToken("g{gap:0}")}},
+		// A <link rel=stylesheet> is not a <style> element and must not be hashed.
+		{"link stylesheet ignored", `<link rel="stylesheet" href="/style.css">`, nil},
+		{"style attribute is not a style element", `<div style="color:red">x</div>`, nil},
+		// Boundary cases inherited from web-terminal-kiro's local scanner when the
+		// library took over the style half: attributes and tag case must not enter
+		// the hash, and a spaced close tag still terminates the block.
+		{"attributes excluded from the hash", `<style type="text/css" media="all">h{x:0}</style>`, []string{hashToken("h{x:0}")}},
+		{"spaced close tag", `<style>i{y:0}</style >`, []string{hashToken("i{y:0}")}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := InlineStyleHashes([]byte(tc.html))
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("InlineStyleHashes(%q) = %v, want %v", tc.html, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestInlineHashesSurviveLengthChangingFold is the sharpest boundary case, and it
+// is why the scanner folds ASCII in place instead of calling bytes.ToLower: a
+// unicode-aware fold can CHANGE a rune's byte length (U+0130 folds to the 1-byte
+// 'i'), sliding every index computed on the folded copy off the ORIGINAL bytes so
+// the scanner hashes the wrong content and ships a policy that blocks the page.
+// Pure-ASCII content cannot tell the two implementations apart, so only content
+// carrying such a rune tests it. Inherited from web-terminal-kiro's local style
+// scanner when the library took over that half; asserted for both tags, since
+// they now share one core.
+func TestInlineHashesSurviveLengthChangingFold(t *testing.T) {
+	const content = "\n  body { content: '\u0130' }\n"
+	want := hashToken(content)
+
+	if got := InlineStyleHashes([]byte("<html><style>" + content + "</style></html>")); !slices.Equal(got, []string{want}) {
+		t.Errorf("InlineStyleHashes = %v, want %v (a length-changing fold slides the content indices)", got, []string{want})
+	}
+	if got := InlineScriptHashes([]byte("<html><script>" + content + "</script></html>")); !slices.Equal(got, []string{want}) {
+		t.Errorf("InlineScriptHashes = %v, want %v (a length-changing fold slides the content indices)", got, []string{want})
+	}
+}
+
+// The two extractors share one scanner core, so pin that they stay independent:
+// scripts must not pick up style content and vice versa, on a page carrying both.
+func TestInlineHashesDoNotCrossContaminate(t *testing.T) {
+	html := []byte(`<head><style>body{margin:0}</style><script type="module">boot()</script></head>`)
+	styles := InlineStyleHashes(html)
+	scripts := InlineScriptHashes(html)
+	if !slices.Equal(styles, []string{hashToken("body{margin:0}")}) {
+		t.Errorf("InlineStyleHashes = %v, want the style body only", styles)
+	}
+	if !slices.Equal(scripts, []string{hashToken("boot()")}) {
+		t.Errorf("InlineScriptHashes = %v, want the script body only", scripts)
+	}
+	// A style hash must never equal the script hash on this page, which would mean
+	// the shared core sliced the wrong content boundary for one of them.
+	if styles[0] == scripts[0] {
+		t.Error("style and script hashes are identical; the shared scanner sliced the same bytes twice")
+	}
+}
+
 // TestCSPHashTokenFormat pins that cspHash emits a CSP-grammar source token: a
 // standard-base64 encoding of a 32-byte sha256 digest wrapped as 'sha256-...'.
 // It validates the encoding/format without hardcoding any expected hash value.
