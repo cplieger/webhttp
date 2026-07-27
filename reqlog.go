@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"runtime/debug"
+	"strings"
 	"time"
 )
 
@@ -160,6 +161,97 @@ func WithPathFunc(fn func(*http.Request) string) LogOption {
 			c.pathFunc = fn
 		}
 	}
+}
+
+// WithTemplatePathsUnder declares URL prefixes whose concrete paths carry a
+// CREDENTIAL, so the access log records the matched ROUTE TEMPLATE for them
+// instead of the path itself: "/api/sessions/{id}" rather than
+// "/api/sessions/6f3a…". Prefer it over WithPathFunc for this job — it is the
+// same protection expressed as data, and the reason that matters is below.
+//
+// The template comes from r.Pattern, which http.ServeMux populates during
+// routing, so the router is the source of truth for what matched. The method
+// prefix ServeMux includes ("DELETE /api/sessions/{id}") is stripped, since the
+// method is already its own attribute on the line.
+//
+// Three cases, and the middle one is the whole point:
+//
+//   - a path under a declared prefix that MATCHED a route: the template.
+//   - a path under a declared prefix that matched NOTHING (a 404 on
+//     "/api/sessions/6f3a…/nope"): the prefix plus an "(unmatched)" marker.
+//     Never the raw path — an unrouted request under a credential-bearing
+//     prefix still has the credential in it, and this is exactly the leak a
+//     path policy exists to close. It is also visible as unmatched rather than
+//     mislabelled onto a route it is not, so a NEW upstream subroute shows up
+//     in the log as something to wire rather than disappearing.
+//   - a path outside every declared prefix: recorded unchanged. Deliberately
+//     not the template, because a static mount's pattern is "/" and logging
+//     that would collapse every asset onto one line, losing which asset 404'd.
+//     Credential-bearing routes are a per-route-family fact, not a per-app one,
+//     which is why this option takes prefixes rather than being a global switch.
+//
+// Why this exists as a declarative option rather than leaving callers to write
+// their own WithPathFunc: two apps in this fleet hand-rolled the identical
+// transform over the same upstream route table and DIVERGED on the unmatched
+// case — one returned "" (indistinguishable from a broken transform) and one
+// returned an "(unmapped)" marker. A free-form hook makes that outcome the
+// default. Expressed as data, the policy has one implementation, and the
+// unmatched-route decision is made once here instead of once per consumer.
+//
+// Pair it with the prefix the route-owning package exports (e.g. the terminal
+// engine's SessionsSubtreePath) rather than a local string literal, so the set
+// of credential-bearing routes stays owned by whoever declares those routes.
+//
+// A prefix that is empty is ignored. Applying this option replaces any
+// previously-set path policy (including WithPathFunc), and vice versa: there is
+// one recorded path, so the last policy applied wins.
+func WithTemplatePathsUnder(prefixes ...string) LogOption {
+	kept := make([]string, 0, len(prefixes))
+	for _, p := range prefixes {
+		if p != "" {
+			kept = append(kept, p)
+		}
+	}
+	return func(c *logConfig) {
+		if len(kept) == 0 {
+			return
+		}
+		c.pathFunc = func(r *http.Request) string {
+			return templatePath(r, kept)
+		}
+	}
+}
+
+// unmatchedTemplateMarker is appended to a declared prefix when a request under
+// it matched no route. It is NOT redactedPathFallback: that placeholder means
+// "the path policy itself failed", and conflating a routine 404 with a broken
+// policy would hide the latter. This one says "routed nowhere, and the path is
+// withheld because it is under a credential-bearing prefix".
+const unmatchedTemplateMarker = "(unmatched)"
+
+// templatePath implements the WithTemplatePathsUnder policy. Split out from the
+// option so the option stays a thin binding and this stays testable as a pure
+// function of (request, prefixes).
+func templatePath(r *http.Request, prefixes []string) string {
+	p := r.URL.Path
+	under := ""
+	for _, prefix := range prefixes {
+		// Longest matching prefix wins, so nested declarations behave the way a
+		// reader expects rather than depending on argument order.
+		if strings.HasPrefix(p, prefix) && len(prefix) > len(under) {
+			under = prefix
+		}
+	}
+	if under == "" {
+		return p
+	}
+	// ServeMux's pattern is "[METHOD ][HOST]/path"; take everything from the
+	// first "/" so the recorded value is a bare path template. A pattern with no
+	// "/" at all cannot be a path and is treated as no match.
+	if i := strings.Index(r.Pattern, "/"); i >= 0 {
+		return r.Pattern[i:]
+	}
+	return under + unmatchedTemplateMarker
 }
 
 // WithRecordMetric registers a hook invoked once per logged request with the

@@ -1213,3 +1213,218 @@ func TestProbeLogLevel_skippedPathStillEmitsNothing(t *testing.T) {
 		t.Errorf("skipped path emitted %d lines, want 0 (skip wins over the probe policy)", n)
 	}
 }
+
+// --- WithTemplatePathsUnder -------------------------------------------------
+//
+// The policy exists because two apps hand-rolled the same WithPathFunc over the
+// same upstream route table and diverged on the unmatched case. These tests pin
+// the three outcomes it decides once, plus the stdlib property the whole thing
+// rests on (a nested ServeMux overwrites r.Pattern in place), because that
+// property is what makes the template visible to a middleware sitting OUTSIDE
+// both muxes.
+
+// nestedSessionMux mirrors the real consumer shape: an outer mux that mounts a
+// subtree prefix, and an inner mux (the route-owning package's own handler)
+// registering the concrete templates under it. Both are plain http.ServeMux, so
+// this is the stdlib behaviour the option depends on, not a stand-in for it.
+func nestedSessionMux() http.Handler {
+	inner := http.NewServeMux()
+	inner.HandleFunc("DELETE /api/sessions/{id}", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	inner.HandleFunc("PUT /api/sessions/{id}/title", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	outer := http.NewServeMux()
+	outer.Handle("/api/sessions/", inner)
+	outer.HandleFunc("/api/sessions/events", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	outer.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	return outer
+}
+
+// loggedPathFor serves one request through the logger wrapped around the nested
+// mux and returns the recorded path attribute.
+func loggedPathFor(t *testing.T, method, target string, opts ...webhttp.LogOption) string {
+	t.Helper()
+	logCap := &captureHandler{}
+	opts = append([]webhttp.LogOption{webhttp.WithLogger(slog.New(logCap))}, opts...)
+	h := webhttp.RequestLogger(nestedSessionMux(), opts...)
+	serve(h, method, target, nil)
+	recs := logCap.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("got %d log records, want exactly 1", len(recs))
+	}
+	p, _ := attrsOf(recs[0])["path"].(string)
+	return p
+}
+
+// A stand-in for the credential a session path embeds. Deliberately
+// sequential rather than random-looking: the assertions only need a value
+// that must not appear in a log line, and a high-entropy hex literal beside an
+// identifier like this one is what secret scanners exist to flag.
+const fakeSessionID = "0123456789abcdef"
+
+func TestWithTemplatePathsUnder_recordsTheMatchedTemplate(t *testing.T) {
+	cases := []struct {
+		name, method, target, want string
+	}{
+		{"session itself", http.MethodDelete, "/api/sessions/" + fakeSessionID, "/api/sessions/{id}"},
+		{"subresource", http.MethodPut, "/api/sessions/" + fakeSessionID + "/title", "/api/sessions/{id}/title"},
+		// An exact path under the prefix is its own registered pattern, so it
+		// records as itself with no special-casing in the option.
+		{"exact path member", http.MethodGet, "/api/sessions/events", "/api/sessions/events"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := loggedPathFor(t, tc.method, tc.target,
+				webhttp.WithTemplatePathsUnder("/api/sessions/"))
+			if got != tc.want {
+				t.Errorf("logged path = %q, want %q", got, tc.want)
+			}
+			if strings.Contains(got, fakeSessionID) {
+				t.Errorf("logged path %q leaked the session token", got)
+			}
+		})
+	}
+}
+
+func TestWithTemplatePathsUnder_unmatchedUnderPrefixWithholdsThePath(t *testing.T) {
+	// The case the two hand-rolled copies disagreed on, and the one that matters
+	// most: an unrouted request under a credential-bearing prefix STILL has the
+	// credential in it, so the raw path must never be recorded. It is marked
+	// unmatched rather than mislabelled onto a route it is not, so a new upstream
+	// subroute shows up as something to wire.
+	got := loggedPathFor(t, http.MethodGet, "/api/sessions/"+fakeSessionID+"/not-a-route",
+		webhttp.WithTemplatePathsUnder("/api/sessions/"))
+	if strings.Contains(got, fakeSessionID) {
+		t.Fatalf("logged path %q leaked the session token on an unmatched route", got)
+	}
+	if got != "/api/sessions/(unmatched)" {
+		t.Errorf("logged path = %q, want %q", got, "/api/sessions/(unmatched)")
+	}
+	// Distinct from the broken-policy placeholder: conflating a routine 404 with
+	// "the path policy itself failed" would hide the latter.
+	if got == "(path-redaction-failed)" {
+		t.Error("an unmatched route must not report as a failed path policy")
+	}
+}
+
+func TestWithTemplatePathsUnder_leavesPathsOutsideThePrefixAlone(t *testing.T) {
+	// Deliberately NOT the template. The static mount's pattern is "/", so
+	// recording templates everywhere would collapse every asset onto one line and
+	// lose which asset was requested. Credential-bearing routes are a
+	// per-route-family fact, which is why the option takes prefixes.
+	for _, target := range []string{"/assets/app.js", "/does-not-exist.png"} {
+		got := loggedPathFor(t, http.MethodGet, target,
+			webhttp.WithTemplatePathsUnder("/api/sessions/"))
+		if got != target {
+			t.Errorf("logged path for %q = %q, want it unchanged", target, got)
+		}
+	}
+}
+
+func TestWithTemplatePathsUnder_longestPrefixWins(t *testing.T) {
+	// Nested declarations must not depend on argument order, so a reader can add
+	// a prefix without auditing the ones already there.
+	//
+	// Asserted on an UNMATCHED path deliberately: when a route matches, the
+	// recorded value is r.Pattern and which prefix was selected cannot be
+	// observed. The selected prefix is only visible in the unmatched marker, so
+	// that is the only case where this rule has an effect to pin.
+	for _, order := range [][]string{
+		{"/api/", "/api/sessions/"},
+		{"/api/sessions/", "/api/"},
+	} {
+		got := loggedPathFor(t, http.MethodGet, "/api/sessions/"+fakeSessionID+"/not-a-route",
+			webhttp.WithTemplatePathsUnder(order...))
+		if got != "/api/sessions/(unmatched)" {
+			t.Errorf("with prefixes %v: logged path = %q, want the LONGEST prefix's marker", order, got)
+		}
+		// ...and a matched route is unaffected by the ordering either way.
+		if p := loggedPathFor(t, http.MethodDelete, "/api/sessions/"+fakeSessionID,
+			webhttp.WithTemplatePathsUnder(order...)); p != "/api/sessions/{id}" {
+			t.Errorf("with prefixes %v: logged path = %q, want the matched template", order, p)
+		}
+	}
+}
+
+func TestWithTemplatePathsUnder_ignoresEmptyPrefixes(t *testing.T) {
+	// An empty prefix would declare the whole surface credential-bearing. It is
+	// dropped rather than honoured, and — the observable half — an option left
+	// with nothing to declare installs NO path policy at all, so it cannot
+	// silently displace one that was already set. Without the filter this reads
+	// as "the last policy applied wins" and quietly discards the transform.
+	got := loggedPathFor(t, http.MethodDelete, "/api/sessions/"+fakeSessionID,
+		webhttp.WithPathFunc(func(*http.Request) string { return "/kept" }),
+		webhttp.WithTemplatePathsUnder("", ""))
+	if got != "/kept" {
+		t.Errorf("logged path = %q, want the earlier transform kept (an all-empty option is inert)", got)
+	}
+
+	// A real prefix alongside an empty one still works, and the empty one does
+	// not widen it.
+	got = loggedPathFor(t, http.MethodDelete, "/api/sessions/"+fakeSessionID,
+		webhttp.WithTemplatePathsUnder("", "/api/sessions/"))
+	if got != "/api/sessions/{id}" {
+		t.Errorf("logged path = %q, want the template alongside a dropped empty prefix", got)
+	}
+	if p := loggedPathFor(t, http.MethodGet, "/assets/app.js",
+		webhttp.WithTemplatePathsUnder("", "/api/sessions/")); p != "/assets/app.js" {
+		t.Errorf("logged path = %q, want the raw path (an empty prefix must not match everything)", p)
+	}
+}
+
+func TestWithTemplatePathsUnder_lastPathPolicyWins(t *testing.T) {
+	// There is one recorded path, so the two path policies cannot both apply.
+	// Pinned in both directions so the precedence is a contract rather than an
+	// accident of which field the options happen to write.
+	got := loggedPathFor(t, http.MethodDelete, "/api/sessions/"+fakeSessionID,
+		webhttp.WithPathFunc(func(*http.Request) string { return "/from-pathfunc" }),
+		webhttp.WithTemplatePathsUnder("/api/sessions/"))
+	if got != "/api/sessions/{id}" {
+		t.Errorf("logged path = %q, want the template (applied last)", got)
+	}
+
+	got = loggedPathFor(t, http.MethodDelete, "/api/sessions/"+fakeSessionID,
+		webhttp.WithTemplatePathsUnder("/api/sessions/"),
+		webhttp.WithPathFunc(func(*http.Request) string { return "/from-pathfunc" }))
+	if got != "/from-pathfunc" {
+		t.Errorf("logged path = %q, want the transform's value (applied last)", got)
+	}
+}
+
+func TestWithTemplatePathsUnder_nestedMuxOverwritesPatternInPlace(t *testing.T) {
+	// The stdlib property the whole option rests on, asserted directly rather
+	// than inferred from the logged output: the OUTER mux sets r.Pattern to its
+	// subtree prefix, then the INNER mux overwrites it with the concrete template
+	// on the SAME request pointer. That is what lets a middleware wrapped around
+	// both see the innermost match — and what makes an inner 404 clear it to "",
+	// which is the unmatched case above.
+	var seen string
+	inner := http.NewServeMux()
+	inner.HandleFunc("DELETE /api/sessions/{id}", func(_ http.ResponseWriter, r *http.Request) {
+		seen = r.Pattern
+	})
+	outer := http.NewServeMux()
+	outer.Handle("/api/sessions/", inner)
+
+	var afterRouting string
+	probe := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		outer.ServeHTTP(w, r)
+		// Same *http.Request the wrapper handed down: if ServeMux cloned instead
+		// of assigning in place, this would still read the outer prefix.
+		afterRouting = r.Pattern
+	})
+	serve(probe, http.MethodDelete, "/api/sessions/"+fakeSessionID, nil)
+
+	if seen != "DELETE /api/sessions/{id}" {
+		t.Errorf("inner handler saw pattern %q, want the concrete template", seen)
+	}
+	if afterRouting != "DELETE /api/sessions/{id}" {
+		t.Errorf("pattern after routing = %q, want the inner template (assigned in place)", afterRouting)
+	}
+}
