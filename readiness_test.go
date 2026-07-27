@@ -110,3 +110,26 @@ func TestReadinessHandler_readyBodyIsExact(t *testing.T) {
 		t.Errorf("raw 200 body = %q, want %q", got, want)
 	}
 }
+
+func TestReadinessHandler_isNeverCacheable(t *testing.T) {
+	// A 200 GET with no explicit freshness is heuristically cacheable under RFC
+	// 9111, and "should this instance receive traffic right now" is the one answer
+	// that is never valid a moment later. The ready case is the reachable failure
+	// (503 is not heuristically cacheable), and it is the dangerous direction: a
+	// cached "ok" keeps traffic arriving at an instance that has begun draining.
+	for _, tc := range []struct {
+		name  string
+		ready bool
+	}{{"ready", true}, {"unready", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &webhttp.Ready{}
+			r.Set(tc.ready)
+			rr := httptest.NewRecorder()
+			webhttp.ReadinessHandler(r).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+
+			if got := rr.Header().Get("Cache-Control"); got != "no-store" {
+				t.Errorf("Cache-Control = %q, want no-store: a cached readiness verdict defeats the gate", got)
+			}
+		})
+	}
+}
