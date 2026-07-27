@@ -164,6 +164,167 @@ func TestRun_serveErrorReturned(t *testing.T) {
 	}
 }
 
+// closedListener returns a listener Serve fails on immediately, the cheapest
+// stand-in for a fatal serve error (a dead accept loop).
+func closedListener(t *testing.T) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	if err := ln.Close(); err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+	return ln
+}
+
+// The default fatal path is unchanged: a serve error returns from Run with
+// NEITHER graceful hook invoked. This is the behavior WithServeExit is opt-in
+// against, so it is pinned rather than assumed.
+func TestRun_fatalServeErrorSkipsGracefulHooksByDefault(t *testing.T) {
+	var preDrainCalled, teardownCalled atomic.Bool
+	runErr := webhttp.Run(context.Background(), webhttp.NewServer(nil), closedListener(t),
+		func(context.Context) { teardownCalled.Store(true) },
+		webhttp.WithPreDrain(func(context.Context) { preDrainCalled.Store(true) }))
+
+	if runErr == nil {
+		t.Fatal("Run = nil, want a serve error from the closed listener")
+	}
+	if preDrainCalled.Load() {
+		t.Error("pre-drain hook ran on a fatal serve error; it is documented for the graceful path only")
+	}
+	if teardownCalled.Load() {
+		t.Error("onShutdown ran on a fatal serve error; it is documented for the graceful path only")
+	}
+}
+
+// WithServeExit is the opt-in teardown for that path: it runs, it runs before
+// Run returns, and it gets a context bounded by the configured grace.
+func TestRun_serveExitRunsOnFatalServeError(t *testing.T) {
+	const grace = 2 * time.Second
+	var (
+		called            atomic.Bool
+		preDrainCalled    atomic.Bool
+		teardownCalled    atomic.Bool
+		deadline          time.Time
+		hasDeadline       bool
+		ctxLiveInsideHook bool
+	)
+	appCtx := t.Context()
+	start := time.Now()
+	// Run calls the hook inline on its own goroutine — the test's, here — so
+	// these are plain same-goroutine writes.
+	serveExit := func(ctx context.Context) {
+		called.Store(true)
+		deadline, hasDeadline = ctx.Deadline()
+		ctxLiveInsideHook = appCtx.Err() == nil
+	}
+
+	runErr := webhttp.Run(appCtx, webhttp.NewServer(nil), closedListener(t),
+		func(context.Context) { teardownCalled.Store(true) },
+		webhttp.WithShutdownGrace(grace),
+		webhttp.WithPreDrain(func(context.Context) { preDrainCalled.Store(true) }),
+		webhttp.WithServeExit(serveExit))
+
+	if runErr == nil {
+		t.Fatal("Run = nil, want the serve error; the hook must not swallow it")
+	}
+	if !called.Load() {
+		t.Fatal("serve-exit hook did not run on a fatal serve error")
+	}
+	if !hasDeadline {
+		t.Fatal("serve-exit context has no deadline; it must be bounded by the shutdown grace")
+	}
+	if span := deadline.Sub(start); span <= 0 || span > grace+250*time.Millisecond {
+		t.Errorf("serve-exit deadline is %v out, want ~%v (the configured grace)", span, grace)
+	}
+	// The hook, not the graceful sequence: pre-drain and onShutdown stay
+	// unrun, and the caller's own context is still live (nothing cancelled it),
+	// which is why a teardown that waits on it must cancel it itself.
+	if preDrainCalled.Load() || teardownCalled.Load() {
+		t.Error("graceful hooks ran alongside the serve-exit hook; exactly one path must run")
+	}
+	if !ctxLiveInsideHook {
+		t.Error("the caller's context was cancelled on the fatal path; WithServeExit documents it as still live")
+	}
+}
+
+// Serve also returns on its own when the caller shuts the server down outside
+// Run. That is the other half of the exactly-one-path contract: the graceful
+// sequence never ran, so the serve-exit hook is what tears down.
+func TestRun_serveExitRunsWhenCallerClosesServer(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := webhttp.NewServer(okHandler())
+	var called, teardownCalled atomic.Bool
+
+	done := make(chan error, 1)
+	go func() {
+		// context.Background(): nothing ever cancels the run, so only the
+		// caller's own Shutdown can end it.
+		done <- webhttp.Run(context.Background(), srv, ln,
+			func(context.Context) { teardownCalled.Store(true) },
+			webhttp.WithServeExit(func(context.Context) { called.Store(true) }))
+	}()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://" + ln.Addr().String() + "/")
+	if err != nil {
+		t.Fatalf("get while serving: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	if err := srv.Shutdown(context.Background()); err != nil {
+		t.Fatalf("caller-driven Shutdown: %v", err)
+	}
+
+	select {
+	case runErr := <-done:
+		if runErr != nil {
+			t.Errorf("Run = %v, want nil (ErrServerClosed is a clean stop)", runErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after the caller shut the server down")
+	}
+	if !called.Load() {
+		t.Error("serve-exit hook did not run when Serve returned on its own")
+	}
+	if teardownCalled.Load() {
+		t.Error("onShutdown ran without a graceful stop; only the serve-exit hook covers this path")
+	}
+}
+
+// On the graceful path the serve-exit hook must stay unrun: the drain sequence
+// already carries the teardown, and running both would tear down twice.
+func TestRun_serveExitNotRunOnGracefulPath(t *testing.T) {
+	var serveExitCalled atomic.Bool
+	var preDrainCalled atomic.Bool
+	err := runAndShutdown(t,
+		webhttp.WithPreDrain(func(context.Context) { preDrainCalled.Store(true) }),
+		webhttp.WithServeExit(func(context.Context) { serveExitCalled.Store(true) }))
+	if err != nil {
+		t.Errorf("Run = %v, want nil on graceful shutdown", err)
+	}
+	if !preDrainCalled.Load() {
+		t.Error("pre-drain hook did not run on the graceful path")
+	}
+	if serveExitCalled.Load() {
+		t.Error("serve-exit hook ran on the graceful path; onShutdown already covers it")
+	}
+}
+
+func TestRun_nilServeExitIgnored(t *testing.T) {
+	// The fatal path with WithServeExit(nil): the nil hook is skipped, not
+	// called, and the serve error still comes back.
+	runErr := webhttp.Run(context.Background(), webhttp.NewServer(nil), closedListener(t), nil,
+		webhttp.WithServeExit(nil))
+	if runErr == nil {
+		t.Error("Run = nil, want the serve error")
+	}
+}
+
 func TestRun_onShutdownNilIsSafe(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
