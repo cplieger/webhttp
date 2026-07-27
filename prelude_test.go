@@ -49,6 +49,147 @@ func TestRequireMethod_mismatch(t *testing.T) {
 	}
 }
 
+// RequireMethod is built on MethodNotAllowed, which renders a LIST. This pins
+// the single-method response byte for byte — header value, status, and raw body
+// — so the multi-method rendering can never change what today's single-method
+// callers (subflux's RequirePOST/RequireGET, vibekit's requirePOST) emit.
+func TestRequireMethod_singleMethodResponseIsByteIdentical(t *testing.T) {
+	const wantBody = `{"error":"method not allowed","code":"method_not_allowed"}` + "\n"
+	cases := []struct {
+		name     string
+		required string
+	}{
+		{"post", http.MethodPost},
+		{"get", http.MethodGet},
+		{"delete", http.MethodDelete},
+		// A method token is case-sensitive (RFC 9110 9.1): the header echoes
+		// exactly what the caller passed, never a canonicalized spelling.
+		{"lowercase verbatim", "post"},
+		// Garbage in: an empty required method still emits the header, with the
+		// empty value the spec defines as "no methods allowed".
+		{"empty", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodOptions, "/", nil)
+			if webhttp.RequireMethod(rr, req, tc.required) {
+				t.Fatalf("RequireMethod = true, want false (OPTIONS vs %q)", tc.required)
+			}
+			allow, ok := rr.Header()["Allow"]
+			if !ok {
+				t.Fatal("no Allow header on the 405 (RFC 9110 makes it mandatory)")
+			}
+			if len(allow) != 1 || allow[0] != tc.required {
+				t.Errorf("Allow = %q, want exactly [%q]", allow, tc.required)
+			}
+			if rr.Code != http.StatusMethodNotAllowed {
+				t.Errorf("code = %d, want 405", rr.Code)
+			}
+			if got := rr.Body.String(); got != wantBody {
+				t.Errorf("body = %q, want %q", got, wantBody)
+			}
+			if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+				t.Errorf("Content-Type = %q, want application/json", ct)
+			}
+			if nosniff := rr.Header().Get("X-Content-Type-Options"); nosniff != "nosniff" {
+				t.Errorf("X-Content-Type-Options = %q, want nosniff", nosniff)
+			}
+		})
+	}
+}
+
+// MethodNotAllowed is the rejection half a multi-method route needs: the 405
+// names every permitted method, which a single-method guard cannot express.
+func TestMethodNotAllowed_multiMethodAllow(t *testing.T) {
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodHead, "/beat/x", nil)
+	webhttp.MethodNotAllowed(rr, req, http.MethodGet, http.MethodPost)
+
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("code = %d, want 405", rr.Code)
+	}
+	if allow := rr.Header().Get("Allow"); allow != "GET, POST" {
+		t.Errorf("Allow = %q, want %q", allow, "GET, POST")
+	}
+	var got webhttp.ErrorResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Code != "method_not_allowed" || got.Error != "method not allowed" {
+		t.Errorf("body = %+v, want the standard method_not_allowed envelope", got)
+	}
+}
+
+// An Allow header is mandatory on a 405 even when nothing is permitted: RFC
+// 9110 10.2.1 defines the empty field value as "the resource allows no
+// methods". Omitting the header entirely would violate the MUST.
+func TestMethodNotAllowed_noMethodsStillSetsEmptyAllow(t *testing.T) {
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/disabled", nil)
+	webhttp.MethodNotAllowed(rr, req)
+
+	values, ok := rr.Header()["Allow"]
+	if !ok {
+		t.Fatal("Allow header absent; RFC 9110 requires it on every 405")
+	}
+	if len(values) != 1 || values[0] != "" {
+		t.Errorf("Allow = %q, want exactly one empty value", values)
+	}
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("code = %d, want 405", rr.Code)
+	}
+}
+
+func TestSetAllow(t *testing.T) {
+	cases := []struct {
+		name    string
+		allowed []string
+		want    string
+	}{
+		{"single", []string{http.MethodPost}, "POST"},
+		{"pair joined with comma space", []string{http.MethodGet, http.MethodPost}, "GET, POST"},
+		{"caller order preserved", []string{http.MethodPost, http.MethodGet}, "POST, GET"},
+		{"three", []string{http.MethodGet, http.MethodPut, http.MethodDelete}, "GET, PUT, DELETE"},
+		// A sender must not generate an empty list element (RFC 9110 5.6.1.1),
+		// so a blank from a config-built set is dropped rather than rendered.
+		{"empty entries dropped", []string{http.MethodGet, "", http.MethodPost}, "GET, POST"},
+		{"only empty entries", []string{"", ""}, ""},
+		// The field names a set, so a doubled entry collapses.
+		{"exact duplicates collapsed", []string{http.MethodGet, http.MethodGet, http.MethodPost}, "GET, POST"},
+		// Case-sensitive (RFC 9110 9.1): distinct spellings are distinct tokens.
+		{"case is not folded", []string{"GET", "get"}, "GET, get"},
+		{"none", nil, ""},
+		// HEAD is never implied by GET; the route advertises what it serves.
+		{"head not implied", []string{http.MethodGet}, "GET"},
+		{"head when explicit", []string{http.MethodGet, http.MethodHead}, "GET, HEAD"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			webhttp.SetAllow(rr, tc.allowed...)
+			values, ok := rr.Header()["Allow"]
+			if !ok {
+				t.Fatal("SetAllow did not set the Allow header")
+			}
+			if len(values) != 1 || values[0] != tc.want {
+				t.Errorf("Allow = %q, want exactly [%q]", values, tc.want)
+			}
+		})
+	}
+}
+
+// SetAllow replaces, never appends: a route that re-advertises its set (a
+// middleware and the handler both naming it) must not emit two Allow fields.
+func TestSetAllow_replacesAnyExistingValue(t *testing.T) {
+	rr := httptest.NewRecorder()
+	rr.Header().Set("Allow", "PATCH")
+	webhttp.SetAllow(rr, http.MethodGet, http.MethodPost)
+	if values := rr.Header()["Allow"]; len(values) != 1 || values[0] != "GET, POST" {
+		t.Errorf("Allow = %q, want exactly [%q]", values, "GET, POST")
+	}
+}
+
 func TestDecodeBody_rejectsTrailingData(t *testing.T) {
 	cases := []struct {
 		name string

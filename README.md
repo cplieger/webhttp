@@ -180,9 +180,13 @@ The gate breaks DNS rebinding (CWE-346): an attacker's page re-resolves its own 
 - `MaxJSONBody`: 1 MiB default body cap.
 - `LimitBody(w, r, maxBytes)`: wraps the body in `http.MaxBytesReader`.
 - `RequireMethod(w, r, method) bool`: 405 + `false` on mismatch.
+- `MethodNotAllowed(w, r, allowed...)`: the 405 refusal on its own, for a route that permits SEVERAL methods and so has no single method to require — the `Allow` header names the whole set (`GET, POST`), the body is the standard `method_not_allowed` envelope. Route each method with the mux (or dispatch on `r.Method`) and refuse the rest with it.
+- `SetAllow(w, allowed...)`: just the RFC 9110 `Allow` header, for an `OPTIONS` responder or any other advertisement outside a 405.
 - `DecodeBody(w, r, v, errMsg) bool`: cap + decode (reject trailing data); 400 + `false` on failure.
 - `DecodeBodyOptional(w, r, v)`: cap + decode, error ignored.
 - `DecodeJSONInto(w, r, v, maxBytes) error`: the mechanism behind `DecodeBody`, for apps with their own error envelope or a per-endpoint cap; caps, decodes a single value, rejects trailing data, writes nothing, and returns the error: a `*http.MaxBytesError` (test with `errors.As`) for an oversize body, `ErrTrailingData` for a second JSON value, otherwise a malformed body. Map the result to your own status and envelope.
+
+`Allow` is mandatory on a 405 and is a comma-separated list, so the value is the caller's set joined with `", "`: entries verbatim (a method token is case-sensitive), blanks dropped (a sender must not emit an empty list element), exact duplicates collapsed, and no methods at all rendered as the empty value the spec defines as "this resource allows no methods". `HEAD` is never implied by `GET`: `net/http`'s `ServeMux` serves `HEAD` from a `GET` pattern, so a route whose `GET` has a side effect registers `HEAD` separately to reject it and must not advertise it — pass `http.MethodHead` when the route really serves it.
 
 ### Static secret verification
 

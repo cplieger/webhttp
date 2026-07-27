@@ -23,8 +23,8 @@ set of small, independent pieces:
   `BindClass`,
 - static assets and CSP: `StaticHandler`, `InlineScriptHashes`,
 - JSON helpers: `WriteJSON`, `WriteJSONStatus`, `Ok`, `WriteError`,
-- request-prelude helpers: `LimitBody`, `RequireMethod`, `DecodeBody`,
-  `DecodeJSONInto`,
+- request-prelude helpers: `LimitBody`, `RequireMethod`, `MethodNotAllowed`,
+  `SetAllow`, `DecodeBody`, `DecodeJSONInto`,
 - the constant-time `StaticTokenVerifier`,
 - a readiness gate: `Ready`, `ReadinessHandler`,
 - a graceful server bootstrap: `NewServer`, `Run`,
@@ -60,6 +60,17 @@ A few properties are load-bearing. Keep them when you change the code.
   precedence over a shutdown error in the return value.
 - **`WriteError` is nil-safe.** It must not panic when `r` is nil; the
   `RequestID` field simply stays empty.
+- **Every 405 carries an `Allow` header, and a one-method 405 stays
+  byte-identical.** RFC 9110 makes the header mandatory on a 405 and defines it
+  as a comma-separated list, so `RequireMethod` is built on `MethodNotAllowed`,
+  which renders the set through `SetAllow`: entries verbatim (a method token is
+  case-sensitive), blanks dropped (a sender must not generate an empty list
+  element), exact duplicates collapsed, and the empty VALUE kept — never an
+  omitted header — when no method is allowed. The single-method path returns the
+  entry unchanged, which is what keeps existing `RequireMethod` callers on the
+  exact same header, status, and body. `HEAD` is never implied by `GET`: a route
+  that registers `HEAD` only to stop `ServeMux` serving it from the `GET`
+  pattern must not advertise it.
 - **`Chain` order and `Recoverer` placement.** `Chain` applies middleware so the
   first listed is the outermost wrapper (`Chain(h, A, B, C)` is `A(B(C(h)))`).
   `Recoverer` must re-panic `http.ErrAbortHandler` untouched (the net/http

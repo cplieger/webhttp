@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/cplieger/webhttp"
@@ -119,6 +121,144 @@ func FuzzDecodeBody(f *testing.F) {
 			t.Fatalf("DecodeBody failure envelope = %+v, want code=bad_request error=%q (body=%q)", er, wantMsg, body)
 		}
 	})
+}
+
+// FuzzSetAllow drives the REAL SetAllow over arbitrary method sets (the input
+// string is split on NUL into entries, so the corpus covers 1..n entries
+// including empty ones) and asserts, for every input:
+//
+//  1. It never panics, and always sets exactly one Allow field — never two,
+//     and never none, since RFC 9110 makes the header mandatory on the 405
+//     MethodNotAllowed builds on it.
+//  2. A single entry renders VERBATIM. This is the compatibility invariant for
+//     every existing RequireMethod caller: whatever byte sequence a
+//     single-method call passed before the list rendering existed, it still
+//     emits.
+//  3. Every non-empty entry survives into the field value.
+//  4. For entries that are real method tokens (the documented contract, RFC
+//     9110 9.1), a RECIPIENT's parse of the field — split on "," and strip OWS,
+//     per 5.6.1.2 — recovers exactly the deduplicated entry list in order, with
+//     no empty list element (5.6.1.1 forbids generating one). Parsing is a
+//     different operation from rendering, so this is an oracle cross-check
+//     rather than a restatement of the encoder.
+//  5. Rendering is idempotent: feeding a parsed field value back through
+//     SetAllow reproduces it byte for byte.
+func FuzzSetAllow(f *testing.F) {
+	seeds := []string{
+		"",
+		"GET",
+		"POST",
+		"get",
+		"GET\x00POST",
+		"POST\x00GET",
+		"GET\x00HEAD\x00POST",
+		"GET\x00GET",       // exact duplicate
+		"GET\x00",          // trailing empty entry
+		"\x00GET",          // leading empty entry
+		"\x00\x00",         // only empty entries
+		"GET, POST",        // one entry that already looks like a list
+		"GET\x00 ",         // whitespace-only entry
+		"\x00",             // two empty entries
+		"OPTIONS\x00TRACE", // uncommon but valid tokens
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, joined string) {
+		entries := strings.Split(joined, "\x00")
+
+		rr := httptest.NewRecorder()
+		webhttp.SetAllow(rr, entries...)
+		values, ok := rr.Header()["Allow"]
+		if !ok {
+			t.Fatalf("SetAllow set no Allow header (entries=%q)", entries)
+		}
+		if len(values) != 1 {
+			t.Fatalf("SetAllow set %d Allow fields, want exactly 1 (entries=%q)", len(values), entries)
+		}
+		got := values[0]
+
+		if len(entries) == 1 && got != entries[0] {
+			t.Fatalf("single-entry Allow = %q, want the entry verbatim %q", got, entries[0])
+		}
+		for _, e := range entries {
+			if e != "" && !strings.Contains(got, e) {
+				t.Fatalf("Allow = %q dropped non-empty entry %q (entries=%q)", got, e, entries)
+			}
+		}
+
+		// The recipient-parse oracle only applies to inputs that are method
+		// tokens; a non-token entry (one containing a comma or space) is
+		// garbage in, emitted verbatim, and cannot survive a list parse.
+		if !allTokensOrEmpty(entries) {
+			return
+		}
+		want := dedupeNonEmpty(entries)
+		parsed := parseAllow(got)
+		if !slices.Equal(parsed, want) {
+			t.Fatalf("parse(Allow %q) = %q, want %q (entries=%q)", got, parsed, want, entries)
+		}
+		for _, p := range parsed {
+			if p == "" {
+				t.Fatalf("Allow = %q contains an empty list element (entries=%q)", got, entries)
+			}
+		}
+
+		// Re-rendering a parsed value must reproduce it exactly.
+		again := httptest.NewRecorder()
+		webhttp.SetAllow(again, parsed...)
+		if reRendered := again.Header().Get("Allow"); reRendered != got {
+			t.Fatalf("SetAllow(parse(%q)) = %q, want the same value", got, reRendered)
+		}
+	})
+}
+
+// parseAllow reads an Allow field value the way a recipient must (RFC 9110
+// 5.6.1.2): comma-separated elements with optional surrounding whitespace. An
+// entirely empty value means "no methods allowed" and yields no elements.
+func parseAllow(value string) []string {
+	if value == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		out = append(out, strings.Trim(p, " \t"))
+	}
+	return out
+}
+
+// dedupeNonEmpty is the expected element set of a rendered Allow field: the
+// non-empty entries in caller order, exact duplicates collapsed.
+func dedupeNonEmpty(entries []string) []string {
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e != "" && !slices.Contains(out, e) {
+			out = append(out, e)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// allTokensOrEmpty reports whether every entry is either empty or a valid HTTP
+// method token (RFC 9110 5.6.2 tchar), the documented input contract under
+// which the field value is parseable as a list.
+func allTokensOrEmpty(entries []string) bool {
+	const tchar = "!#$%&'*+-.^_`|~"
+	for _, e := range entries {
+		for _, c := range e {
+			switch {
+			case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+			case strings.ContainsRune(tchar, c):
+			default:
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // FuzzDecodeBodyOptional drives the REAL DecodeBodyOptional over arbitrary
