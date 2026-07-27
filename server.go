@@ -86,6 +86,7 @@ func NewServer(handler http.Handler, opts ...ServerOption) *http.Server {
 // runConfig holds resolved Run configuration.
 type runConfig struct {
 	preDrain      func(ctx context.Context)
+	serveExit     func(ctx context.Context)
 	shutdownGrace time.Duration
 }
 
@@ -112,6 +113,34 @@ func WithPreDrain(fn func(ctx context.Context)) RunOption {
 	return func(c *runConfig) { c.preDrain = fn }
 }
 
+// WithServeExit registers an opt-in teardown hook Run invokes when srv.Serve
+// returns on its own — before ctx is ever cancelled — in place of the graceful
+// sequence. That covers a fatal serve error (the listener or the accept loop is
+// gone) and a Shutdown or Close the caller drove itself outside Run. Exactly
+// one of the two paths runs per Run call: with the hook registered, either
+// pre-drain -> Shutdown -> onShutdown ran, or fn did. Without it, Run keeps
+// today's behavior of returning the serve error with NEITHER hook invoked, so
+// an existing caller sees no change. A nil fn is ignored.
+//
+// fn receives a context bounded by the shutdown grace period, and gets the
+// whole budget: there was no drain to share it with. Run does NOT call
+// srv.Shutdown on this path — Serve has already returned and closed the
+// listener, so a drain would only spend fn's budget waiting on connections
+// whose accept loop is already dead.
+//
+// WithPreDrain and onShutdown are NOT reused here, because both are documented
+// against a graceful stop that this path is not: ctx is still LIVE (nothing
+// cancelled it), and there is no drain for a pre-drain phase to precede. That
+// matters for what fn must do — a teardown that waits on a goroutine keyed to
+// ctx (a background loop stopped by the same signal context) has to cancel it
+// inside fn, by calling the signal context's stop function, or it waits out the
+// whole grace for a goroutine nothing has asked to stop. A caller whose
+// teardown is cancellation-independent can pass the same function to both
+// slots: Run(ctx, srv, ln, teardown, WithServeExit(teardown)).
+func WithServeExit(fn func(ctx context.Context)) RunOption {
+	return func(c *runConfig) { c.serveExit = fn }
+}
+
 // Run serves srv on ln until ctx is cancelled, then shuts down gracefully.
 //
 // It starts srv.Serve(ln) in a goroutine (treating http.ErrServerClosed as a
@@ -125,6 +154,12 @@ func WithPreDrain(fn func(ctx context.Context)) RunOption {
 // after the earlier ones, not a fresh full window. Run returns the first
 // non-ErrServerClosed error it observes (a serve error, else a shutdown error),
 // or nil on a clean graceful stop.
+//
+// When Serve instead returns on its own, before ctx is cancelled, none of that
+// sequence runs: there is no drain to bound and nothing has asked the
+// application to stop. Run returns the serve error straight away, having
+// invoked only the opt-in WithServeExit hook when one is registered — that hook
+// is the sole way to get a bounded teardown on this path.
 //
 // The caller binds ln up front (for example with net.ListenConfig.Listen) so a
 // port-in-use error surfaces synchronously before Run is called, and passes
@@ -149,7 +184,16 @@ func Run(ctx context.Context, srv *http.Server, ln net.Listener, onShutdown func
 	select {
 	case err := <-serveErr:
 		// Serve returned before shutdown was requested (a fatal serve error;
-		// ErrServerClosed was already normalized to nil).
+		// ErrServerClosed was already normalized to nil). The graceful sequence
+		// does not run here: ctx is still live and the listener is already
+		// gone, so neither the pre-drain phase nor a drain has any meaning.
+		// Only the opt-in serve-exit hook gets a turn, on its own full grace
+		// budget (see WithServeExit).
+		if c.serveExit != nil {
+			exitCtx, exitCancel := context.WithTimeout(context.Background(), c.shutdownGrace)
+			c.serveExit(exitCtx)
+			exitCancel()
+		}
 		return err
 	case <-ctx.Done():
 	}

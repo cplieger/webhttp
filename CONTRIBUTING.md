@@ -58,6 +58,15 @@ A few properties are load-bearing. Keep them when you change the code.
   `onShutdown`; each later phase gets whatever budget remains, not a fresh
   window. `http.ErrServerClosed` is a clean stop, and a real serve error takes
   precedence over a shutdown error in the return value.
+- **`Run` has exactly two exits, and they never overlap.** When `Serve` returns
+  on its own — before `ctx` is cancelled — the graceful sequence must NOT run:
+  `WithPreDrain` and `onShutdown` are both documented against a graceful stop
+  (`ctx` is still live on this path and there is no drain to precede), and
+  `srv.Shutdown` must not be called after `Serve` has already returned and
+  closed the listener. Only the opt-in `WithServeExit` hook runs there, on its
+  own full grace budget. Keep the exclusivity in both directions: a caller with
+  the hook registered gets exactly one of the two paths, and a caller without it
+  gets no hook at all on the serve-exit path.
 - **`WriteError` is nil-safe.** It must not panic when `r` is nil; the
   `RequestID` field simply stays empty.
 - **Every 405 carries an `Allow` header, and a one-method 405 stays
