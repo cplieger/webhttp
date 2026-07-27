@@ -43,7 +43,8 @@ type readinessResponse struct {
 
 // ReadinessHandler returns a handler that reports serving state as JSON: 200
 // with {"status":"ok"} when c reports ready, otherwise 503 with
-// {"status":"unready","reason":"starting up or shutting down"}.
+// {"status":"unready","reason":"starting up or shutting down"}. Both responses
+// carry Cache-Control: no-store.
 //
 // This is the HTTP SERVING-STATE gate (note the lowercase "ok"), meant for a
 // load balancer asking "should this instance receive traffic right now?". It is
@@ -51,8 +52,20 @@ type readinessResponse struct {
 // file-marker probe, which answers {"status":"OK","timestamp":…} for a Docker
 // HEALTHCHECK asking "is the process alive?". The two are complementary and are
 // not the same endpoint.
+//
+// no-store is not decoration. Under RFC 9111 a 200 GET carrying no explicit
+// freshness information is HEURISTICALLY CACHEABLE, and the answer to "should
+// this instance receive traffic right now" is the one answer in a service that
+// is never valid a moment later. The unready direction is safe by accident (503
+// is not among the heuristically-cacheable statuses), so the reachable failure
+// is the dangerous one: a cached "ok" outliving the readiness it reported, which
+// keeps traffic arriving at an instance that has begun draining — defeating the
+// gate at exactly the moment it exists for. Consumers that front this endpoint
+// with a caching reverse proxy (the documented deployment shape for more than
+// one of them) were relying on that proxy not to cache.
 func ReadinessHandler(c ReadinessChecker) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
 		if c.Ready() {
 			WriteJSONStatus(w, http.StatusOK, readinessResponse{Status: "ok"})
 			return
