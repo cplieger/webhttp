@@ -31,7 +31,7 @@
 //   - JSON response and error helpers (WriteJSON, WriteJSONStatus, Ok,
 //     WriteError),
 //   - request-prelude helpers for body limiting, method gating, and JSON
-//     decoding (LimitBody, RequireMethod, DecodeBody),
+//     decoding (LimitBody, RequireMethod, MethodNotAllowed, DecodeBody),
 //   - a constant-time verifier for a single operator-configured static
 //     credential — an API key, bearer token, or basic-auth field — hashing
 //     the secret once at construction and comparing SHA-256 digests so no

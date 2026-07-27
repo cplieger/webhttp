@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"slices"
+	"strings"
 )
 
 // ErrTrailingData is returned by DecodeJSONInto when the body holds more than a
@@ -26,17 +28,85 @@ func LimitBody(w http.ResponseWriter, r *http.Request, maxBytes int64) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 }
 
+// SetAllow sets the RFC 9110 Allow header to the set of methods a route
+// advertises as supported: the entries joined with ", " (RFC 9110 Section
+// 10.2.1, "Allow = #method"). A 405 response MUST carry the header, which is
+// why MethodNotAllowed and RequireMethod both render it here; the spec permits
+// it on any other response too, so an OPTIONS handler can advertise its route
+// with the same call.
+//
+// Entries are method tokens (http.MethodGet and friends) emitted verbatim,
+// because a method token is case-sensitive (Section 9.1): the header must name
+// what the route actually compares a request method against, not a
+// canonicalized spelling of it. An empty entry is dropped, so a set assembled
+// from configuration cannot emit the empty list element a sender must not
+// generate (Section 5.6.1.1), and an exact duplicate is collapsed because the
+// field names a set. Passing no methods sets the header to the empty value,
+// which is the spec's own encoding for "this resource allows no methods" — a
+// route disabled by configuration — and keeps the 405's MUST satisfied.
+//
+// HEAD is deliberately NOT implied by GET. The field reports what THIS route
+// advertises, and a route may refuse HEAD on purpose: net/http's ServeMux
+// serves a HEAD request from a GET pattern, so a route whose GET carries a
+// side effect (recording a heartbeat, say) registers HEAD separately to reject
+// it and must not then advertise it. Pass http.MethodHead explicitly when the
+// route serves it.
+func SetAllow(w http.ResponseWriter, allowed ...string) {
+	w.Header().Set("Allow", allowValue(allowed))
+}
+
+// allowValue renders the Allow field value for an advertised method set. The
+// single-method case returns the entry unchanged (the RequireMethod path, and
+// the reason a one-method Allow value is byte-identical to a hand-set header).
+func allowValue(allowed []string) string {
+	if len(allowed) == 1 {
+		return allowed[0]
+	}
+	uniq := make([]string, 0, len(allowed))
+	for _, m := range allowed {
+		if m == "" || slices.Contains(uniq, m) {
+			continue
+		}
+		uniq = append(uniq, m)
+	}
+	return strings.Join(uniq, ", ")
+}
+
+// MethodNotAllowed writes the 405 refusal for a request whose method the route
+// does not support: it sets the Allow header to the allowed set (see SetAllow)
+// and writes the standard error response (code "method_not_allowed"). It is
+// the rejection half of RequireMethod, exported because a route may permit
+// SEVERAL methods and so cannot express its refusal as a single-method guard:
+//
+//	// POST /things and GET /things are registered; HEAD is not served.
+//	mux.HandleFunc("HEAD /things", func(w http.ResponseWriter, r *http.Request) {
+//		webhttp.MethodNotAllowed(w, r, http.MethodGet, http.MethodPost)
+//	})
+//
+// A handler that dispatches on the method itself (a switch over r.Method)
+// calls it from the default branch with the same list. Either way the 405
+// carries the full Allow list RFC 9110 requires, instead of the one method a
+// guard could name.
+func MethodNotAllowed(w http.ResponseWriter, r *http.Request, allowed ...string) {
+	SetAllow(w, allowed...)
+	WriteError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+}
+
 // RequireMethod reports whether the request method equals method. On a mismatch
-// it sets the RFC 9110 Allow header to method, writes a 405 error response
-// (code "method_not_allowed"), and returns false, so a handler can guard with:
+// it writes the standard 405 via MethodNotAllowed, naming method as the only
+// allowed one, and returns false, so a handler can guard with:
 //
 //	if !webhttp.RequireMethod(w, r, http.MethodPost) {
 //		return
 //	}
+//
+// A route that permits more than one method has no single method to require:
+// route each method with the mux (net/http's method-prefixed patterns) or
+// dispatch on r.Method, and refuse the rest with MethodNotAllowed so the 405
+// advertises the whole set.
 func RequireMethod(w http.ResponseWriter, r *http.Request, method string) bool {
 	if r.Method != method {
-		w.Header().Set("Allow", method)
-		WriteError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		MethodNotAllowed(w, r, method)
 		return false
 	}
 	return true

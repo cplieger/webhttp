@@ -33,6 +33,20 @@ func ExampleWriteError() {
 	// {"error":"invalid payload","code":"bad_request"}
 }
 
+func ExampleMethodNotAllowed() {
+	rr := httptest.NewRecorder()
+	// A route serving GET and POST refuses everything else, and RFC 9110
+	// requires the 405 to advertise BOTH permitted methods, not just one.
+	webhttp.MethodNotAllowed(rr, nil, http.MethodGet, http.MethodPost)
+	fmt.Println(rr.Code)
+	fmt.Println(rr.Header().Get("Allow"))
+	fmt.Print(rr.Body.String())
+	// Output:
+	// 405
+	// GET, POST
+	// {"error":"method not allowed","code":"method_not_allowed"}
+}
+
 func ExampleNewStaticTokenVerifier() {
 	v := webhttp.NewStaticTokenVerifier("s3cr3t")
 	fmt.Println(v.Verify("s3cr3t"))
