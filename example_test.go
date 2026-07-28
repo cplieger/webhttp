@@ -47,6 +47,27 @@ func ExampleMethodNotAllowed() {
 	// {"error":"method not allowed","code":"method_not_allowed"}
 }
 
+func ExampleRouteMetricLabels() {
+	// The labels for a request that matched "GET /beat/{id}". A HEAD probe
+	// records HEAD, not the pattern's GET, so the metric and the access line
+	// agree on the method.
+	head := &http.Request{Method: http.MethodHead, Pattern: "GET /beat/{id}"}
+	fmt.Println(webhttp.RouteMetricLabels(head))
+
+	// A non-standard method collapses onto one bucket, so a caller cannot mint a
+	// series per invented token. The access line still records the token itself.
+	probe := &http.Request{Method: "PROPFIND", Pattern: "/"}
+	fmt.Println(webhttp.RouteMetricLabels(probe))
+
+	// Nothing matched: every unrouted request shares one path label.
+	missed := &http.Request{Method: http.MethodGet}
+	fmt.Println(webhttp.RouteMetricLabels(missed))
+	// Output:
+	// HEAD /beat/{id}
+	// other /
+	// GET unmatched
+}
+
 func ExampleNewStaticTokenVerifier() {
 	v := webhttp.NewStaticTokenVerifier("s3cr3t")
 	fmt.Println(v.Verify("s3cr3t"))

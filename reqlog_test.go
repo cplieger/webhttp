@@ -1,13 +1,16 @@
 package webhttp_test
 
 import (
+	"context"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/cplieger/webhttp"
 )
@@ -1426,5 +1429,742 @@ func TestWithTemplatePathsUnder_nestedMuxOverwritesPatternInPlace(t *testing.T) 
 	}
 	if afterRouting != "DELETE /api/sessions/{id}" {
 		t.Errorf("pattern after routing = %q, want the inner template (assigned in place)", afterRouting)
+	}
+}
+
+// The recorded-path cap and its marker as the package DOCUMENTS them, spelled
+// out here rather than read from the package: they are the public contract, so a
+// test that imported them could not notice either one changing.
+const (
+	defaultLoggedPathCap = 512
+	truncatedMarker      = "...(truncated)"
+	overlongMethod       = "(overlong)"
+)
+
+// requestWithPath builds a request carrying path verbatim as r.URL.Path,
+// bypassing the target parsing httptest.NewRequest does. A real client sends
+// %-escapes that decode to bytes url.Parse refuses in a target string, and the
+// recorded path is read from URL.Path either way, so this is the honest shape
+// for path-boundary cases (empty, invalid UTF-8, very long).
+func requestWithPath(method, path string) *http.Request {
+	req := httptest.NewRequestWithContext(context.Background(), method, "http://x", nil)
+	req.URL.Path = path
+	return req
+}
+
+// loggedAttrs serves req through RequestLogger wrapped around next and returns
+// the attributes of the single access line it emitted.
+func loggedAttrs(t *testing.T, next http.Handler, req *http.Request, opts ...webhttp.LogOption) map[string]any {
+	t.Helper()
+	logCap := &captureHandler{}
+	opts = append([]webhttp.LogOption{webhttp.WithLogger(slog.New(logCap))}, opts...)
+	webhttp.RequestLogger(next, opts...).ServeHTTP(httptest.NewRecorder(), req)
+	recs := logCap.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("got %d log records, want exactly 1", len(recs))
+	}
+	return attrsOf(recs[0])
+}
+
+// loggedPathOf returns the recorded path for a request whose URL.Path is set
+// verbatim to path.
+func loggedPathOf(t *testing.T, path string, opts ...webhttp.LogOption) string {
+	t.Helper()
+	got, _ := loggedAttrs(t, okHandler(), requestWithPath(http.MethodGet, path), opts...)["path"].(string)
+	return got
+}
+
+// asciiPath returns a request path of exactly n bytes.
+func asciiPath(n int) string {
+	return "/" + strings.Repeat("a", n-1)
+}
+
+func TestRequestLogger_boundsTheLoggedPathByDefault(t *testing.T) {
+	// The cap is a floor, not an opt-in: no option is passed here, which is the
+	// whole point — the eight consumers that never bounded their path get it on a
+	// version bump without touching their code.
+	cases := []struct {
+		name, path, want string
+	}{
+		{"short path unchanged", "/api/thing", "/api/thing"},
+		{"exactly at the cap unchanged", asciiPath(defaultLoggedPathCap), asciiPath(defaultLoggedPathCap)},
+		{"one byte over is cut", asciiPath(defaultLoggedPathCap + 1), asciiPath(defaultLoggedPathCap) + truncatedMarker},
+		{"a megabyte URL costs half a kilobyte", asciiPath(1 << 20), asciiPath(defaultLoggedPathCap) + truncatedMarker},
+		// r.URL.Path can be empty (a client sending "OPTIONS *", a synthetic
+		// request). Unchanged: only a path POLICY's empty return means "the
+		// policy failed", and coercing this one would report a failure that did
+		// not happen.
+		{"empty stays empty", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := loggedPathOf(t, tc.path)
+			if got != tc.want {
+				t.Errorf("logged path (len %d) = %.80q… (len %d), want %.80q… (len %d)",
+					len(tc.path), got, len(got), tc.want, len(tc.want))
+			}
+			if len(got) > defaultLoggedPathCap+len(truncatedMarker) {
+				t.Errorf("logged path is %d bytes, want at most %d",
+					len(got), defaultLoggedPathCap+len(truncatedMarker))
+			}
+		})
+	}
+}
+
+func TestRequestLogger_cutLoggedPathCarriesTheMarker(t *testing.T) {
+	// A silently shortened path reads as a real request for a route that does not
+	// exist, which sends an operator hunting for a missing handler instead of a
+	// client sending a megabyte URL. The marker is the difference.
+	got := loggedPathOf(t, asciiPath(4096))
+	if !strings.HasSuffix(got, truncatedMarker) {
+		t.Errorf("logged path = %.80q…, want it to end in %q", got, truncatedMarker)
+	}
+	if in := loggedPathOf(t, "/api/thing"); strings.Contains(in, truncatedMarker) {
+		t.Errorf("within-cap path logged as %q, want no truncation marker", in)
+	}
+}
+
+func TestRequestLogger_cutsTheLoggedPathOnARuneBoundary(t *testing.T) {
+	// Each case places a multi-byte rune so the cap falls INSIDE it. The whole
+	// rune must go: half a rune is rewritten as U+FFFD by every encoder between
+	// here and the log store, so the tail of the value is corrupt for the reader
+	// and two distinct paths can render identically.
+	cases := []struct {
+		name string
+		r    rune
+		// lead is the byte count before the rune, chosen so the rune spans byte
+		// index defaultLoggedPathCap.
+		lead int
+	}{
+		{"two-byte rune", 'é', defaultLoggedPathCap - 1},
+		{"three-byte rune", '€', defaultLoggedPathCap - 2},
+		{"four-byte rune", '𝄞', defaultLoggedPathCap - 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := asciiPath(tc.lead) + string(tc.r) + strings.Repeat("z", 32)
+			if size := utf8.RuneLen(tc.r); tc.lead+size <= defaultLoggedPathCap {
+				t.Fatalf("case does not straddle the cap: lead %d + rune %d bytes", tc.lead, size)
+			}
+			got := loggedPathOf(t, path)
+
+			if want := asciiPath(tc.lead) + truncatedMarker; got != want {
+				t.Errorf("logged path = %q…, want the cut at the rune boundary (%d bytes kept)", got[max(0, len(got)-8):], tc.lead)
+			}
+			if !utf8.ValidString(got) {
+				t.Errorf("logged path is not valid UTF-8: %q", got[max(0, len(got)-8):])
+			}
+			if strings.ContainsRune(got, utf8.RuneError) {
+				t.Errorf("logged path contains U+FFFD, so a rune was split: %q", got[max(0, len(got)-8):])
+			}
+		})
+	}
+}
+
+func TestWithMaxLoggedPath_tightensAndWidensTheCap(t *testing.T) {
+	// knell's ask: a route table of /healthz, /metrics, and /beat/{id} with a
+	// 64-char id has no use for 512 bytes of log line.
+	if got, want := loggedPathOf(t, asciiPath(300), webhttp.WithMaxLoggedPath(128)),
+		asciiPath(128)+truncatedMarker; got != want {
+		t.Errorf("with a 128-byte cap: logged path = %.40q… (len %d), want the cut at 128", got, len(got))
+	}
+	// Widening keeps a long path whole for an app that wants it.
+	if got := loggedPathOf(t, asciiPath(2000), webhttp.WithMaxLoggedPath(4096)); got != asciiPath(2000) {
+		t.Errorf("with a 4096-byte cap: logged path is %d bytes, want the 2000-byte path unchanged", len(got))
+	}
+	// Within either cap, byte-identical.
+	if got := loggedPathOf(t, "/api/thing", webhttp.WithMaxLoggedPath(16)); got != "/api/thing" {
+		t.Errorf("logged path = %q, want it unchanged", got)
+	}
+}
+
+func TestWithMaxLoggedPath_nonPositiveKeepsTheDefault(t *testing.T) {
+	// There is no way to switch the bound off, and a config-driven 0 must not
+	// find one: eight of the nine access-log consumers had no path bound of their
+	// own, so an option that could zero the cap would reopen exactly the hole it
+	// closes.
+	for _, n := range []int{0, -1, -512} {
+		got := loggedPathOf(t, asciiPath(1000), webhttp.WithMaxLoggedPath(n))
+		if want := asciiPath(defaultLoggedPathCap) + truncatedMarker; got != want {
+			t.Errorf("WithMaxLoggedPath(%d): logged path is %d bytes, want the default cap to stand (%d)",
+				n, len(got), len(want))
+		}
+	}
+}
+
+func TestWithMaxLoggedPath_boundsACallerPathFuncReturn(t *testing.T) {
+	// A transform is a REDACTION policy; nothing about redacting a token also
+	// bounds the path it sat in. So the cap applies to fn's return, not only to
+	// the raw default — the caller cannot opt out of the floor by installing a
+	// policy.
+	long := "/rewritten/" + strings.Repeat("b", 2000)
+	got := loggedPathOf(t, "/short",
+		webhttp.WithPathFunc(func(*http.Request) string { return long }))
+	if want := long[:defaultLoggedPathCap] + truncatedMarker; got != want {
+		t.Errorf("logged path is %d bytes, want the transform's return cut at %d", len(got), defaultLoggedPathCap)
+	}
+}
+
+func TestWithMaxLoggedPath_keepsTheFailClosedPlaceholder(t *testing.T) {
+	// The cap runs after the fail-closed coercion, and the placeholder is well
+	// under it, so a broken policy still reports as a broken policy rather than
+	// as a truncated one.
+	got := loggedPathOf(t, "/secret/"+fakeSessionID,
+		webhttp.WithPathFunc(func(*http.Request) string { return "" }))
+	if got != "(path-redaction-failed)" {
+		t.Errorf("logged path = %q, want the fail-closed placeholder", got)
+	}
+}
+
+func TestWithMaxLoggedPath_boundsTheTemplatePolicyOutput(t *testing.T) {
+	// WithTemplatePathsUnder returns a path OUTSIDE every declared prefix
+	// unchanged — deliberately, so a static 404 stays diagnosable — which leaves
+	// the raw client bytes as the recorded value. That is the branch the cap has
+	// to cover.
+	outside := asciiPath(1000)
+	got := loggedPathOf(t, outside, webhttp.WithTemplatePathsUnder("/api/sessions/"))
+	if want := asciiPath(defaultLoggedPathCap) + truncatedMarker; got != want {
+		t.Errorf("path outside the prefix logged at %d bytes, want the cut at %d", len(got), defaultLoggedPathCap)
+	}
+	// A matched template is a string the server registered, so it is far under
+	// the cap and comes through untouched.
+	if p := loggedPathFor(t, http.MethodDelete, "/api/sessions/"+fakeSessionID,
+		webhttp.WithTemplatePathsUnder("/api/sessions/")); p != "/api/sessions/{id}" {
+		t.Errorf("logged path = %q, want the matched template unchanged", p)
+	}
+}
+
+func TestRequestLogger_boundsTheLoggedMethod(t *testing.T) {
+	// net/http validates the method's CHARSET before a handler runs, so LENGTH is
+	// the axis left open — and it is bounded only by the request line, a megabyte
+	// at this package's own MaxHeaderBytes default.
+	cases := []struct {
+		name, method, want string
+	}{
+		{"GET", http.MethodGet, http.MethodGet},
+		// The longest method in IANA's registry (RFC 4437 §7). A real method must
+		// log as itself, which is what rules out a tighter bound.
+		{"longest registered method", "UPDATEREDIRECTREF", "UPDATEREDIRECTREF"},
+		{"exactly at the cap", strings.Repeat("M", 24), strings.Repeat("M", 24)},
+		// One byte over: a fixed placeholder, never a prefix. "MMMM…M" cut to 24
+		// reads as a method somebody tried, and grepping the upstream for it finds
+		// nothing.
+		{"one byte over the cap", strings.Repeat("M", 25), overlongMethod},
+		{"absurd method", strings.Repeat("Z", 4096), overlongMethod},
+		// A token of punctuation is a legal method (RFC 9110 §5.6.2) and reaches a
+		// handler, so the bound cannot assume methods look like words.
+		{"punctuation token", "M!#$%&'*+-.^_`|~", "M!#$%&'*+-.^_`|~"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _ := loggedAttrs(t, okHandler(), requestWithPath(tc.method, "/x"))["method"].(string)
+			if got != tc.want {
+				t.Errorf("logged method (len %d) = %.40q, want %.40q", len(tc.method), got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRequestLogger_overlongMethodDoesNotAlterRouting(t *testing.T) {
+	// Only the LOGGED value changes. The mux still refuses the method the client
+	// actually sent, with the status and the Allow header it would have produced
+	// without this package in the chain.
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /x", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+
+	logCap := &captureHandler{}
+	rr := httptest.NewRecorder()
+	webhttp.RequestLogger(mux, webhttp.WithLogger(slog.New(logCap))).
+		ServeHTTP(rr, requestWithPath(strings.Repeat("M", 100), "/x"))
+
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405 (routing must be untouched)", rr.Code)
+	}
+	// "GET, HEAD" is what ServeMux advertises for a GET-only pattern, unchanged
+	// by anything here.
+	if allow := rr.Header().Get("Allow"); allow != "GET, HEAD" {
+		t.Errorf("Allow = %q, want %q", allow, "GET, HEAD")
+	}
+	recs := logCap.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("got %d log records, want exactly 1", len(recs))
+	}
+	m := attrsOf(recs[0])
+	if m["method"] != overlongMethod {
+		t.Errorf("logged method = %v, want the placeholder", m["method"])
+	}
+	if m["status"] != int64(http.StatusMethodNotAllowed) {
+		t.Errorf("logged status = %v, want 405", m["status"])
+	}
+}
+
+func TestRequestLogger_boundsTheMethodInAHookFailureDiagnostic(t *testing.T) {
+	// The hook-failure diagnostics log a method too, and they land in the same
+	// stream as the access line. A bound that covered only the access line would
+	// leave a panicking hook as the way to get an unbounded method into the log.
+	logCap := &captureHandler{}
+	webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(slog.New(logCap)),
+		webhttp.WithLogLevel(func(*http.Request, int) slog.Level { panic("level boom") }),
+	).ServeHTTP(httptest.NewRecorder(), requestWithPath(strings.Repeat("M", 300), "/x"))
+
+	recs := logCap.snapshot()
+	if len(recs) != 2 {
+		t.Fatalf("got %d log records, want the diagnostic plus the access line", len(recs))
+	}
+	for _, rec := range recs {
+		if got := attrsOf(rec)["method"]; got != overlongMethod {
+			t.Errorf("%q record logged method %v, want the placeholder", rec.Message, got)
+		}
+	}
+}
+
+func TestRequestLogger_legacyMetricHookGetsTheBoundedValues(t *testing.T) {
+	// The legacy hook's two text arguments ARE the recorded values, so an
+	// over-long token cannot reach a metric label either.
+	var gotMethod, gotPath string
+	webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(discardLogger()),
+		webhttp.WithRecordMetric(func(method, path string, _ int, _ time.Duration) {
+			gotMethod, gotPath = method, path
+		}),
+	).ServeHTTP(httptest.NewRecorder(), requestWithPath(strings.Repeat("M", 100), asciiPath(1000)))
+
+	if gotMethod != overlongMethod {
+		t.Errorf("hook method = %.40q, want the placeholder", gotMethod)
+	}
+	if want := asciiPath(defaultLoggedPathCap) + truncatedMarker; gotPath != want {
+		t.Errorf("hook path is %d bytes, want the cut value (%d bytes)", len(gotPath), len(want))
+	}
+}
+
+// The ten values the metric's method label can take, spelled out here rather
+// than read from the package: the closed set IS the public ceiling, so a test
+// that imported the constants could not notice the set changing.
+var permittedMetricMethods = []string{
+	http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut,
+	http.MethodDelete, http.MethodConnect, http.MethodOptions,
+	http.MethodTrace, http.MethodPatch, metricMethodBucket,
+}
+
+const (
+	metricMethodBucket = "other"
+	metricUnmatched    = "unmatched"
+	// A method that is a legal RFC 9110 §5.6.2 token of pure punctuation. Sent
+	// over a real socket it reaches a handler, so the bucket cannot assume a
+	// method looks like a word.
+	hostileMethodToken = "M!#$%&'*+-.^_`|~"
+)
+
+// routeLabelRequest builds the minimal request RouteMetricLabels reads — the
+// method, the matched pattern, a path — as a struct literal.
+// httptest.NewRequest cannot express two of the cases this derivation must
+// bound: it substitutes GET for an empty method, and it panics on a method
+// carrying a space (a real socket refuses that one at parse time, but the
+// derivation is a pure function and must not depend on who calls it).
+func routeLabelRequest(method, pattern string) *http.Request {
+	return &http.Request{
+		Method:  method,
+		Pattern: pattern,
+		URL:     &url.URL{Path: "/beat/x"},
+	}
+}
+
+func TestRouteMetricLabels_labelPairs(t *testing.T) {
+	// The pattern is set directly so every shape is covered including ones a
+	// single mux cannot produce at once; the mux-driven tests below pin that
+	// http.ServeMux really does assign these patterns.
+	cases := []struct {
+		name, method, pattern, wantMethod, wantPath string
+	}{
+		// The nine standard methods record VERBATIM, against a method-agnostic
+		// pattern (which http.ServeMux hands every method to, and whose path
+		// label is the pattern itself).
+		{"GET", http.MethodGet, "/beat/{id}", http.MethodGet, "/beat/{id}"},
+		{"HEAD", http.MethodHead, "/beat/{id}", http.MethodHead, "/beat/{id}"},
+		{"POST", http.MethodPost, "/beat/{id}", http.MethodPost, "/beat/{id}"},
+		{"PUT", http.MethodPut, "/beat/{id}", http.MethodPut, "/beat/{id}"},
+		{"DELETE", http.MethodDelete, "/beat/{id}", http.MethodDelete, "/beat/{id}"},
+		{"CONNECT", http.MethodConnect, "/beat/{id}", http.MethodConnect, "/beat/{id}"},
+		{"OPTIONS", http.MethodOptions, "/beat/{id}", http.MethodOptions, "/beat/{id}"},
+		{"TRACE", http.MethodTrace, "/beat/{id}", http.MethodTrace, "/beat/{id}"},
+		{"PATCH", http.MethodPatch, "/beat/{id}", http.MethodPatch, "/beat/{id}"},
+
+		// Everything outside that set collapses onto ONE bucket, whatever it
+		// looks like. PROPFIND is a real registered method and still buckets:
+		// the set is the standard nine, not the IANA registry, because the
+		// registry is open-ended and a label domain must not be.
+		{"registered but non-standard method", "PROPFIND", "/", metricMethodBucket, "/"},
+		{"vendor method", "PURGE", "/", metricMethodBucket, "/"},
+		{"attacker-shaped token", hostileMethodToken, "/", metricMethodBucket, "/"},
+		{"absurdly long token", strings.Repeat("M", 4096), "/", metricMethodBucket, "/"},
+		// HTTP methods are case-SENSITIVE (RFC 9110 §9.1), so "get" is not GET.
+		// Folding it in would hand a caller a second spelling of a real series;
+		// bucketing it is the only reading that keeps the domain closed.
+		{"lowercase get is not GET", "get", "/", metricMethodBucket, "/"},
+		{"mixed-case Get is not GET", "Get", "/", metricMethodBucket, "/"},
+		{"empty method", "", "/", metricMethodBucket, "/"},
+
+		// A method-BEARING pattern: the path label drops the method prefix,
+		// which the method label carries in its own right.
+		{"method-bearing pattern", http.MethodGet, "GET /beat/{id}", http.MethodGet, "/beat/{id}"},
+		{"method-bearing exact path", http.MethodPost, "POST /api/sessions", http.MethodPost, "/api/sessions"},
+		// The case that motivated reading the request instead of the pattern:
+		// http.ServeMux routes HEAD to a GET-only pattern, so a pattern-derived
+		// method label would record GET here while the access line for the same
+		// request_id records HEAD.
+		{"HEAD against a GET-only pattern", http.MethodHead, "GET /beat/{id}", http.MethodHead, "/beat/{id}"},
+		// Still a string the server registered, so still bounded; the host is
+		// kept rather than stripped because it is part of what matched.
+		{"host-qualified pattern", http.MethodGet, "GET example.com/beat/{id}", http.MethodGet, "example.com/beat/{id}"},
+
+		// Nothing matched: the PATH collapses, so every scanner probe lands in
+		// one series. The METHOD does not collapse with it — it is already
+		// bounded to ten values with no help from the route table, so there is
+		// nothing left for a collapse to protect, and keeping it means a 404
+		// flood is still visible per method.
+		{"nothing matched", http.MethodGet, "", http.MethodGet, metricUnmatched},
+		{"nothing matched, hostile method", hostileMethodToken, "", metricMethodBucket, metricUnmatched},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			method, path := webhttp.RouteMetricLabels(routeLabelRequest(tc.method, tc.pattern))
+			if method != tc.wantMethod || path != tc.wantPath {
+				t.Errorf("RouteMetricLabels(method %.40q, pattern %q) = (%.40q, %q), want (%q, %q)",
+					tc.method, tc.pattern, method, path, tc.wantMethod, tc.wantPath)
+			}
+		})
+	}
+}
+
+func TestRouteMetricLabels_methodLabelIsBoundedByConstruction(t *testing.T) {
+	// The bug this derivation exists to end. An app registering a "/" catch-all
+	// (an SPA fallback) has a NEVER-empty r.Pattern, so an "unmatched" collapse
+	// keyed on the empty pattern never fires — and a derivation that trusts
+	// r.Method verbatim there hands an unauthenticated caller the label: one
+	// permanent series per token, in this process and in every observer
+	// scraping it. The bound must therefore hold for every pattern, including
+	// none at all.
+	permitted := make(map[string]bool, len(permittedMetricMethods))
+	for _, m := range permittedMetricMethods {
+		permitted[m] = true
+	}
+	hostile := []string{
+		strings.Repeat("Z", 300), hostileMethodToken, "PROPFIND", "get", "",
+		"GET ", " GET", "GET\tHEAD", "gEt",
+	}
+	for _, pattern := range []string{"", "/", "/api/sessions/", "GET /beat/{id}"} {
+		for _, m := range hostile {
+			method, _ := webhttp.RouteMetricLabels(routeLabelRequest(m, pattern))
+			if !permitted[method] {
+				t.Errorf("pattern %q, method %.40q: label %.40q is outside the ten permitted values",
+					pattern, m, method)
+			}
+		}
+	}
+}
+
+// routeMetricMux is a route table with the three shapes that decide a path
+// label: a method-bearing template, a method-agnostic subtree, and the "/"
+// catch-all that makes r.Pattern never empty.
+func routeMetricMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /beat/{id}", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/api/sessions/", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	return mux
+}
+
+func TestRouteMetricLabels_againstARealMux(t *testing.T) {
+	// The patterns asserted above are only worth asserting if http.ServeMux
+	// really assigns them, so this drives the labels through a real route table
+	// — including the catch-all that makes r.Pattern never empty.
+	cases := []struct {
+		name, method, path, wantMethod, wantPath string
+	}{
+		{"matched template", http.MethodGet, "/beat/abc123", http.MethodGet, "/beat/{id}"},
+		// ServeMux routes HEAD to the GET-only pattern, so the PATH is that
+		// pattern's template while the METHOD stays the verb that arrived —
+		// which is what keeps this line's metric and its access line agreeing.
+		{"HEAD against a GET pattern", http.MethodHead, "/beat/abc123", http.MethodHead, "/beat/{id}"},
+		{"method-agnostic subtree", http.MethodDelete, "/api/sessions/abc", http.MethodDelete, "/api/sessions/"},
+		// Falls through to the SPA catch-all, where an app's own "unmatched"
+		// collapse could never fire. The token buckets anyway.
+		{"scanner probe onto the catch-all", "PROPFIND", "/wp-login.php", metricMethodBucket, "/"},
+		{"hostile token onto the catch-all", hostileMethodToken, "/", metricMethodBucket, "/"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotMethod, gotPath string
+			webhttp.RequestLogger(routeMetricMux(),
+				webhttp.WithLogger(discardLogger()),
+				webhttp.WithRecordMetricRequest(func(r *http.Request, _ int, _ time.Duration) {
+					gotMethod, gotPath = webhttp.RouteMetricLabels(r)
+				}),
+			).ServeHTTP(httptest.NewRecorder(), requestWithPath(tc.method, tc.path))
+
+			if gotMethod != tc.wantMethod || gotPath != tc.wantPath {
+				t.Errorf("%.40q %s: labels = (%.40q, %q), want (%q, %q)",
+					tc.method, tc.path, gotMethod, gotPath, tc.wantMethod, tc.wantPath)
+			}
+		})
+	}
+}
+
+func TestRouteMetricLabels_unmatchedCollapsesThePathLabel(t *testing.T) {
+	// Without a catch-all, a 404 clears the pattern and every probe lands on the
+	// one path label, so a scanner cannot mint a series per URL. The method
+	// label stays the caller's method when it is standard and buckets otherwise
+	// — bounded either way, so the pair is at most ten series for all 404s.
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /beat/{id}", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+
+	cases := []struct {
+		method, target, wantMethod string
+	}{
+		{http.MethodGet, "/nope", http.MethodGet},
+		{http.MethodGet, "/wp-login.php", http.MethodGet},
+		{http.MethodGet, "/beat", http.MethodGet},
+		{http.MethodDelete, "/nope", http.MethodDelete},
+		{"PROPFIND", "/.git/config", metricMethodBucket},
+		{hostileMethodToken, "/nope", metricMethodBucket},
+	}
+	for _, tc := range cases {
+		var gotMethod, gotPath string
+		webhttp.RequestLogger(mux,
+			webhttp.WithLogger(discardLogger()),
+			webhttp.WithRecordMetricRequest(func(r *http.Request, _ int, _ time.Duration) {
+				gotMethod, gotPath = webhttp.RouteMetricLabels(r)
+			}),
+		).ServeHTTP(httptest.NewRecorder(), requestWithPath(tc.method, tc.target))
+
+		if gotMethod != tc.wantMethod || gotPath != metricUnmatched {
+			t.Errorf("%.40q %s: labels = (%.40q, %q), want (%q, %q)",
+				tc.method, tc.target, gotMethod, gotPath, tc.wantMethod, metricUnmatched)
+		}
+	}
+}
+
+// routeMetricCall is one WithRecordRouteMetric invocation, as the application
+// sees it.
+type routeMetricCall struct {
+	method, path string
+	status       int
+	d            time.Duration
+}
+
+func TestWithRecordRouteMetric_handsTheAppBoundedLabels(t *testing.T) {
+	// The end-to-end shape a consumer actually wires: a real ServeMux behind
+	// Chain + Logging. The app's hook is a plain recorder that does NOT derive
+	// anything — the point of the option is that there is nothing left to
+	// derive, so a consumer cannot repeat the mistake of trusting r.Method.
+	var calls []routeMetricCall
+	handler := webhttp.Chain(routeMetricMux(),
+		webhttp.Logging(
+			webhttp.WithLogger(discardLogger()),
+			webhttp.WithRecordRouteMetric(func(method, path string, status int, d time.Duration) {
+				calls = append(calls, routeMetricCall{method: method, path: path, status: status, d: d})
+			}),
+		),
+		webhttp.Recoverer(),
+	)
+
+	cases := []struct {
+		name, method, target string
+		want                 routeMetricCall
+	}{
+		{
+			"matched template", http.MethodGet, "/beat/abc123",
+			routeMetricCall{method: http.MethodGet, path: "/beat/{id}", status: http.StatusOK},
+		},
+		{
+			"HEAD against the GET-only pattern", http.MethodHead, "/beat/abc123",
+			routeMetricCall{method: http.MethodHead, path: "/beat/{id}", status: http.StatusOK},
+		},
+		{
+			"method-agnostic subtree", http.MethodDelete, "/api/sessions/" + fakeSessionID,
+			routeMetricCall{method: http.MethodDelete, path: "/api/sessions/", status: http.StatusOK},
+		},
+		{
+			// The subflux shape: a "/" catch-all, an attacker-chosen method and
+			// an attacker-chosen path. Both labels are fixed strings.
+			"hostile probe onto the catch-all", hostileMethodToken, "/" + strings.Repeat("z", 2000),
+			routeMetricCall{method: metricMethodBucket, path: "/", status: http.StatusOK},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			calls = nil
+
+			handler.ServeHTTP(httptest.NewRecorder(), requestWithPath(tc.method, tc.target))
+
+			if len(calls) != 1 {
+				t.Fatalf("got %d hook calls, want exactly 1", len(calls))
+			}
+			got := calls[0]
+			if got.method != tc.want.method || got.path != tc.want.path || got.status != tc.want.status {
+				t.Errorf("hook got (%.40q, %q, %d), want (%q, %q, %d)",
+					got.method, got.path, got.status, tc.want.method, tc.want.path, tc.want.status)
+			}
+			if got.d < 0 {
+				t.Errorf("hook duration = %v, want a non-negative latency", got.d)
+			}
+		})
+	}
+}
+
+func TestWithRecordRouteMetric_pathLabelIgnoresTheLogPathPolicy(t *testing.T) {
+	// The label is the matched ROUTE, so a recorded-path policy (which exists to
+	// redact a credential out of the LOG) neither feeds nor weakens it. The two
+	// are complementary: one bounds a log line, the other bounds a label domain.
+	var gotPath string
+	h := webhttp.RequestLogger(routeMetricMux(),
+		webhttp.WithLogger(discardLogger()),
+		webhttp.WithPathFunc(func(*http.Request) string { return "/redacted" }),
+		webhttp.WithRecordRouteMetric(func(_, path string, _ int, _ time.Duration) { gotPath = path }),
+	)
+	h.ServeHTTP(httptest.NewRecorder(), requestWithPath(http.MethodGet, "/beat/abc123"))
+
+	if gotPath != "/beat/{id}" {
+		t.Errorf("hook path = %q, want the matched route template", gotPath)
+	}
+}
+
+func TestWithRecordRouteMetric_firesOnPanicAndSkipsSkippedPaths(t *testing.T) {
+	panicking := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic("boom") })
+	mux := http.NewServeMux()
+	mux.Handle("GET /boom", panicking)
+	mux.HandleFunc("GET /events", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+
+	var calls []routeMetricCall
+	// Recoverer INSIDE the logger, the documented order: the panic is answered
+	// 500 and the metric still records, from the same deferred emit as the
+	// access line.
+	h := webhttp.Chain(mux,
+		webhttp.Logging(
+			webhttp.WithLogger(discardLogger()),
+			webhttp.WithSkipPaths("/events"),
+			webhttp.WithRecordRouteMetric(func(method, path string, status int, _ time.Duration) {
+				calls = append(calls, routeMetricCall{method: method, path: path, status: status})
+			}),
+		),
+		webhttp.Recoverer(webhttp.WithRecoverLogger(discardLogger())),
+	)
+
+	h.ServeHTTP(httptest.NewRecorder(), requestWithPath(http.MethodGet, "/boom"))
+	if len(calls) != 1 {
+		t.Fatalf("got %d hook calls for the panicking route, want exactly 1", len(calls))
+	}
+	if want := (routeMetricCall{method: http.MethodGet, path: "/boom", status: http.StatusInternalServerError}); calls[0] != want {
+		t.Errorf("hook got %+v, want %+v", calls[0], want)
+	}
+
+	// A skipped path emits no access line, so it records no metric either: a
+	// stream's open-to-close duration paired with a synthetic status misleads.
+	calls = nil
+	h.ServeHTTP(httptest.NewRecorder(), requestWithPath(http.MethodGet, "/events"))
+	if len(calls) != 0 {
+		t.Errorf("got %d hook calls for a skipped path, want 0", len(calls))
+	}
+}
+
+func TestWithRecordRouteMetric_panickingHookStillEmitsAccessLine(t *testing.T) {
+	// The hook runs in the outer Logging defer, outside Recoverer, so an
+	// unisolated panic here would escape to net/http and close the connection on
+	// an otherwise completed request.
+	logCap := &captureHandler{}
+	h := webhttp.RequestLogger(okHandler(),
+		webhttp.WithLogger(slog.New(logCap)),
+		webhttp.WithRecordRouteMetric(func(string, string, int, time.Duration) { panic("metric boom") }))
+
+	func() {
+		defer func() {
+			if v := recover(); v != nil {
+				t.Errorf("route metric hook panic escaped RequestLogger: %v", v)
+			}
+		}()
+		h.ServeHTTP(httptest.NewRecorder(), requestWithPath(http.MethodGet, "/x"))
+	}()
+
+	recs := logCap.snapshot()
+	var sawAccess, sawFailure bool
+	for _, rec := range recs {
+		switch rec.Message {
+		case "http":
+			sawAccess = true
+		case "webhttp: metric hook failed":
+			sawFailure = true
+		}
+	}
+	if !sawAccess {
+		t.Error("access line was not emitted after the route metric hook panicked")
+	}
+	if !sawFailure {
+		t.Error("expected a 'metric hook failed' diagnostic, got none")
+	}
+}
+
+func TestWithRecordRouteMetric_mutuallyExclusiveWithTheOtherHooks(t *testing.T) {
+	// Three hooks, one metric per request: whichever option is applied last
+	// wins, and the earlier one must be CLEARED rather than left firing too.
+	// Each case records which hook ran, so a double-fire fails as loudly as a
+	// wrong winner.
+	cases := []struct {
+		name string
+		opts func(fire func(string)) []webhttp.LogOption
+		want string
+	}{
+		{"route after legacy", func(fire func(string)) []webhttp.LogOption {
+			return []webhttp.LogOption{
+				webhttp.WithRecordMetric(func(string, string, int, time.Duration) { fire("legacy") }),
+				webhttp.WithRecordRouteMetric(func(string, string, int, time.Duration) { fire("route") }),
+			}
+		}, "route"},
+		{"route after request-aware", func(fire func(string)) []webhttp.LogOption {
+			return []webhttp.LogOption{
+				webhttp.WithRecordMetricRequest(func(*http.Request, int, time.Duration) { fire("request") }),
+				webhttp.WithRecordRouteMetric(func(string, string, int, time.Duration) { fire("route") }),
+			}
+		}, "route"},
+		{"legacy after route", func(fire func(string)) []webhttp.LogOption {
+			return []webhttp.LogOption{
+				webhttp.WithRecordRouteMetric(func(string, string, int, time.Duration) { fire("route") }),
+				webhttp.WithRecordMetric(func(string, string, int, time.Duration) { fire("legacy") }),
+			}
+		}, "legacy"},
+		{"request-aware after route", func(fire func(string)) []webhttp.LogOption {
+			return []webhttp.LogOption{
+				webhttp.WithRecordRouteMetric(func(string, string, int, time.Duration) { fire("route") }),
+				webhttp.WithRecordMetricRequest(func(*http.Request, int, time.Duration) { fire("request") }),
+			}
+		}, "request"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var fired []string
+			opts := append([]webhttp.LogOption{webhttp.WithLogger(discardLogger())},
+				tc.opts(func(which string) { fired = append(fired, which) })...)
+			webhttp.RequestLogger(okHandler(), opts...).
+				ServeHTTP(httptest.NewRecorder(), requestWithPath(http.MethodGet, "/x"))
+
+			if len(fired) != 1 || fired[0] != tc.want {
+				t.Errorf("hooks fired = %v, want exactly [%s]", fired, tc.want)
+			}
+		})
+	}
+}
+
+func TestWithRecordRouteMetric_nilIsNoOp(t *testing.T) {
+	// The package's skip-nil convention: a trailing nil neither enables the hook
+	// nor clears the one already applied.
+	var got string
+	webhttp.RequestLogger(routeMetricMux(),
+		webhttp.WithLogger(discardLogger()),
+		webhttp.WithRecordRouteMetric(func(method, _ string, _ int, _ time.Duration) { got = method }),
+		webhttp.WithRecordRouteMetric(nil),
+	).ServeHTTP(httptest.NewRecorder(), requestWithPath(http.MethodDelete, "/api/sessions/x"))
+
+	if got != http.MethodDelete {
+		t.Errorf("hook method = %q, want the prior hook still installed and firing", got)
 	}
 }

@@ -3,7 +3,15 @@
 //
 // It bundles the pieces almost every server ends up hand-rolling:
 //
-//   - request-id injection plus one-line access logging (RequestLogger),
+//   - request-id injection plus one-line access logging (RequestLogger), whose
+//     two attacker-controlled attributes are bounded by default — the path to
+//     512 bytes on a rune boundary (WithMaxLoggedPath re-sets the cap), the
+//     method to 24 bytes, beyond which it records a placeholder rather than a
+//     misleading prefix — so a megabyte URL cannot buy a megabyte log line,
+//     plus a metric hook whose (method, path) labels the LIBRARY derives and
+//     bounds, the method onto a closed ten-value set and the path onto the
+//     matched route (WithRecordRouteMetric, over the RouteMetricLabels
+//     primitive), so an app cannot forget the cardinality bound,
 //   - a status recorder that stays transparent to http.ResponseController and
 //     also implements http.Flusher/http.Hijacker/io.ReaderFrom passthroughs, so
 //     both ResponseController-based and direct-type-assertion callers (plus the
