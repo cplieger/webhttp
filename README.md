@@ -178,7 +178,7 @@ The gate breaks DNS rebinding (CWE-346): an attacker's page re-resolves its own 
 ### Request prelude
 
 - `MaxJSONBody`: 1 MiB default body cap.
-- `LimitBody(w, r, maxBytes)`: wraps the body in `http.MaxBytesReader`.
+- `LimitBody(w, r, maxBytes)`: wraps the body in `http.MaxBytesReader`. A read past the cap fails with a `*http.MaxBytesError` (test with `errors.As`) and nothing is written, so the status is yours. It also asks `net/http` to close the connection rather than drain the sender's excess, reaching net/http's own writer through the `Unwrap` chain — best-effort, because a middleware that does not unwrap (or `RouteTimeout`, whose buffering writer cannot be unwrapped) blocks that signal. Detect an over-limit body on the read error, never on the close.
 - `RequireMethod(w, r, method) bool`: 405 + `false` on mismatch.
 - `MethodNotAllowed(w, r, allowed...)`: the 405 refusal on its own, for a route that permits SEVERAL methods and so has no single method to require — the `Allow` header names the whole set (`GET, POST`), the body is the standard `method_not_allowed` envelope. Route each method with the mux (or dispatch on `r.Method`) and refuse the rest with it.
 - `SetAllow(w, allowed...)`: just the RFC 9110 `Allow` header, for an `OPTIONS` responder or any other advertisement outside a 405.

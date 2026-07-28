@@ -19,13 +19,88 @@ var ErrTrailingData = errors.New("webhttp: unexpected data after JSON value")
 const MaxJSONBody int64 = 1 << 20
 
 // LimitBody caps the request body at maxBytes by replacing r.Body with an
-// http.MaxBytesReader. A read past the limit then fails with a
-// *http.MaxBytesError (and net/http is asked to close the connection); it does
-// not by itself write a 413, so the caller chooses the response status.
-// DecodeBody, for example, surfaces the resulting decode error as a 400. Call
-// it before reading the body.
+// http.MaxBytesReader. Call it before reading the body.
+//
+// It writes NOTHING to w, so detecting and answering an over-limit body is the
+// CALLER's job, on the read error — that error is the ONLY signal the condition
+// reliably delivers:
+//
+//	webhttp.LimitBody(w, r, maxBytes)
+//	body, err := io.ReadAll(r.Body)
+//	var tooLarge *http.MaxBytesError
+//	if errors.As(err, &tooLarge) {
+//		// tooLarge.Limit == maxBytes. The status is yours: 413, 400, or none
+//		// at all (log it and drop the request).
+//	}
+//
+// Every read path in the package keeps that contract: DecodeJSONInto returns
+// the *http.MaxBytesError untouched, and DecodeBody maps it — like any other
+// decode failure — to a 400.
+//
+// # The connection-close signal, and when it is absent
+//
+// http.MaxBytesReader also tells net/http that the request was too large, which
+// makes the server add Connection: close and close the connection after the
+// reply rather than draining the sender's remaining bytes. It delivers that by
+// type-asserting an UNEXPORTED net/http interface on the ResponseWriter it was
+// handed, so it reaches net/http ONLY when the writer is net/http's own — no
+// third-party wrapper can satisfy an unexported method, and MaxBytesReader does
+// not walk Unwrap itself. LimitBody therefore walks w's Unwrap chain (the
+// http.ResponseController convention) and hands MaxBytesReader the writer at
+// the end of it. The middlewares here that wrap the writer to record a status
+// (Logging and Recoverer, via StatusRecorder) implement Unwrap, so a normal
+// Chain keeps the signal.
+//
+// It is still absent, with no way for this package to recover it, when:
+//
+//   - some wrapper in the chain does not implement Unwrap() http.ResponseWriter
+//     (a third-party middleware): the walk stops at that wrapper;
+//   - the handler runs under RouteTimeout / http.TimeoutHandler, whose
+//     buffering writer is not unwrappable;
+//   - w is not a net/http writer at all (an httptest.ResponseRecorder).
+//
+// In every one of those cases the read still fails with a *http.MaxBytesError —
+// which is why the caller-side check above is the contract and the close is
+// not. Independently of this signal, net/http closes the connection anyway when
+// more than 256 KiB of the body is left unread.
 func LimitBody(w http.ResponseWriter, r *http.Request, maxBytes int64) {
-	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+	r.Body = http.MaxBytesReader(baseResponseWriter(w), r.Body, maxBytes)
+}
+
+// unwrapWalkLimit bounds the baseResponseWriter walk. Any real chain is a
+// handful of wrappers deep; the bound is what makes a writer whose Unwrap
+// returns itself (or a cycle of two) terminate instead of spinning. The walk
+// deliberately does not compare writers to detect the cycle: == on interface
+// values panics when the dynamic type is not comparable, and a middleware
+// writer is free to be such a type.
+const unwrapWalkLimit = 16
+
+// baseResponseWriter returns the writer at the end of w's Unwrap chain: the
+// http.ResponseWriter net/http itself passed to the handler, when every wrapper
+// in between implements Unwrap() http.ResponseWriter. It is what LimitBody
+// hands to http.MaxBytesReader so the too-large signal reaches net/http's own
+// writer (see LimitBody for why that signal cannot travel through a wrapper).
+//
+// The returned writer is used ONLY as that signal's target — never written
+// through — so unwrapping cannot bypass a wrapper's own behavior: a
+// StatusRecorder still sees, and records, everything the handler writes.
+//
+// A chain that stops early (a wrapper without Unwrap, an Unwrap returning nil)
+// yields the last writer reached, which is exactly the writer today's callers
+// pass by hand: no worse than not walking at all.
+func baseResponseWriter(w http.ResponseWriter) http.ResponseWriter {
+	for range unwrapWalkLimit {
+		u, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return w
+		}
+		inner := u.Unwrap()
+		if inner == nil {
+			return w
+		}
+		w = inner
+	}
+	return w
 }
 
 // SetAllow sets the RFC 9110 Allow header to the set of methods a route
