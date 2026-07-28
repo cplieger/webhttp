@@ -378,6 +378,11 @@ func (w *jsonTimeoutWriter) WriteHeader(code int) {
 // use per-request deadlines (http.ResponseController.SetWriteDeadline) for
 // streaming routes instead.
 //
+// That buffering writer is also not unwrappable, so a handler under it cannot
+// reach the ResponseWriter net/http gave the request: on a body-reading route,
+// LimitBody's over-limit read still fails with a *http.MaxBytesError but net/http
+// is never told to close the connection (see LimitBody).
+//
 // The timeout envelope follows the package's universal request-id correlation
 // scheme, exactly like WriteError: it is rendered per request, so when the
 // request context carries an id (RouteTimeout composed under Logging /

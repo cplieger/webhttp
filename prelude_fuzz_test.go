@@ -3,6 +3,8 @@ package webhttp_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -308,6 +310,86 @@ func FuzzDecodeBodyOptional(f *testing.F) {
 			if !reflect.DeepEqual(optInto, decInto) {
 				t.Fatalf("DecodeBody accepted but Optional decoded a different value: opt=%#v dec=%#v (body=%q)", optInto, decInto, body)
 			}
+		}
+	})
+}
+
+// FuzzLimitBodyWriterChain fuzzes the ResponseWriter chain LimitBody must walk
+// (to reach net/http's own writer with the too-large signal) together with the
+// cap and the body length. The chain shape is untrusted input in the sense that
+// matters here: it is assembled from whatever middleware — first-party,
+// third-party, or buggy — a consumer composed, and each byte of `shape`
+// contributes one wrapper:
+//
+//	0: a wrapper exposing the inner writer via Unwrap (StatusRecorder's shape)
+//	1: a wrapper with no Unwrap at all (opaque third-party middleware)
+//	2: a wrapper whose Unwrap returns ITSELF (an unterminated chain)
+//	3: a wrapper whose Unwrap returns nil
+//
+// The invariants hold for every chain, which is the point: the walk is a
+// best-effort reach for an optional signal and must never change the guarantee
+// callers actually rely on.
+//
+//  1. It terminates and never panics — no chain, however degenerate or deep,
+//     can spin the walk or hand a nil writer onward.
+//  2. Reads never exceed the cap: at most maxBytes bytes are delivered.
+//  3. The error class is decided by size alone, never by the chain: a body over
+//     the cap always fails with *http.MaxBytesError, one within it never does.
+func FuzzLimitBodyWriterChain(f *testing.F) {
+	f.Add([]byte{}, int64(8), 128)
+	f.Add([]byte{0}, int64(8), 128)                     // one unwrappable wrapper
+	f.Add([]byte{1}, int64(8), 128)                     // one opaque wrapper
+	f.Add([]byte{2}, int64(8), 128)                     // self-referential Unwrap
+	f.Add([]byte{3}, int64(8), 128)                     // nil Unwrap
+	f.Add([]byte{0, 0, 1, 0, 2, 3}, int64(1), 4096)     // mixed chain
+	f.Add(bytes.Repeat([]byte{0}, 64), int64(16), 4096) // deeper than the walk bound
+	f.Add([]byte{0, 1}, int64(0), 1)                    // zero cap
+	f.Add([]byte{0}, int64(-1), 1)                      // negative cap (treated as 0)
+	f.Add([]byte{0}, int64(64), 64)                     // exactly at the cap
+	f.Add(bytes.Repeat([]byte{2}, 32), int64(4), 1<<10) // nothing but cycles
+	f.Fuzz(func(t *testing.T, shape []byte, maxBytes int64, bodyLen int) {
+		// Keep the case cheap and meaningful: a body big enough to cross any cap
+		// under test, a chain deep enough to exceed the walk bound.
+		if bodyLen < 0 || bodyLen > 1<<16 || len(shape) > 128 {
+			t.Skip()
+		}
+		var w http.ResponseWriter = httptest.NewRecorder()
+		for _, kind := range shape {
+			switch kind % 4 {
+			case 0:
+				w = &unwrappableWriter{ResponseWriter: w}
+			case 1:
+				w = &opaqueWriter{ResponseWriter: w}
+			case 2:
+				w = &selfUnwrappingWriter{ResponseWriter: w}
+			default:
+				w = &nilUnwrappingWriter{ResponseWriter: w}
+			}
+		}
+
+		req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(bytes.Repeat([]byte("z"), bodyLen)))
+		webhttp.LimitBody(w, req, maxBytes) // must return for every chain
+		n, err := io.Copy(io.Discard, req.Body)
+
+		effectiveCap := max(maxBytes, 0) // MaxBytesReader treats a negative cap as 0
+		if n > effectiveCap {
+			t.Fatalf("read %d bytes past the %d-byte cap (shape=%v)", n, effectiveCap, shape)
+		}
+		var tooLarge *http.MaxBytesError
+		gotTooLarge := errors.As(err, &tooLarge)
+		wantTooLarge := int64(bodyLen) > effectiveCap
+		if gotTooLarge != wantTooLarge {
+			t.Fatalf("MaxBytesError=%v (err=%v) for a %d-byte body under a %d-byte cap, want %v (shape=%v)",
+				gotTooLarge, err, bodyLen, effectiveCap, wantTooLarge, shape)
+		}
+		if gotTooLarge && tooLarge.Limit != effectiveCap {
+			t.Fatalf("MaxBytesError.Limit = %d, want %d (shape=%v)", tooLarge.Limit, effectiveCap, shape)
+		}
+		if !gotTooLarge && err != nil {
+			t.Fatalf("read err = %v (%T), want nil within the cap (shape=%v)", err, err, shape)
+		}
+		if !gotTooLarge && n != int64(bodyLen) {
+			t.Fatalf("read %d of %d bytes within the cap (shape=%v)", n, bodyLen, shape)
 		}
 	})
 }
