@@ -334,6 +334,41 @@ func Logging(opts ...LogOption) Middleware {
 	}
 }
 
+// NoStore returns middleware that sets Cache-Control: no-store on every
+// response passing through it, before the next handler runs.
+//
+// The value is FIXED. This is deliberately not a cache-policy API: the one
+// header every dynamic surface needs is worth a name, and anything richer is
+// per-asset POLICY that already has a home in WithStaticCacheControl. Three
+// consumers had hand-written this exact three-line wrapper — for a
+// state-reporting API, for an SPA's HTML and API responses, and for an /api/
+// subtree whose handlers set no cache directive at all — and the library
+// already set the same value internally at ReadinessHandler without exporting a
+// composable form.
+//
+// PLACEMENT AND OVERRIDE ORDERING STAY APP-OWNED, exactly like
+// WithStaticCacheControl's policy hook. The header is set before next runs and
+// is not locked: a handler or an inner middleware that needs a different value
+// for its own responses (a long-lived immutable asset, a per-asset cache
+// policy, a cacheable preview image) simply Sets Cache-Control itself and wins,
+// which is why the usual placement is innermost in the Chain — early enough to
+// land before any handler writes a status, late enough that the asset paths
+// that need to override it still can. Scope it by mounting it on the subtree
+// that needs it rather than by configuring it.
+//
+// It is NOT the middleware for a conditional no-store: a response that must
+// only be uncacheable when it carries a Set-Cookie (the OWASP session-
+// management rule) has a different trigger and a different concern, and belongs
+// with the code that sets the cookie.
+func NoStore() Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Cache-Control", "no-store")
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // jsonTimeoutWriter labels a 503 response that carries no Content-Type as JSON,
 // so the timeout envelope written by http.TimeoutHandler is served as
 // application/json (with nosniff) instead of being content-sniffed as

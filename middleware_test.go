@@ -1009,3 +1009,64 @@ func TestRouteTimeout_underRequestLoggerCorrelatesHeaderAndBody(t *testing.T) {
 		t.Errorf("envelope request_id = %q, header id = %q; want them equal", body.RequestID, id)
 	}
 }
+
+func TestNoStore_setsHeader(t *testing.T) {
+	rr := serve(webhttp.NoStore()(okHandler()), http.MethodGet, "/", nil)
+
+	if got := rr.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want %q", got, "no-store")
+	}
+}
+
+func TestNoStore_setsHeaderBeforeHandlerRuns(t *testing.T) {
+	// The middleware sets the header before next runs, which is what lets a
+	// handler both observe it and replace it.
+	var seen string
+	h := webhttp.NoStore()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		seen = w.Header().Get("Cache-Control")
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	serve(h, http.MethodGet, "/", nil)
+
+	if seen != "no-store" {
+		t.Errorf("handler saw Cache-Control = %q, want %q (set before next runs)", seen, "no-store")
+	}
+}
+
+func TestNoStore_handlerCanOverride(t *testing.T) {
+	// The load-bearing property: placement and override ordering stay app-owned,
+	// so an inner handler with its own cache policy (a long-lived asset, a
+	// cacheable preview) wins over the blanket no-store.
+	const assetPolicy = "public, max-age=86400"
+	h := webhttp.NoStore()(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Cache-Control", assetPolicy)
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	rr := serve(h, http.MethodGet, "/asset.js", nil)
+
+	if got := rr.Header().Get("Cache-Control"); got != assetPolicy {
+		t.Errorf("Cache-Control = %q, want %q (the handler's own policy must win)", got, assetPolicy)
+	}
+	if vals := rr.Header().Values("Cache-Control"); len(vals) != 1 {
+		t.Errorf("Cache-Control values = %v, want exactly one (Set replaces, never appends)", vals)
+	}
+}
+
+func TestNoStore_composesInChainOnEveryResponse(t *testing.T) {
+	// Innermost in the Chain: the header lands on an error envelope too, not
+	// only on a 200.
+	h := webhttp.Chain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		webhttp.WriteError(w, r, http.StatusNotFound, "not_found", "no such thing")
+	}), webhttp.SecurityHeaders(), webhttp.NoStore())
+
+	rr := serve(h, http.MethodGet, "/missing", nil)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rr.Code)
+	}
+	if got := rr.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control on a 404 = %q, want %q", got, "no-store")
+	}
+}
