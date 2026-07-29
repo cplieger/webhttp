@@ -3,18 +3,46 @@ package webhttp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"time"
 )
 
+// ErrShutdownGraceExpired marks a Run return whose origin was the shutdown
+// grace period running out, so a caller can tell WHICH DeadlineExceeded it is
+// holding.
+//
+// Run's error is one value with two possible origins: a serve error carrying a
+// deadline of the caller's own making, or the graceful sequence outliving the
+// single shutdown grace. Both can satisfy
+// errors.Is(err, context.DeadlineExceeded), and a caller that assumes the
+// second is asserting something the value alone cannot prove. A grace-expiry
+// return is wrapped so both hold:
+//
+//	errors.Is(err, webhttp.ErrShutdownGraceExpired) // the origin: the grace ran out
+//	errors.Is(err, context.DeadlineExceeded)        // still true, unchanged
+//
+// The diagnosis itself stays the caller's: naming the grace constant to raise,
+// deciding the log level, and choosing the exit code are app policy.
+var ErrShutdownGraceExpired = errors.New("webhttp: shutdown grace period expired")
+
 // Default server and shutdown tunables.
 const (
 	defaultReadHeaderTimeout = 10 * time.Second
 	defaultIdleTimeout       = 120 * time.Second
-	defaultMaxHeaderBytes    = 1 << 20
-	defaultShutdownGrace     = 5 * time.Second
+	// defaultMaxHeaderBytes deliberately restates net/http's own 1 MiB default
+	// rather than tightening it like the two timeouts above. Shortening a timeout
+	// can only end a connection that was already slow or idle, and the symptom is
+	// a closed connection; a smaller size cap REJECTS a well-formed request with a
+	// 431 the handler never sees, which is both surprising and hard to trace back
+	// to a library default. This library's consumers are heterogeneous — some are
+	// browser-facing with cookies and large auth headers, some are machine-only
+	// APIs — so the right ceiling is per app. WithMaxHeaderBytes is the knob.
+	defaultMaxHeaderBytes = 1 << 20
+	defaultShutdownGrace  = 5 * time.Second
 )
 
 // ServerOption configures the *http.Server built by NewServer.
@@ -50,9 +78,36 @@ func WithMaxHeaderBytes(n int) ServerOption {
 }
 
 // WithErrorLog sets http.Server.ErrorLog so connection-level errors go to the
-// caller's logger instead of the standard logger. Wire it to slog with
-// slog.NewLogLogger(handler, slog.LevelError).
+// caller's logger instead of the standard logger. It is the override for a
+// custom *log.Logger; for the ordinary case of routing those lines into slog
+// at a chosen level, use WithSlogErrorLog.
 func WithErrorLog(l *log.Logger) ServerOption { return func(s *http.Server) { s.ErrorLog = l } }
+
+// WithSlogErrorLog sets http.Server.ErrorLog to a bridge that forwards
+// net/http's own connection-level lines into slog at level, so they arrive as
+// level-carrying records in an otherwise structured stream instead of as
+// unstructured, level-less standard-logger output that no level-based log rule
+// can match. The lines it covers are net/http's, above all
+// "http: Accept error: ...; retrying" — the trace of an exhausted fd budget,
+// which is a whole-service outage no request-scoped log will report.
+//
+// The LEVEL is the caller's policy and deliberately has no default here,
+// because consumers legitimately disagree: an accept failure is fatal to a
+// service whose only job is to answer probes (Error) and a degradation to one
+// that will retry (Warn). This option only gives that choice a named home
+// instead of three hand-written copies of the same slog.NewLogLogger recipe.
+//
+// It resolves slog.Default() when the option is APPLIED (inside NewServer), so
+// install the process logger before building the server; a later
+// slog.SetDefault does not retroactively re-target an already-built
+// http.Server. WithErrorLog remains the escape hatch for any other
+// *log.Logger, and the default (net/http's standard logger) is unchanged when
+// neither option is passed.
+func WithSlogErrorLog(level slog.Level) ServerOption {
+	return func(s *http.Server) {
+		WithErrorLog(slog.NewLogLogger(slog.Default().Handler(), level))(s)
+	}
+}
 
 // NewServer builds an *http.Server for handler with streaming-safe defaults:
 // ReadHeaderTimeout 10s (a slowloris guard), IdleTimeout 120s, MaxHeaderBytes
@@ -153,7 +208,11 @@ func WithServeExit(fn func(ctx context.Context)) RunOption {
 // SAME deadline: each later phase runs within whatever grace budget REMAINS
 // after the earlier ones, not a fresh full window. Run returns the first
 // non-ErrServerClosed error it observes (a serve error, else a shutdown error),
-// or nil on a clean graceful stop.
+// or nil on a clean graceful stop. A shutdown error that IS the grace period
+// running out is additionally wrapped in ErrShutdownGraceExpired, so a caller
+// can identify that origin instead of guessing it from a bare
+// context.DeadlineExceeded; the wrapped error stays in the chain, so existing
+// errors.Is checks are unaffected.
 //
 // When Serve instead returns on its own, before ctx is cancelled, none of that
 // sequence runs: there is no drain to bound and nothing has asked the
@@ -219,5 +278,84 @@ func Run(ctx context.Context, srv *http.Server, ln net.Listener, onShutdown func
 	if err := <-serveErr; err != nil {
 		return err
 	}
-	return shutdownErr
+	return graceExpiryError(shutdownErr)
+}
+
+// graceExpiryError marks a shutdown error that IS the grace period running out,
+// so Run's caller can identify that origin with errors.Is instead of inferring
+// it from a bare context.DeadlineExceeded (see ErrShutdownGraceExpired).
+//
+// It is a pure addition to the return contract: the original error stays in the
+// chain as the second %w, so every errors.Is / errors.As check a caller already
+// performs against it (context.DeadlineExceeded above all) keeps holding, and a
+// shutdown error of any other kind — or none — passes through untouched.
+func graceExpiryError(shutdownErr error) error {
+	if !errors.Is(shutdownErr, context.DeadlineExceeded) {
+		return shutdownErr
+	}
+	return fmt.Errorf("%w: %w", ErrShutdownGraceExpired, shutdownErr)
+}
+
+// AwaitDone blocks until done is closed or ctx expires, and reports whether
+// done closed in time. It is the bounded WAIT a teardown needs, not the
+// teardown itself: shutdown teardown bodies stay app-owned, and so does every
+// policy around the result — what to log, at which level, whether to name the
+// grace constant, whether to count it.
+//
+// It deliberately creates NO timeout of its own and logs nothing. Run hands
+// onShutdown a context carrying whatever remains of the ONE shutdown grace
+// after the pre-drain phase and the HTTP drain have spent their share, so a
+// fresh deadline invented here would hand the teardown a budget the shutdown
+// sequence does not actually have.
+//
+// The post-expiry recheck is the reason this is worth sharing. A drain that
+// consumed the whole grace hands the teardown an ALREADY-EXPIRED context, and a
+// select whose cases are both ready picks pseudo-randomly — so the naive
+// two-case select reports a goroutine that DID finish as still running a
+// fraction of the time, turning a clean drain into a spurious warning. After
+// ctx fires, AwaitDone re-checks done and only then reports false.
+//
+// A nil done channel never becomes ready, so the wait is then bounded by ctx
+// alone.
+func AwaitDone(ctx context.Context, done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+	}
+	// ctx has expired, but both cases above may have become ready together, in
+	// which case the select's choice was arbitrary. Completion wins: a teardown
+	// that finished exactly as the budget ran out finished.
+	select {
+	case <-done:
+		return true
+	default:
+		return false
+	}
+}
+
+// CausedByCancellation reports whether err is the observable form of THIS
+// context's cancellation, so a boundary can tell a routine stop apart from a
+// fault that merely happened at the same moment.
+//
+// It PROVES the match rather than assuming it. A cancelled context alone is not
+// evidence: a listener bind that genuinely failed while a signal was arriving
+// must still read as a bind failure, not as a clean stop — the classification
+// mistake this predicate exists to prevent. So err must carry either the stable
+// ctx.Err() or the cancellation cause.
+//
+// Matching context.Cause(ctx) as well as ctx.Err() is what makes it usable at a
+// net/http boundary: a cause passed to context.WithCancelCause need not wrap
+// context.Canceled, and net/http reports a cancelled operation as the cause
+// verbatim, so a ctx.Err()-only check misses it. A nil ctx, a nil err, or a
+// context that is not cancelled all report false.
+//
+// What to DO with a true answer stays the caller's policy — the log level, the
+// message, the exit code, and whether the operation is retried are none of the
+// library's business.
+func CausedByCancellation(ctx context.Context, err error) bool {
+	if ctx == nil || err == nil || ctx.Err() == nil {
+		return false
+	}
+	return errors.Is(err, ctx.Err()) || errors.Is(err, context.Cause(ctx))
 }
