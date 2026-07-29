@@ -22,8 +22,9 @@ import (
 // Hijack reports http.ErrNotSupported on an HTTP/2 stream.
 type StatusRecorder struct {
 	http.ResponseWriter
-	status      int
-	wroteHeader bool
+	status       int
+	wroteHeader  bool
+	hijackedBare bool
 }
 
 // NewStatusRecorder wraps w. The recorded status defaults to http.StatusOK
@@ -93,11 +94,32 @@ func (s *StatusRecorder) Flush() {
 func (s *StatusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	conn, rw, err := http.NewResponseController(s.ResponseWriter).Hijack()
 	if err == nil {
+		// Latch "hijacked with nothing recorded yet" BEFORE the commit flag below
+		// erases the distinction. When a handler takes the connection over without
+		// having written a status or a byte, net/http sent nothing at all: the
+		// handler owns the whole wire (this is how gorilla/websocket writes its
+		// 101 handshake), so the 200 the recorder defaults to describes no
+		// response that exists. RequestLogger's WithSkipUpgrades reads that fact
+		// through switchedProtocol; Status() keeps returning the default, since
+		// every existing caller wants a status rather than a second zero value to
+		// handle.
+		s.hijackedBare = !s.wroteHeader
 		// The connection is now the caller's; the ResponseWriter can no longer
 		// emit a status/body, so mark it committed to stop Recoverer writing onto it.
 		s.wroteHeader = true
 	}
 	return conn, rw, err
+}
+
+// switchedProtocol reports whether the response left HTTP request/response
+// framing instead of completing an exchange: it recorded 101 Switching
+// Protocols (the handshake went through this writer, as coder/websocket's
+// WriteHeader(101)-then-Hijack does), or it was hijacked before anything was
+// recorded (the handler wrote the handshake onto the connection itself). It is
+// the FACT behind RequestLogger's WithSkipUpgrades, which owns the policy of
+// what to do about it; nothing here decides whether such a response is logged.
+func (s *StatusRecorder) switchedProtocol() bool {
+	return s.status == http.StatusSwitchingProtocols || s.hijackedBare
 }
 
 // ReadFrom preserves the zero-copy (sendfile) fast path for io.Copy and

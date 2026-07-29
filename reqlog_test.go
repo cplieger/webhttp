@@ -1,6 +1,7 @@
 package webhttp_test
 
 import (
+	"bufio"
 	"context"
 	"log/slog"
 	"net"
@@ -369,6 +370,326 @@ func TestRequestLogger_skipFuncFalseStillLogs(t *testing.T) {
 
 	if n := len(logCap.snapshot()); n != 1 {
 		t.Errorf("skip-func returning false emitted %d log lines, want 1", n)
+	}
+}
+
+// hijackableRecorder is an httptest.ResponseRecorder that also implements
+// http.Hijacker — the one capability a WebSocket upgrade needs and the plain
+// recorder lacks. Hijack succeeds with a nil connection: what is under test is
+// what the access LOG does once a handler has taken the connection over, not the
+// bytes that then travel on it (recorder_test.go's hijackOnlyWriter is the same
+// stand-in for the recorder's own tests).
+type hijackableRecorder struct {
+	*httptest.ResponseRecorder
+	hijacked bool
+}
+
+func (h *hijackableRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h.hijacked = true
+	return nil, nil, nil
+}
+
+// hijackThroughWriter takes the connection over through the writer the handler
+// was handed, using the direct http.Hijacker assertion both real WebSocket
+// libraries make (coder/websocket's hijacker helper type-switches on it first,
+// gorilla/websocket asserts it outright). Going through the writer is the point:
+// that is how the hijack reaches webhttp's StatusRecorder at all.
+func hijackThroughWriter(t *testing.T, w http.ResponseWriter) {
+	t.Helper()
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		t.Fatal("writer handed to the handler does not implement http.Hijacker")
+	}
+	if _, _, err := hj.Hijack(); err != nil {
+		t.Fatalf("Hijack: %v", err)
+	}
+}
+
+// wsUpgradeHandler answers a handshake the way coder/websocket's Accept does on
+// success: WriteHeader(101) through the writer it was handed, then a hijack
+// through that same writer. A real handler returns from here only when the
+// socket CLOSES, which is why the record cannot be decided by "what the status
+// was when the handler returned" without inventing a session-length duration.
+func wsUpgradeHandler(t *testing.T) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusSwitchingProtocols)
+		hijackThroughWriter(t, w)
+	})
+}
+
+// wsBareHijackHandler is the OTHER upgrade shape: hijack first and write the 101
+// status line onto the connection directly (gorilla/websocket's Upgrade), so no
+// status ever reaches the recorder and its 200 default describes nothing.
+func wsBareHijackHandler(t *testing.T) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hijackThroughWriter(t, w)
+	})
+}
+
+// statusThenHijackHandler writes an explicit status BEFORE hijacking, the HTTP
+// CONNECT-tunnel shape. It told us what it answered, so its record is kept.
+func statusThenHijackHandler(code int) func(*testing.T) http.Handler {
+	return func(t *testing.T) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(code)
+			hijackThroughWriter(t, w)
+		})
+	}
+}
+
+// fixedHandler adapts a plain handler to the table's per-subtest factory shape.
+func fixedHandler(h http.Handler) func(*testing.T) http.Handler {
+	return func(*testing.T) http.Handler { return h }
+}
+
+// TestWithSkipUpgrades pins the whole contract on ONE route: only a response
+// that actually switched protocols loses its record, and every refusal the same
+// route can answer keeps a complete one. The 400 and the 403 are the two
+// outcomes a request-inspecting predicate cannot model (coder/websocket
+// base64-decodes Sec-WebSocket-Key and requires 16 bytes; the origin check runs
+// inside Accept), which is why they are asserted field by field rather than by
+// count.
+func TestWithSkipUpgrades(t *testing.T) {
+	const wsRoute = "/ws"
+
+	cases := []struct {
+		name        string
+		target      string
+		handler     func(*testing.T) http.Handler
+		extraOpts   []webhttp.LogOption
+		wantRecords int
+		wantStatus  int
+	}{
+		{
+			name:    "completed upgrade through the writer is suppressed",
+			target:  wsRoute,
+			handler: wsUpgradeHandler,
+		},
+		{
+			name:    "hijack without a status is suppressed",
+			target:  wsRoute,
+			handler: wsBareHijackHandler,
+		},
+		{
+			name:        "malformed Sec-WebSocket-Key 400 on the same route is logged",
+			target:      wsRoute,
+			handler:     fixedHandler(statusHandler(http.StatusBadRequest)),
+			wantRecords: 1,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "disallowed origin 403 on the same route is logged",
+			target:      wsRoute,
+			handler:     fixedHandler(statusHandler(http.StatusForbidden)),
+			wantRecords: 1,
+			wantStatus:  http.StatusForbidden,
+		},
+		{
+			name:        "missing upgrade headers 426 on the same route is logged",
+			target:      wsRoute,
+			handler:     fixedHandler(statusHandler(http.StatusUpgradeRequired)),
+			wantRecords: 1,
+			wantStatus:  http.StatusUpgradeRequired,
+		},
+		{
+			name:        "explicit status before a hijack keeps its record",
+			target:      wsRoute,
+			handler:     statusThenHijackHandler(http.StatusOK),
+			wantRecords: 1,
+			wantStatus:  http.StatusOK,
+		},
+		{
+			name:        "ordinary 200 is unaffected",
+			target:      "/api/thing",
+			handler:     fixedHandler(okHandler()),
+			wantRecords: 1,
+			wantStatus:  http.StatusOK,
+		},
+		{
+			// No WriteHeader at all: net/http sends the implicit 200 the recorder
+			// defaults to, which is not 101, so the line is emitted as ever.
+			name:   "implicit 200 without WriteHeader is unaffected",
+			target: "/api/thing",
+			handler: fixedHandler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte("hello"))
+			})),
+			wantRecords: 1,
+			wantStatus:  http.StatusOK,
+		},
+		{
+			// A skip predicate is evaluated before the handler and bypasses the
+			// recorder, so it wins over any status: the 400 that WithSkipUpgrades
+			// alone would have logged stays silent.
+			name:      "a skip predicate still wins over the status rule",
+			target:    wsRoute,
+			handler:   fixedHandler(statusHandler(http.StatusBadRequest)),
+			extraOpts: []webhttp.LogOption{webhttp.WithSkipFunc(func(*http.Request) bool { return true })},
+		},
+		{
+			name:      "a skip path still wins over the status rule",
+			target:    wsRoute,
+			handler:   fixedHandler(statusHandler(http.StatusForbidden)),
+			extraOpts: []webhttp.LogOption{webhttp.WithSkipPaths(wsRoute)},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logCap := &captureHandler{}
+			var metricCalls int
+			opts := []webhttp.LogOption{
+				webhttp.WithLogger(slog.New(logCap)),
+				webhttp.WithSkipUpgrades(),
+				webhttp.WithClientIP(),
+				webhttp.WithRecordMetric(func(string, string, int, time.Duration) { metricCalls++ }),
+			}
+			h := webhttp.RequestLogger(tc.handler(t), append(opts, tc.extraOpts...)...)
+
+			w := &hijackableRecorder{ResponseRecorder: httptest.NewRecorder()}
+			h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, tc.target, nil))
+
+			recs := logCap.snapshot()
+			if len(recs) != tc.wantRecords {
+				t.Fatalf("emitted %d access lines, want %d", len(recs), tc.wantRecords)
+			}
+			// A suppressed record takes the metric hook with it, the same pairing
+			// WithSkipPaths has and for the same reason.
+			if metricCalls != tc.wantRecords {
+				t.Errorf("metric hook called %d times, want %d", metricCalls, tc.wantRecords)
+			}
+			// Every path through the middleware still mints and echoes an id.
+			if echoed := w.Header().Get(webhttp.HeaderRequestID); !webhttp.ValidRequestID(echoed) {
+				t.Errorf("echoed request id %q is not valid", echoed)
+			}
+			if tc.wantRecords == 0 {
+				return
+			}
+			m := attrsOf(recs[0])
+			if m["status"] != int64(tc.wantStatus) {
+				t.Errorf("logged status = %v, want %d", m["status"], tc.wantStatus)
+			}
+			if m["path"] != tc.target {
+				t.Errorf("logged path = %v, want %q", m["path"], tc.target)
+			}
+			if d, ok := m["duration_ms"].(int64); !ok || d < 0 {
+				t.Errorf("duration_ms = %v, want a non-negative int64", m["duration_ms"])
+			}
+			if id, _ := m["request_id"].(string); !webhttp.ValidRequestID(id) {
+				t.Errorf("request_id = %v, want a valid id", m["request_id"])
+			}
+			// httptest.NewRequest's peer, resolved by the spoof-proof ClientIP with
+			// no trusted proxies.
+			if m["client_ip"] != "192.0.2.1" {
+				t.Errorf("client_ip = %v, want 192.0.2.1", m["client_ip"])
+			}
+		})
+	}
+}
+
+// looksLikeUpgrade is the shape of predicate a consumer must write to skip
+// upgrades from the REQUEST: the RFC 6455 header signal plus GET, HTTP/1.1,
+// version 13, and exactly one Sec-WebSocket-Key field. Every condition is
+// necessary for a handshake to succeed, and they are still not sufficient.
+func looksLikeUpgrade(r *http.Request) bool {
+	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
+		strings.EqualFold(r.Header.Get("Connection"), "upgrade") &&
+		r.Method == http.MethodGet &&
+		r.ProtoAtLeast(1, 1) &&
+		r.Header.Get("Sec-WebSocket-Version") == "13" &&
+		len(r.Header.Values("Sec-WebSocket-Key")) == 1
+}
+
+// upgradeRequest builds a handshake that satisfies every condition a predicate
+// can check while carrying a Sec-WebSocket-Key that is valid base64 of the WRONG
+// length (12 bytes, not 16) — the exact input coder/websocket answers 400 for
+// and a predicate calls an upgrade.
+func upgradeRequest() *http.Request {
+	req := httptest.NewRequest(http.MethodGet, "/ws", nil)
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Sec-WebSocket-Version", "13")
+	req.Header.Set("Sec-WebSocket-Key", "AAAAAAAAAAAAAAAA")
+	return req
+}
+
+// TestWithSkipUpgrades_recordsTheRefusalAPredicateSuppresses is the regression
+// for the bug the option exists to fix, asserted with both wirings side by side
+// on the same request and the same response.
+func TestWithSkipUpgrades_recordsTheRefusalAPredicateSuppresses(t *testing.T) {
+	refused := statusHandler(http.StatusBadRequest) // what Accept answers for that key
+
+	predicting := &captureHandler{}
+	webhttp.RequestLogger(refused,
+		webhttp.WithLogger(slog.New(predicting)),
+		webhttp.WithSkipFunc(looksLikeUpgrade),
+	).ServeHTTP(httptest.NewRecorder(), upgradeRequest())
+
+	if n := len(predicting.snapshot()); n != 0 {
+		t.Fatalf("the predicting wiring emitted %d lines for the refused handshake, want 0; "+
+			"this test no longer models the bug WithSkipUpgrades fixes", n)
+	}
+
+	observing := &captureHandler{}
+	webhttp.RequestLogger(refused,
+		webhttp.WithLogger(slog.New(observing)),
+		webhttp.WithSkipUpgrades(),
+	).ServeHTTP(httptest.NewRecorder(), upgradeRequest())
+
+	recs := observing.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("got %d access lines for the refused handshake, want exactly 1", len(recs))
+	}
+	if m := attrsOf(recs[0]); m["status"] != int64(http.StatusBadRequest) {
+		t.Errorf("logged status = %v, want %d", m["status"], http.StatusBadRequest)
+	}
+}
+
+// TestWithSkipUpgrades_absentLeavesUpgradesLogged pins that the option is
+// additive: without it, a 101 keeps the line every existing consumer gets today.
+func TestWithSkipUpgrades_absentLeavesUpgradesLogged(t *testing.T) {
+	logCap := &captureHandler{}
+	h := webhttp.RequestLogger(wsUpgradeHandler(t), webhttp.WithLogger(slog.New(logCap)))
+
+	w := &hijackableRecorder{ResponseRecorder: httptest.NewRecorder()}
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/ws", nil))
+
+	recs := logCap.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("got %d access lines without the option, want exactly 1", len(recs))
+	}
+	if m := attrsOf(recs[0]); m["status"] != int64(http.StatusSwitchingProtocols) {
+		t.Errorf("logged status = %v, want %d", m["status"], http.StatusSwitchingProtocols)
+	}
+}
+
+// TestWithSkipUpgrades_panicAfterTheSwitchIsStillLogged pins the godoc claim
+// that suppressing the record does not hide a crash mid-session: Recoverer logs
+// the panic and its stack from its own line, which is where a failure after the
+// handshake belongs — the access line it would have paired with says 101, since
+// the status was decided at the handshake, not at the crash.
+func TestWithSkipUpgrades_panicAfterTheSwitchIsStillLogged(t *testing.T) {
+	logCap := &captureHandler{}
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusSwitchingProtocols)
+		hijackThroughWriter(t, w)
+		panic("session boom")
+	})
+	h := webhttp.Chain(next,
+		webhttp.Logging(webhttp.WithLogger(slog.New(logCap)), webhttp.WithSkipUpgrades()),
+		webhttp.Recoverer(webhttp.WithRecoverLogger(slog.New(logCap))),
+	)
+
+	w := &hijackableRecorder{ResponseRecorder: httptest.NewRecorder()}
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/ws", nil))
+
+	recs := logCap.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("got %d log records, want exactly 1 (Recoverer's panic line, no access line)", len(recs))
+	}
+	if recs[0].Message == "http" {
+		t.Errorf("the one line emitted is the access line; a suppressed upgrade must not emit one")
+	}
+	if m := attrsOf(recs[0]); m["panic"] != "session boom" {
+		t.Errorf("recovered panic attr = %v, want %q", m["panic"], "session boom")
 	}
 }
 
