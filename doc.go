@@ -19,10 +19,12 @@
 //   - a composable middleware set: an ordering combinator (Chain), a panic
 //     recoverer (Recoverer), baseline response security headers
 //     (SecurityHeaders), access logging as middleware (Logging), a JSON
-//     per-route timeout (RouteTimeout), and a shared token-bucket rate
+//     per-route timeout (RouteTimeout), a shared token-bucket rate
 //     limiter (RateLimiter, with the SessionCreateRateLimit preset for
-//     heavy-child-spawning create endpoints), plus a spoof-aware client-IP
-//     resolver that
+//     heavy-child-spawning create endpoints), and a fixed
+//     Cache-Control: no-store setter for dynamic surfaces (NoStore, whose
+//     placement and override ordering stay app-owned), plus a spoof-aware
+//     client-IP resolver that
 //     reads X-Forwarded-For only from trusted proxy hops (ClientIP),
 //   - an exact-match Host allowlist against DNS rebinding: an immutable
 //     parsed policy (ParseHostList, HostPolicy) applied as middleware or
@@ -50,7 +52,13 @@
 //     host:port at all — with the malformed-input decision left to the app
 //     (ClassifyBind, ClassifyBindHost, BindClass),
 //   - an HTTP readiness gate for load balancers (Ready, ReadinessHandler),
-//   - a graceful server bootstrap (NewServer, Run).
+//   - a graceful server bootstrap (NewServer, Run) with net/http's own
+//     connection-level lines routed into slog at a caller-chosen level
+//     (WithSlogErrorLog), a grace expiry identifiable by its origin rather
+//     than by a bare deadline error (ErrShutdownGraceExpired), a bounded
+//     teardown wait that cannot misreport a completion as a timeout
+//     (AwaitDone), and a cause-aware predicate for telling a routine
+//     cancellation apart from a coincident fault (CausedByCancellation).
 //
 // The middleware share the standard func(http.Handler) http.Handler shape (the
 // Middleware alias) and compose with Chain, whose first-listed entry is the
