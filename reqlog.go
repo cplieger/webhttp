@@ -83,6 +83,7 @@ type logConfig struct {
 	clientIPTrusted []*net.IPNet
 	maxLoggedPath   int
 	logClientIP     bool
+	skipUpgrades    bool
 }
 
 // LogOption configures RequestLogger.
@@ -119,6 +120,79 @@ func WithSkipPaths(paths ...string) LogOption {
 // that an exact WithSkipPaths match cannot cover.
 func WithSkipFunc(fn func(*http.Request) bool) LogOption {
 	return func(c *logConfig) { c.skipFunc = fn }
+}
+
+// WithSkipUpgrades suppresses the access record for a request whose response
+// SWITCHED PROTOCOLS — and for nothing else. It is what a WebSocket route
+// should use instead of a WithSkipFunc predicate that PREDICTS which requests
+// will upgrade.
+//
+// The decision comes from the response, not from the request. The record is
+// suppressed when the recorded status is 101 (the handshake went through the
+// ResponseWriter, as coder/websocket's WriteHeader(101)-then-hijack does) or
+// when the handler hijacked the connection before recording anything at all
+// (the handler wrote the handshake onto the connection itself, as
+// gorilla/websocket does). Those are the two shapes a completed upgrade takes,
+// and in both the exchange has ENDED rather than completed, so the one line
+// that would be emitted when the socket finally closes — hours later, carrying
+// a session-length duration and a status net/http never sent — describes
+// something that never happened. Every OTHER outcome on the same route keeps
+// its record with its real status, duration, request id, and client ip: the 400
+// for a malformed Sec-WebSocket-Key, the 403 for a disallowed origin, the 405
+// for a non-GET, the 426 for missing upgrade headers. Those refusals are what
+// an operator greps for when a browser cannot attach or a reverse proxy mangles
+// a handshake.
+//
+// Why the decision belongs here: a skip predicate has to answer before the
+// handler runs, so it must model the handshake policy of whichever library will
+// answer the request, and it drifts when that library changes. A consumer's
+// predicate checked that Sec-WebSocket-Key was present exactly once;
+// coder/websocket base64-decodes that header and requires exactly 16 bytes,
+// answering 400 otherwise, so every malformed-key 400 was suppressed as if it
+// had upgraded — as was the cross-origin 403 the same predicate could not model
+// — losing status, duration, request id, and client ip for exactly the refused
+// requests worth seeing. The fact the predicate was guessing at is known HERE,
+// once the response exists.
+//
+// The interaction with the skip options is one-way. WithSkipPaths and
+// WithSkipFunc are evaluated before the handler and bypass the recorder
+// entirely, so a request either of them matches is skipped whatever status it
+// ends up with, and this option cannot bring its record back. This option only
+// ever REMOVES a record that would otherwise have been emitted.
+//
+// Suppression removes the whole record, the same pairing WithSkipPaths has and
+// for the same reason: no access line and no metric hook, and neither the
+// WithLogLevel policy nor a WithPathFunc / WithTemplatePathsUnder transform is
+// consulted. The request id is still minted, echoed, and threaded, as on every
+// path through this middleware. A handler that PANICS after the switch is not
+// hidden by that: Recoverer logs the panic and its stack from its own line,
+// which is where a crash mid-session belongs — the access line it would
+// otherwise pair with says 101, not 500, because the status was decided at the
+// handshake.
+//
+// Two boundaries, because both KEEP their record:
+//
+//   - A handler that never calls WriteHeader records the implicit 200 net/http
+//     sends. That is not 101, so an ordinary request that writes only a body is
+//     logged exactly as it is without this option.
+//   - A handler that writes an explicit status and THEN hijacks (an HTTP CONNECT
+//     tunnel answering 200) keeps its record with that status: it told us what
+//     it answered, and only 101 says "this is no longer an HTTP exchange". A
+//     consumer that wants such a tunnel silent still has WithSkipFunc, whose
+//     prediction problem does not apply to a test on the method.
+//
+// It takes no status argument on purpose. 101 is the one status that means the
+// exchange ended rather than completed, so a general skip-these-statuses option
+// would add exactly one capability: silencing refusals. A 404 flood is a broken
+// route and a 401 flood is an attack, and deleting their records is CWE-778
+// rather than noise control — which WithLogLevel (or the ProbeLogLevel preset)
+// already does properly, by lowering a line's level instead of removing it.
+//
+// HTTP/2's extended-CONNECT upgrade (RFC 8441) answers 2xx rather than 101 and
+// is deliberately out of scope; it cannot arise for this option's audience
+// anyway, since a server that hijacks to speak WebSocket needs HTTP/1.1.
+func WithSkipUpgrades() LogOption {
+	return func(c *logConfig) { c.skipUpgrades = true }
 }
 
 // redactedPathFallback is the fail-closed placeholder recorded as the path
@@ -740,6 +814,14 @@ func (c *logConfig) resolveClientIP(r *http.Request) string {
 // the client_ip attribute is omitted, or the metric is skipped — mirroring
 // Recoverer's isolation of its WithPanicHook.
 func (c *logConfig) emitAccessLog(rec *StatusRecorder, r *http.Request, path, id string, start time.Time) {
+	// The suppression test comes first, so a suppressed record costs no
+	// path transform, no client-ip resolution, no level policy, and no metric
+	// hook. The fact it reads was latched when the handler wrote 101 (or
+	// hijacked), not now: this defer only runs when the handler returns, which
+	// for a live WebSocket is when the socket closes.
+	if c.skipUpgrades && rec.switchedProtocol() {
+		return
+	}
 	d := time.Since(start)
 	status := rec.Status()
 	if c.pathFunc != nil {
@@ -911,7 +993,11 @@ func (c *logConfig) safeRecordMetric(r *http.Request, path string, status int, d
 //
 // A request matched by WithSkipPaths or WithSkipFunc still gets an id minted,
 // echoed, and threaded, but is served through the raw writer with no recorder,
-// no access-log line, and no metric hook.
+// no access-log line, and no metric hook. WithSkipUpgrades removes the record of
+// a request that actually SWITCHED PROTOCOLS (a completed WebSocket handshake),
+// decided from the response instead of predicted from the request, so every
+// refusal on the same route keeps its line; it can only remove a record, never
+// restore one a skip rule dropped.
 //
 // The access-log line and metric hook are emitted from a deferred call, so a
 // handler that panics is still logged (the status shows the recorded value)
