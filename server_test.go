@@ -2,11 +2,15 @@ package webhttp_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -529,8 +533,13 @@ func TestRun_returnsShutdownDeadlineExceeded(t *testing.T) {
 		if err == nil {
 			t.Fatal("Run = nil, want shutdown deadline exceeded when in-flight requests outlive the grace period")
 		}
-		if got, want := err.Error(), context.DeadlineExceeded.Error(); got != want {
-			t.Fatalf("Run error = %q, want %q", got, want)
+		// Both facts hold: the wrapped context.DeadlineExceeded (the pre-existing
+		// contract) and the origin marker that says WHICH deadline it was.
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Run error = %v, want it to wrap context.DeadlineExceeded", err)
+		}
+		if !errors.Is(err, webhttp.ErrShutdownGraceExpired) {
+			t.Errorf("Run error = %v, want it to wrap ErrShutdownGraceExpired", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return after shutdown grace expired")
@@ -639,5 +648,282 @@ func TestRun_preDrainRunsBeforeShutdownDrain(t *testing.T) {
 func TestRun_nilPreDrainIgnored(t *testing.T) {
 	if err := runAndShutdown(t, webhttp.WithPreDrain(nil)); err != nil {
 		t.Errorf("Run with WithPreDrain(nil) = %v, want nil", err)
+	}
+}
+
+func TestWithSlogErrorLog_bridgesNetHTTPLinesIntoSlog(t *testing.T) {
+	// slog.Default is process-global, so this test must not run in parallel.
+	capture := &captureHandler{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(capture))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	srv := webhttp.NewServer(nil, webhttp.WithSlogErrorLog(slog.LevelWarn))
+	if srv.ErrorLog == nil {
+		t.Fatal("WithSlogErrorLog did not set http.Server.ErrorLog")
+	}
+	// Stand in for net/http's own connection-level line.
+	srv.ErrorLog.Print("http: Accept error: too many open files; retrying")
+
+	records := capture.snapshot()
+	if len(records) != 1 {
+		t.Fatalf("captured %d records, want 1", len(records))
+	}
+	if records[0].Level != slog.LevelWarn {
+		t.Errorf("level = %v, want %v (the caller's chosen level)", records[0].Level, slog.LevelWarn)
+	}
+	if !strings.Contains(records[0].Message, "Accept error") {
+		t.Errorf("message = %q, want it to carry net/http's line", records[0].Message)
+	}
+}
+
+func TestWithSlogErrorLog_lastAppliedWins(t *testing.T) {
+	prev := slog.Default()
+	slog.SetDefault(slog.New(&captureHandler{}))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	// WithErrorLog remains the override for a custom logger.
+	custom := log.New(io.Discard, "", 0)
+	srv := webhttp.NewServer(nil, webhttp.WithSlogErrorLog(slog.LevelError), webhttp.WithErrorLog(custom))
+	if srv.ErrorLog != custom {
+		t.Error("WithErrorLog did not override an earlier WithSlogErrorLog")
+	}
+}
+
+func TestNewServer_errorLogDefaultUnchanged(t *testing.T) {
+	// Neither option passed: the default stays net/http's standard logger (nil),
+	// so the additions change no existing default.
+	if srv := webhttp.NewServer(nil); srv.ErrorLog != nil {
+		t.Errorf("ErrorLog = %v, want nil (net/http's standard logger)", srv.ErrorLog)
+	}
+}
+
+func TestAwaitDone_reportsCompletion(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+
+	if !webhttp.AwaitDone(t.Context(), done) {
+		t.Error("AwaitDone = false, want true when done is already closed")
+	}
+}
+
+func TestAwaitDone_reportsExpiry(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	if webhttp.AwaitDone(ctx, make(chan struct{})) {
+		t.Error("AwaitDone = true, want false when the budget runs out first")
+	}
+}
+
+func TestAwaitDone_completionWinsWhenBothReadyAtOnce(t *testing.T) {
+	// The case the post-expiry recheck exists for: a drain that consumed the
+	// whole grace hands the teardown an ALREADY-EXPIRED context, so both select
+	// cases are ready and the choice is pseudo-random. Without the recheck this
+	// reports a teardown that DID finish as still running, roughly half the time.
+	done := make(chan struct{})
+	close(done)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	for i := range 500 {
+		if !webhttp.AwaitDone(ctx, done) {
+			t.Fatalf("AwaitDone = false on iteration %d; a completion that landed with the expiry must win", i)
+		}
+	}
+}
+
+func TestAwaitDone_nilChannelIsBoundedByContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if webhttp.AwaitDone(ctx, nil) {
+		t.Error("AwaitDone = true, want false: a nil channel never becomes ready")
+	}
+}
+
+func TestAwaitDone_waitsForALateCompletion(t *testing.T) {
+	done := make(chan struct{})
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		close(done)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	if !webhttp.AwaitDone(ctx, done) {
+		t.Error("AwaitDone = false, want true: it must block for a completion still inside the budget")
+	}
+}
+
+func TestCausedByCancellation(t *testing.T) {
+	liveCtx := t.Context()
+
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	expiredCtx, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancelExpired()
+
+	// A cause that does NOT wrap context.Canceled: the shape net/http surfaces
+	// verbatim, which a ctx.Err()-only check would miss.
+	customCause := errors.New("listener torn down by the supervisor")
+	causeCtx, cancelCause := context.WithCancelCause(context.Background())
+	cancelCause(customCause)
+	defer cancelCause(nil)
+
+	var nilCtx context.Context
+
+	tests := map[string]struct {
+		ctx  context.Context
+		err  error
+		want bool
+	}{
+		"live context, real fault":         {liveCtx, errors.New("bind: address already in use"), false},
+		"live context, canceled-ish error": {liveCtx, context.Canceled, false},
+		"cancelled context, nil error":     {cancelledCtx, nil, false},
+		"cancelled context, its own error": {cancelledCtx, context.Canceled, true},
+		"cancelled context, wrapped":       {cancelledCtx, fmt.Errorf("binding :9190: %w", context.Canceled), true},
+		"cancelled context, real fault":    {cancelledCtx, errors.New("bind: address already in use"), false},
+		"expired context, its own error":   {expiredCtx, fmt.Errorf("drain: %w", context.DeadlineExceeded), true},
+		"expired context, real fault":      {expiredCtx, errors.New("bind: address already in use"), false},
+		"cause-only error":                 {causeCtx, fmt.Errorf("serve: %w", customCause), true},
+		"cause context, unrelated fault":   {causeCtx, errors.New("bind: address already in use"), false},
+		"nil context":                      {nilCtx, context.Canceled, false},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := webhttp.CausedByCancellation(tc.ctx, tc.err); got != tc.want {
+				t.Errorf("CausedByCancellation() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// fatalAcceptListener substitutes its own fatal error for whatever the wrapped
+// listener's Accept reports, and signals when Serve returns (Serve closes the
+// listener through a deferred Close on its way out, after it has already decided
+// which error to return). That signal is what makes the precedence test
+// deterministic: the pre-drain hook can wait for Serve to have committed to the
+// fatal error BEFORE Run reaches srv.Shutdown, which is the only window in which
+// net/http reports a serve error rather than ErrServerClosed.
+type fatalAcceptListener struct {
+	net.Listener
+	fatal      error
+	serveDone  chan struct{}
+	closedOnce sync.Once
+}
+
+func (l *fatalAcceptListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, l.fatal
+	}
+	return c, nil
+}
+
+func (l *fatalAcceptListener) Close() error {
+	l.closedOnce.Do(func() { close(l.serveDone) })
+	return l.Listener.Close()
+}
+
+// A real Serve error still takes precedence over the shutdown error, and stays
+// matchable: the grace-expiry marker must not displace it, and must not be
+// attached to it.
+func TestRun_serveErrorTakesPrecedenceOverGraceExpiry(t *testing.T) {
+	inner, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	fatal := errors.New("accept loop is gone")
+	ln := &fatalAcceptListener{Listener: inner, fatal: fatal, serveDone: make(chan struct{})}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var released atomic.Bool
+	releaseHandler := func() {
+		if released.CompareAndSwap(false, true) {
+			close(release)
+		}
+	}
+	t.Cleanup(releaseHandler)
+
+	// The handler stays in-flight so srv.Shutdown cannot finish inside the grace,
+	// which is what makes the shutdown error a grace expiry.
+	srv := webhttp.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(entered)
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(func() { _ = srv.Close() })
+
+	preDrain := func(context.Context) {
+		// Break the accept loop while the server is not yet shutting down, so
+		// Serve returns the fatal error instead of ErrServerClosed, and wait until
+		// it has done so.
+		_ = inner.Close()
+		select {
+		case <-ln.serveDone:
+		case <-time.After(2 * time.Second):
+			t.Error("Serve did not return after the accept loop broke")
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- webhttp.Run(ctx, srv, ln, nil,
+			webhttp.WithShutdownGrace(100*time.Millisecond), webhttp.WithPreDrain(preDrain))
+	}()
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	requestDone := make(chan struct{})
+	go func() {
+		defer close(requestDone)
+		resp, err := client.Get("http://" + inner.Addr().String() + "/")
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		cancel()
+		t.Fatal("handler never became in-flight")
+	}
+
+	cancel()
+
+	var runErr error
+	select {
+	case runErr = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return")
+	}
+
+	if !errors.Is(runErr, fatal) {
+		t.Fatalf("Run = %v, want the serve error %v (it takes precedence and stays matchable)", runErr, fatal)
+	}
+	if errors.Is(runErr, webhttp.ErrShutdownGraceExpired) {
+		t.Error("the serve error was marked as a grace expiry; the marker belongs to the shutdown error only")
+	}
+
+	releaseHandler()
+	select {
+	case <-requestDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight request did not finish after release")
+	}
+}
+
+func TestRun_cleanShutdownIsNotMarkedAsGraceExpiry(t *testing.T) {
+	err := runAndShutdown(t, webhttp.WithShutdownGrace(2*time.Second))
+	if err != nil {
+		t.Fatalf("Run = %v, want nil on a clean graceful stop", err)
+	}
+	if errors.Is(err, webhttp.ErrShutdownGraceExpired) {
+		t.Error("a clean stop was marked as a grace expiry")
 	}
 }
