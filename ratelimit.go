@@ -13,9 +13,10 @@ type RateLimitOption func(*rateLimitConfig)
 
 // rateLimitConfig holds resolved RateLimiter configuration.
 type rateLimitConfig struct {
-	when func(*http.Request) bool
-	code string
-	msg  string
+	when      func(*http.Request) bool
+	responder ErrorResponder
+	code      string
+	msg       string
 }
 
 // WithRateLimitError sets the error code and message written in the 429 JSON
@@ -24,6 +25,24 @@ type rateLimitConfig struct {
 func WithRateLimitError(code, msg string) RateLimitOption {
 	return func(c *rateLimitConfig) {
 		c.code, c.msg = code, msg
+	}
+}
+
+// WithRateLimitResponder sets the ErrorResponder that writes the 429 body when a
+// request is denied. It defaults to WriteError - the JSON envelope; supply one
+// to render the 429 on a different content type, for example an XML endpoint
+// returning its own error document. The responder owns writing the status and
+// headers (the Retry-After hint is already set on w when it runs). A nil
+// responder is ignored, keeping the default.
+//
+// It composes with WithRateLimitError rather than replacing it: the code and
+// message that option sets are the ones handed to the responder, so an app keeps
+// one error taxonomy across both renderings.
+func WithRateLimitResponder(fn ErrorResponder) RateLimitOption {
+	return func(c *rateLimitConfig) {
+		if fn != nil {
+			c.responder = fn
+		}
 	}
 }
 
@@ -46,9 +65,10 @@ func WithRateLimitWhen(pred func(*http.Request) bool) RateLimitOption {
 // accrue one token (the refill cadence). Each admitted request consumes one
 // token; a request that arrives with the bucket empty is answered with a 429
 // via WriteError(w, r, http.StatusTooManyRequests, "rate_limited", "rate limit
-// exceeded") (code and message overridable with WithRateLimitError) and does
-// not reach the next handler. The 429 carries a conservative Retry-After hint:
-// the whole seconds for the CURRENT token deficit to refill at the configured
+// exceeded") (code and message overridable with WithRateLimitError, the
+// rendering with WithRateLimitResponder) and does not reach the next handler.
+// The 429 carries a conservative Retry-After hint: the whole seconds for the
+// CURRENT token deficit to refill at the configured
 // rate — at most ceil(interval) when the bucket was just emptied, less when it
 // is already partially refilled — clamped to at least 1s.
 //
@@ -85,6 +105,9 @@ func RateLimiter(burst int, interval time.Duration, opts ...RateLimitOption) Mid
 			o(c)
 		}
 	}
+	if c.responder == nil {
+		c.responder = WriteError
+	}
 	// Convert at the seam, leaving the tokenBucket internals in refillPerSec
 	// terms: interval > 0 and finite (an int64 duration) and burst >= 1, so
 	// refillPerSec is always finite and positive and float64(burst) >= 1 — no
@@ -99,7 +122,7 @@ func RateLimiter(burst int, interval time.Duration, opts ...RateLimitOption) Mid
 			}
 			if ok, retryAfter := b.allow(); !ok {
 				w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
-				WriteError(w, r, http.StatusTooManyRequests, c.code, c.msg)
+				c.responder(w, r, http.StatusTooManyRequests, c.code, c.msg)
 				return
 			}
 			next.ServeHTTP(w, r)
