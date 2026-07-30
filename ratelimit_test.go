@@ -109,6 +109,149 @@ func TestRateLimiter429Envelope(t *testing.T) {
 	}
 }
 
+// TestRateLimiter429DefaultRenderingUnchanged pins the zero-option default now
+// that the rendering is a hook: with no WithRateLimitResponder the 429 is still
+// the JSON WriteError envelope with the default code and message, on a JSON
+// content type, alongside the Retry-After hint.
+func TestRateLimiter429DefaultRenderingUnchanged(t *testing.T) {
+	hits := 0
+	h := RateLimiter(1, 100*time.Second)(okHandler(&hits))
+
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/x", nil))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/x", nil))
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json (the default rendering)", ct)
+	}
+	if ra := rec.Header().Get("Retry-After"); ra == "" {
+		t.Error("Retry-After is empty, want a whole-second hint on the default rendering")
+	}
+	var env ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("body is not the JSON error envelope: %v (body=%q)", err, rec.Body.String())
+	}
+	if env.Code != "rate_limited" || env.Error != "rate limit exceeded" {
+		t.Errorf("envelope = %+v, want code=rate_limited error=%q", env, "rate limit exceeded")
+	}
+}
+
+// TestRateLimiterCustomResponder covers WithRateLimitResponder: the responder is
+// invoked with the 429 status and the configured code and message, its body is
+// what reaches the client (no JSON envelope beside it), the Retry-After hint is
+// already set when it runs, and an ADMITTED request never calls it.
+func TestRateLimiterCustomResponder(t *testing.T) {
+	var calls int
+	var gotStatus int
+	var gotCode, gotMsg, gotRetryAfter string
+	responder := func(w http.ResponseWriter, _ *http.Request, status int, code, msg string) {
+		calls++
+		gotStatus, gotCode, gotMsg = status, code, msg
+		gotRetryAfter = w.Header().Get("Retry-After")
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(`<error code="` + code + `">` + msg + `</error>`))
+	}
+	hits := 0
+	h := RateLimiter(1, 100*time.Second, WithRateLimitResponder(responder))(okHandler(&hits))
+
+	// The admitted request must not reach the responder.
+	admitted := httptest.NewRecorder()
+	h.ServeHTTP(admitted, httptest.NewRequest(http.MethodPost, "/x", nil))
+	if admitted.Code != http.StatusOK || calls != 0 {
+		t.Fatalf("admitted request: status = %d, responder calls = %d, want 200 and 0", admitted.Code, calls)
+	}
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/x", nil))
+
+	if calls != 1 {
+		t.Fatalf("responder called %d times on a throttled request, want 1", calls)
+	}
+	if gotStatus != http.StatusTooManyRequests {
+		t.Errorf("responder status = %d, want 429", gotStatus)
+	}
+	if gotCode != "rate_limited" || gotMsg != "rate limit exceeded" {
+		t.Errorf("responder args = (%q, %q), want (rate_limited, rate limit exceeded)", gotCode, gotMsg)
+	}
+	if gotRetryAfter == "" {
+		t.Error("responder saw no Retry-After header, want the hint already set")
+	}
+	if rec.Code != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/xml" {
+		t.Errorf("Content-Type = %q, want application/xml (custom responder)", ct)
+	}
+	if got, want := rec.Body.String(), `<error code="rate_limited">rate limit exceeded</error>`; got != want {
+		t.Errorf("body = %q, want %q (the responder's body is what reaches the client)", got, want)
+	}
+	if hits != 1 {
+		t.Errorf("next handler ran %d times, want 1 (a throttled request never reaches it)", hits)
+	}
+}
+
+// TestRateLimiterResponderComposesWithRateLimitError pins that the two options
+// stack rather than displace each other: the code and message set by
+// WithRateLimitError are the ones handed to a custom responder, so an app keeps
+// one error taxonomy across both renderings.
+func TestRateLimiterResponderComposesWithRateLimitError(t *testing.T) {
+	var gotCode, gotMsg string
+	responder := func(w http.ResponseWriter, _ *http.Request, status int, code, msg string) {
+		gotCode, gotMsg = code, msg
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(code + ": " + msg))
+	}
+	hits := 0
+	h := RateLimiter(1, 100*time.Second,
+		WithRateLimitError("session_rate", "too many sessions"),
+		WithRateLimitResponder(responder),
+	)(okHandler(&hits))
+
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/x", nil))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/x", nil))
+
+	if gotCode != "session_rate" || gotMsg != "too many sessions" {
+		t.Errorf("responder args = (%q, %q), want (session_rate, too many sessions)", gotCode, gotMsg)
+	}
+	if rec.Code != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429", rec.Code)
+	}
+	if got, want := rec.Body.String(), "session_rate: too many sessions"; got != want {
+		t.Errorf("body = %q, want %q", got, want)
+	}
+}
+
+// TestRateLimiterNilResponderKeepsJSONDefault mirrors Recoverer's nil-option
+// contract: a nil responder is ignored, so the JSON WriteError default stands.
+func TestRateLimiterNilResponderKeepsJSONDefault(t *testing.T) {
+	hits := 0
+	h := RateLimiter(1, 100*time.Second, WithRateLimitResponder(nil))(okHandler(&hits))
+
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/x", nil))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/x", nil))
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json (nil responder keeps the default)", ct)
+	}
+	var env ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("body is not the JSON error envelope: %v (body=%q)", err, rec.Body.String())
+	}
+	if env.Code != "rate_limited" || env.Error != "rate limit exceeded" {
+		t.Errorf("envelope = %+v, want the default rate_limited envelope", env)
+	}
+}
+
 // TestRateLimiter429SetsRetryAfter pins the conservative whole-second
 // Retry-After header on throttled 429s: a fractional interval rounds up (ceil),
 // and a sub-second interval clamps to the 1s floor.
