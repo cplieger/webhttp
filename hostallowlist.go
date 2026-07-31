@@ -318,6 +318,55 @@ func (p *HostPolicy) Middleware() Middleware {
 	}
 }
 
+// LoopbackRequest reports whether a request is genuinely local: its socket PEER
+// is loopback AND its Host header names the local host. Both legs are required,
+// so either one failing refuses. It is the route-level gate for a loopback-only
+// surface on an otherwise-unauthenticated port — an in-container agent running
+// curl localhost:PORT, an operator repair hook — and it decides admission only:
+// the refusal's status, envelope and wording stay with the caller, as does any
+// ADDITIONAL deny the app layers on top.
+//
+// It consults exactly two fields, r.RemoteAddr and r.Host, and nothing else. The
+// forwarded headers (X-Forwarded-For, X-Forwarded-Host, Forwarded) are IGNORED
+// in both directions: their presence can never admit a request, and never
+// refuse one either. That asymmetry is what makes the answer trustworthy —
+// RemoteAddr is set by the server from the accepted connection
+// (net.Conn.RemoteAddr().String()), so it cannot be spoofed at this layer, while
+// any header can be. An app that wants to REFUSE on proxy provenance composes
+// that deny around this predicate rather than finding it folded in.
+//
+// Both legs fail CLOSED. A RemoteAddr that does not split as host:port (a
+// portless value from a non-stdlib caller, an empty string) or whose host
+// net.ParseIP refuses is not a loopback peer; a Host that CanonicalHost rejects
+// canonicalizes to "" and names nothing. The Host leg accepts every well-formed
+// spelling CanonicalHost collapses: "localhost" in any case, with or without a
+// port or one trailing FQDN dot, 127.0.0.0/8, ::1, and bracketed IPv6 with or
+// without a port.
+//
+// The CONJUNCTION is the reusable unit, which is why it is what this library
+// exports. A bare peer-only predicate is withheld BY DESIGN (see BindClass's
+// rule: a peer is classified internally where a feature's own contract needs it,
+// never handed out loose), because the peer leg alone invites exactly the misuse
+// this export replaces. A DNS-rebound page reaches a server sharing its loopback
+// interface with a LOOPBACK socket peer and the ATTACKER's name in Host, so a
+// peer-only gate admits it (CWE-346); and after rebinding Origin and Host agree,
+// so a same-origin check does not catch it either. Requiring the Host leg in the
+// same call is what makes the shared unit safe to reach for — two separately
+// exported halves would let a consumer ship half the check and believe it had
+// the gate.
+//
+// This is NOT HostPolicy, and cannot be assembled from one. HostPolicy evaluates
+// its Host-only allowlist BEFORE the two-legged loopback exemption (Allows
+// checks the allowlist map first), so a REMOTE caller sending Host: localhost is
+// ADMITTED whenever that name is allowed — precisely the caller this predicate
+// must refuse, and a name an operator has every reason to allow so their own
+// browser reaches the service. An inactive policy (unset configuration) admits
+// everything besides. The allowlist answers "is this Host one the operator
+// named"; this answers "did this request come from inside".
+func LoopbackRequest(r *http.Request) bool {
+	return isLoopbackPeer(r.RemoteAddr) && isLoopbackHost(CanonicalHost(r.Host))
+}
+
 // isLoopbackHost reports whether a CanonicalHost-normalized value names the
 // local host: the literal "localhost" or any loopback IP (127.0.0.0/8, ::1).
 func isLoopbackHost(canon string) bool {

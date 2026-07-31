@@ -64,6 +64,153 @@ func TestCanonicalHost(t *testing.T) {
 	}
 }
 
+// TestLoopbackRequest pins the composite predicate's contract: both legs
+// required, forwarded headers ignored in BOTH directions, and fail-closed on
+// anything unparseable in either leg. The motivating case — a REMOTE peer
+// sending Host: localhost — is asserted explicitly, since it is the request a
+// peer-only gate (and, per the subtest below, a Host allowlist) admits.
+func TestLoopbackRequest(t *testing.T) {
+	// The request URL is a fixed placeholder; the predicate reads req.Host,
+	// assigned raw so malformed wire values reach it unrepaired (building a URL
+	// from them would panic in NewRequest before the predicate ran).
+	build := func(host, remoteAddr string) *http.Request {
+		req := httptest.NewRequest(http.MethodGet, "http://placeholder/x", http.NoBody)
+		req.Host = host
+		req.RemoteAddr = remoteAddr
+		return req
+	}
+
+	cases := []struct {
+		name, host, remoteAddr string
+		want                   bool
+	}{
+		// Both legs loopback: the in-container caller this gate exists for.
+		{"ipv4 peer + ipv4 Host", "127.0.0.1:9848", "127.0.0.1:5000", true},
+		{"ipv4 peer + localhost name (the documented curl shape)", "localhost:9848", "127.0.0.1:5000", true},
+		{"portless name Host", "localhost", "127.0.0.1:5000", true},
+		{"portless ipv4 Host", "127.0.0.1", "127.0.0.1:5000", true},
+		{"case-folded name Host", "LocalHost:9848", "127.0.0.1:5000", true},
+		{"trailing-dot fqdn Host", "localhost.:9848", "127.0.0.1:5000", true},
+		{"127/8 is loopback, not just 127.0.0.1", "127.9.9.9:9848", "127.0.0.5:5000", true},
+		{"bracketed ipv6 Host + ipv6 peer", "[::1]:9848", "[::1]:5000", true},
+		{"bare ipv6 Host (no port possible)", "::1", "[::1]:5000", true},
+		{"expanded ipv6 spelling", "0:0:0:0:0:0:0:1", "[::1]:5000", true},
+		{"v4-mapped bracketed ipv6 Host", "[::ffff:127.0.0.1]:9848", "127.0.0.1:5000", true},
+
+		// The Host leg alone refusing. A DNS-rebound page reaches a same-host
+		// server with a LOOPBACK socket peer and the attacker's own name in
+		// Host, so dropping this leg reopens CWE-346.
+		{"loopback peer + attacker Host", "attacker.evil:9848", "127.0.0.1:5000", false},
+		{"loopback peer + LAN name Host", "kiro.lan", "127.0.0.1:5000", false},
+		{"loopback peer + decorated name Host", "localhost.evil.example", "127.0.0.1:5000", false},
+		{"loopback peer + decorated literal Host", "127.0.0.1.evil.example", "127.0.0.1:5000", false},
+
+		// The peer leg alone refusing — THE motivating case. A remote client
+		// can put anything in Host, so a Host-only decision admits it.
+		{"remote peer + Host localhost", "localhost:9848", "203.0.113.9:5000", false},
+		{"remote peer + Host 127.0.0.1", "127.0.0.1:9848", "203.0.113.9:5000", false},
+		{"remote peer + Host [::1]", "[::1]:9848", "[2001:db8::1]:5000", false},
+		{"remote peer + remote Host", "webterm.example.com:9848", "203.0.113.9:5000", false},
+
+		// Unparseable RemoteAddr fails closed: a portless or malformed value
+		// would otherwise let a non-stdlib caller widen the gate.
+		{"portless peer", "localhost:9848", "127.0.0.1", false},
+		{"empty peer", "localhost:9848", "", false},
+		{"non-address peer", "localhost:9848", "not-an-addr", false},
+		{"non-ip peer host", "localhost:9848", "not-an-ip:1234", false},
+		{"unbracketed ipv6 peer (too many colons)", "localhost:9848", "::1:5000", false},
+
+		// Unparseable or empty Host fails closed: CanonicalHost returns "",
+		// which names nothing, and is never repaired into a match.
+		{"empty Host", "", "127.0.0.1:5000", false},
+		{"Host with garbage port", "127.0.0.1:garbage", "127.0.0.1:5000", false},
+		{"bracketed name Host (brackets are ipv6-only)", "[localhost]", "127.0.0.1:5000", false},
+		{"multi-colon port Host", "localhost:garbage:443", "127.0.0.1:5000", false},
+		{"double trailing dot Host", "localhost..", "127.0.0.1:5000", false},
+		{"pasted url Host", "http://localhost:9848/x", "127.0.0.1:5000", false},
+		{"leading-zero literal Host is not repaired", "127.0.0.001:9848", "127.0.0.1:5000", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := webhttp.LoopbackRequest(build(tc.host, tc.remoteAddr)); got != tc.want {
+				t.Errorf("LoopbackRequest(Host %q, peer %q) = %v, want %v", tc.host, tc.remoteAddr, got, tc.want)
+			}
+		})
+	}
+
+	// Forwarded headers are ignored in BOTH directions. Their presence must not
+	// ADMIT (the header is client-controlled, so honoring it would hand a remote
+	// caller the gate) and must not REFUSE either (an app that wants a
+	// provenance deny composes it around this predicate; folding it in here
+	// would make that policy the library's).
+	t.Run("forwarded headers change nothing", func(t *testing.T) {
+		forwarded := map[string]string{
+			"X-Forwarded-For":  "127.0.0.1",
+			"X-Forwarded-Host": "localhost",
+			"Forwarded":        "for=127.0.0.1;host=localhost",
+		}
+		cases := []struct {
+			name, host, remoteAddr string
+			want                   bool
+		}{
+			{"cannot refuse an admitted request", "localhost:9848", "127.0.0.1:5000", true},
+			{"cannot admit a remote peer", "localhost:9848", "203.0.113.9:5000", false},
+			{"cannot admit a rebound Host", "attacker.evil:9848", "127.0.0.1:5000", false},
+			{"cannot admit a malformed peer", "localhost:9848", "127.0.0.1", false},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				for name, value := range forwarded {
+					req := build(tc.host, tc.remoteAddr)
+					req.Header.Set(name, value)
+					if got := webhttp.LoopbackRequest(req); got != tc.want {
+						t.Errorf("%s: %s = %q changed the verdict to %v, want %v", tc.name, name, value, got, tc.want)
+					}
+				}
+				// All three at once, in case a future implementation reads them
+				// only in combination.
+				req := build(tc.host, tc.remoteAddr)
+				for name, value := range forwarded {
+					req.Header.Set(name, value)
+				}
+				if got := webhttp.LoopbackRequest(req); got != tc.want {
+					t.Errorf("%s: all forwarded headers set changed the verdict to %v, want %v", tc.name, got, tc.want)
+				}
+			})
+		}
+	})
+
+	// Why this predicate exists rather than a HostPolicy call, pinned rather
+	// than only asserted in the godoc: HostPolicy checks its Host-only
+	// allowlist BEFORE the two-legged loopback exemption, so an operator who
+	// allows "localhost" (so their own browser reaches the service) thereby
+	// admits a REMOTE caller that sends Host: localhost — the exact request
+	// LoopbackRequest must refuse. The two answer different questions, and this
+	// case fails if that ordering ever changes underneath the doc comment.
+	t.Run("HostPolicy admits the caller this predicate refuses", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "http://placeholder/x", http.NoBody)
+		req.Host = "localhost:9848"
+		req.RemoteAddr = "203.0.113.9:5000" // a REMOTE peer
+
+		for _, exempt := range []bool{false, true} {
+			var opts []webhttp.HostAllowlistOption
+			if exempt {
+				opts = append(opts, webhttp.WithLoopbackExempt())
+			}
+			p, invalid := webhttp.ParseHostList([]string{"localhost", "webterm.example.com"}, opts...)
+			if len(invalid) != 0 {
+				t.Fatalf("unexpected invalid entries: %v", invalid)
+			}
+			if !p.Allows(req) {
+				t.Errorf("WithLoopbackExempt=%v: HostPolicy.Allows refused a remote caller sending an allowlisted Host; the doc comment's rationale for LoopbackRequest is stale", exempt)
+			}
+		}
+		if webhttp.LoopbackRequest(req) {
+			t.Error("LoopbackRequest admitted a remote peer sending Host: localhost")
+		}
+	})
+}
+
 func TestParseHostList(t *testing.T) {
 	cases := []struct {
 		name        string

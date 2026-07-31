@@ -123,6 +123,74 @@ func FuzzHostPolicyAllows(f *testing.F) {
 	})
 }
 
+// FuzzLoopbackRequest pins the exported composite against arbitrary Host and
+// RemoteAddr input, with three invariants:
+//
+//  1. Justified admission — an admitted request satisfies BOTH legs under the
+//     independent oracles below (loopbackAddr from the standard library,
+//     oracleLoopbackHost from the RFC 3986 grammar), never the package's own
+//     parser. One-directional for the same reason as FuzzHostPolicyAllows: the
+//     Host oracle is marginally LOOSER on shapes production rejects (it accepts
+//     a trailing dot on an IPv6 literal, which CanonicalHost refuses), and a
+//     rejection can never be a security failure.
+//  2. Forwarded headers are inert — X-Forwarded-For, X-Forwarded-Host and
+//     Forwarded, set to the fuzzed values themselves, never change the verdict
+//     in EITHER direction. Admitting on one would hand a remote caller the gate;
+//     refusing on one would make an app's provenance policy the library's.
+//  3. It IS HostPolicy's loopback carve-out — for an active exempt policy whose
+//     allowlist holds one non-loopback name, Allows is exactly "the Host matches
+//     that name, or LoopbackRequest". The carve-out shipped first, so it is the
+//     reference implementation; a leg dropped from either side breaks equality.
+func FuzzLoopbackRequest(f *testing.F) {
+	f.Add("localhost:9848", "127.0.0.1:5000")     // the in-container curl shape
+	f.Add("127.0.0.1", "127.0.0.1:5000")          // portless literal Host
+	f.Add("[::1]:9848", "[::1]:5000")             // ipv6 both ends
+	f.Add("localhost:9848", "203.0.113.9:5000")   // remote peer forging Host
+	f.Add("attacker.evil:9848", "127.0.0.1:5000") // rebinding: loopback peer, attacker Host
+	f.Add("localhost:9848", "127.0.0.1")          // portless peer must fail closed
+	f.Add("", "")
+	f.Add("[::ffff:127.0.0.1]:80", "[::1]:5")
+	f.Add("0:0:0:0:0:0:0:1", "127.0.0.1:5000")
+	f.Add("localhost.", "127.0.0.1:5000")
+	f.Add("localhost..", "127.0.0.1:5000")
+	f.Add("127.0.0.001:9848", "127.0.0.1:5000")
+	f.Add("webterm.example.com", "203.0.113.9:5000")
+
+	// A fixed, active allowlist of one browser-facing (non-loopback) host, so
+	// invariant 3's two branches never overlap.
+	const allowed = "webterm.example.com"
+	f.Fuzz(func(t *testing.T, host, remoteAddr string) {
+		build := func() *http.Request {
+			req := httptest.NewRequest(http.MethodGet, "http://placeholder/x", http.NoBody)
+			req.Host = host
+			req.RemoteAddr = remoteAddr
+			return req
+		}
+
+		got := webhttp.LoopbackRequest(build())
+
+		if got && (!loopbackAddr(remoteAddr) || !oracleLoopbackHost(host)) {
+			t.Errorf("admitted an unjustified request: host=%q remoteAddr=%q (oracle: peer=%v host=%v)",
+				host, remoteAddr, loopbackAddr(remoteAddr), oracleLoopbackHost(host))
+		}
+
+		forwarded := build()
+		forwarded.Header.Set("X-Forwarded-For", remoteAddr)
+		forwarded.Header.Set("X-Forwarded-Host", host)
+		forwarded.Header.Set("Forwarded", "for="+remoteAddr+";host="+host)
+		if again := webhttp.LoopbackRequest(forwarded); again != got {
+			t.Errorf("forwarded headers changed the verdict %v -> %v: host=%q remoteAddr=%q", got, again, host, remoteAddr)
+		}
+
+		p, _ := webhttp.ParseHostList([]string{allowed}, webhttp.WithLoopbackExempt())
+		wantAllows := webhttp.CanonicalHost(host) == allowed || got
+		if allows := p.Allows(build()); allows != wantAllows {
+			t.Errorf("exempt HostPolicy.Allows = %v, want %v (allowlist match=%v, LoopbackRequest=%v): host=%q remoteAddr=%q",
+				allows, wantAllows, webhttp.CanonicalHost(host) == allowed, got, host, remoteAddr)
+		}
+	})
+}
+
 // splitAuthority splits an unbracketed authority into its name, stripping at
 // most one syntactically valid ":port" suffix; a second colon or a bad port
 // fails. Written from the RFC 3986 authority grammar, independent of
