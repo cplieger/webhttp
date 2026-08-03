@@ -373,6 +373,10 @@ func TestDecodeJSONInto_trailingDataIsErrTrailingData(t *testing.T) {
 
 // The oversize case surfaces as a *http.MaxBytesError so a caller can map it to
 // 413 (as vibekit does) while a malformed body maps to 400.
+//
+// Green on go1.27rc2 as well as 1.26. If it ever fails under a
+// GOEXPERIMENT=jsonv2 build on a Go 1.26 toolchain, that is golang/go#77789
+// (fixed in 1.27, not backported), not a real regression — see LimitBody's doc.
 func TestDecodeJSONInto_oversizeIsMaxBytesError(t *testing.T) {
 	// A VALID JSON body that exceeds the cap: the decoder reads past maxBytes
 	// while parsing, so the MaxBytesReader trips. (A non-JSON body would fail
