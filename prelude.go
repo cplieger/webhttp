@@ -37,6 +37,19 @@ const MaxJSONBody int64 = 1 << 20
 // the *http.MaxBytesError untouched, and DecodeBody maps it — like any other
 // decode failure — to a 400.
 //
+// That contract SURVIVES Go 1.27's re-implementation of encoding/json on top of
+// encoding/json/v2, verified against go1.27rc2: Decode over an
+// http.MaxBytesReader still yields *http.MaxBytesError and errors.As still
+// matches. Recorded because the intermediate state looks alarming and invites a
+// fix that is not needed — building with GOEXPERIMENT=jsonv2 on a Go 1.26
+// toolchain DOES break it (the read error arrives wrapped in a
+// *json.SyntaxError whose Unwrap chain ends there), which is golang/go#77789,
+// fixed by CL 748860 on 2026-03-06, well before the 1.27 freeze and therefore
+// present in 1.27 but absent from the 1.26 patch line. So a jsonv2-experiment
+// build on Go 1.26 is NOT a valid preview of 1.27 for this path; test against
+// the real toolchain before concluding this contract needs decoupling from the
+// decoder.
+//
 // # The connection-close signal, and when it is absent
 //
 // http.MaxBytesReader also tells net/http that the request was too large, which
