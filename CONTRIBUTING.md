@@ -15,7 +15,7 @@ set of small, independent pieces:
   logging,
 - a composable middleware set: `Chain`, `Recoverer`, `SecurityHeaders`,
   `RouteTimeout`, the shared-bucket `RateLimiter` and its
-  `SessionCreateRateLimit` preset,
+  `SessionCreateRateLimit` / `FailedAuthRateLimit` presets,
 - the `ClientIP` resolver plus `ParseCIDRs`,
 - the exact-match Host allowlist: `ParseHostList`, `CanonicalHost`,
   `HostPolicy`,
@@ -25,6 +25,7 @@ set of small, independent pieces:
 - JSON helpers: `WriteJSON`, `WriteJSONStatus`, `Ok`, `WriteError`,
 - request-prelude helpers: `LimitBody`, `RequireMethod`, `MethodNotAllowed`,
   `SetAllow`, `DecodeBody`, `DecodeJSONInto`,
+- the request-path canonicalizer `CanonicalRequestPath`,
 - the constant-time `StaticTokenVerifier`,
 - a readiness gate: `Ready`, `ReadinessHandler`,
 - a graceful server bootstrap: `NewServer`, `Run`,

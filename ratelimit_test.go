@@ -496,3 +496,179 @@ func TestTokenBucketRetryAfterScalesToDeficit(t *testing.T) {
 		t.Errorf("partial-deficit hint = %d, want 1 (only the remaining 0.4 tokens)", got)
 	}
 }
+
+// TestFailedAuthRateLimitTuning pins the preset's tuning as the three consumers
+// hand-wrote it: burst 10 (ten immediate attempts admitted, the eleventh
+// throttled), a 6s refill (which the deficit-scaled Retry-After reports as 6 on
+// a freshly emptied bucket), and the fixed "too_many_auth_failures" envelope
+// code carrying the caller's message.
+func TestFailedAuthRateLimitTuning(t *testing.T) {
+	hits := 0
+	h := FailedAuthRateLimit(nil, "too many failed bearer attempts")(okHandler(&hits))
+
+	for i := range 10 {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/dump", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("attempt %d status = %d, want 200 (inside the burst of 10)", i+1, rec.Code)
+		}
+	}
+	if hits != 10 {
+		t.Fatalf("next handler ran %d times, want 10", hits)
+	}
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/dump", nil))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("attempt 11 status = %d, want 429 (burst exhausted)", rec.Code)
+	}
+	if hits != 10 {
+		t.Errorf("next handler ran %d times, want 10 (a throttled attempt must not reach it)", hits)
+	}
+	// One whole token missing at 1/6 tokens per second rounds up to 6s, so the
+	// hint is the observable proof of the refill interval.
+	if got := rec.Header().Get("Retry-After"); got != "6" {
+		t.Errorf("Retry-After = %q, want %q (6s refill)", got, "6")
+	}
+	var env ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("429 body is not the JSON error envelope: %v (body=%q)", err, rec.Body.String())
+	}
+	if env.Code != "too_many_auth_failures" {
+		t.Errorf("envelope code = %q, want %q (the fixed cross-service code)", env.Code, "too_many_auth_failures")
+	}
+	if env.Error != "too many failed bearer attempts" {
+		t.Errorf("envelope message = %q, want the caller's msg verbatim", env.Error)
+	}
+}
+
+// TestFailedAuthRateLimitNilPredicateThrottlesEverything pins the nil-when
+// wiring (knell's): with no predicate every request the middleware sees draws a
+// token, whatever its method or path, because the caller has already filtered
+// the failed-auth class before handing the request over.
+func TestFailedAuthRateLimitNilPredicateThrottlesEverything(t *testing.T) {
+	hits := 0
+	h := FailedAuthRateLimit(nil, "")(okHandler(&hits))
+
+	// Ten assorted requests drain the shared bucket: none is exempt.
+	drain := []struct{ method, path string }{
+		{http.MethodPost, "/beat/a"},
+		{http.MethodGet, "/beat/a"},
+		{http.MethodPost, "/beat/b"},
+		{http.MethodDelete, "/beat/b"},
+		{http.MethodPut, "/other"},
+		{http.MethodPost, "/"},
+		{http.MethodGet, "/metrics"},
+		{http.MethodHead, "/beat/c"},
+		{http.MethodPatch, "/beat/c"},
+		{http.MethodOptions, "/beat/d"},
+	}
+	for i, tc := range drain {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s %s (request %d) status = %d, want 200 (inside the burst)", tc.method, tc.path, i+1, rec.Code)
+		}
+	}
+	if hits != 10 {
+		t.Fatalf("next handler ran %d times, want 10", hits)
+	}
+
+	// With the bucket empty nothing is exempt either.
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodPost, "/beat/a"},
+		{http.MethodGet, "/metrics"},
+		{http.MethodDelete, "/anything"},
+	} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))
+		if rec.Code != http.StatusTooManyRequests {
+			t.Errorf("%s %s status = %d, want 429 (a nil predicate exempts nothing)", tc.method, tc.path, rec.Code)
+		}
+	}
+}
+
+// TestFailedAuthRateLimitPredicateThrottlesOnlyMatching pins the
+// predicate-through-the-limiter wiring (pg-autodump's and seadex-scout's): only
+// a request the predicate calls a failed credential draws a token, so a valid
+// credential is never throttled even with the bucket empty.
+func TestFailedAuthRateLimitPredicateThrottlesOnlyMatching(t *testing.T) {
+	hits := 0
+	failedAuth := func(r *http.Request) bool {
+		return r.Method == http.MethodPost && r.URL.Path == "/dump" &&
+			r.Header.Get("Authorization") != "Bearer good"
+	}
+	h := FailedAuthRateLimit(failedAuth, "too many failed bearer attempts")(okHandler(&hits))
+
+	// Drain the bucket with bad-bearer POSTs to the guarded route.
+	for i := range 10 {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/dump", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("bad-bearer attempt %d status = %d, want 200 (inside the burst)", i+1, rec.Code)
+		}
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/dump", nil))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("bad-bearer attempt 11 status = %d, want 429", rec.Code)
+	}
+
+	// Everything the predicate rejects still passes: a valid bearer on the
+	// guarded route (the property that lets the tuning ignore real senders),
+	// another method, and another path.
+	valid := httptest.NewRequest(http.MethodPost, "/dump", nil)
+	valid.Header.Set("Authorization", "Bearer good")
+	for _, tc := range []struct {
+		name string
+		r    *http.Request
+	}{
+		{"valid bearer on the guarded route", valid},
+		{"other method", httptest.NewRequest(http.MethodGet, "/dump", nil)},
+		{"other path", httptest.NewRequest(http.MethodPost, "/healthz", nil)},
+	} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, tc.r)
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s status = %d, want 200 (the predicate exempts it even when the bucket is empty)", tc.name, rec.Code)
+		}
+	}
+}
+
+// TestFailedAuthRateLimitMessage pins the msg contract: a caller's message is
+// used verbatim and an empty one falls back to the fixed default, while the
+// envelope code stays the same either way.
+func TestFailedAuthRateLimitMessage(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		msg  string
+		want string
+	}{
+		{"caller message used verbatim", "too many failed apikey attempts", "too many failed apikey attempts"},
+		{"empty falls back to the default", "", "too many failed authentication attempts"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hits := 0
+			h := FailedAuthRateLimit(nil, tc.msg)(okHandler(&hits))
+			// Empty the burst, then read the refusal.
+			for range failedAuthBurst {
+				h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/x", nil))
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/x", nil))
+			if rec.Code != http.StatusTooManyRequests {
+				t.Fatalf("status = %d, want 429", rec.Code)
+			}
+			var env ErrorResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+				t.Fatalf("429 body is not the JSON error envelope: %v (body=%q)", err, rec.Body.String())
+			}
+			if env.Error != tc.want {
+				t.Errorf("envelope message = %q, want %q", env.Error, tc.want)
+			}
+			if env.Code != "too_many_auth_failures" {
+				t.Errorf("envelope code = %q, want %q", env.Code, "too_many_auth_failures")
+			}
+		})
+	}
+}
