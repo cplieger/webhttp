@@ -21,7 +21,8 @@
 //     (SecurityHeaders), access logging as middleware (Logging), a JSON
 //     per-route timeout (RouteTimeout), a shared token-bucket rate
 //     limiter (RateLimiter, with the SessionCreateRateLimit preset for
-//     heavy-child-spawning create endpoints), and a fixed
+//     heavy-child-spawning create endpoints and the FailedAuthRateLimit preset
+//     for a route guarded by one static credential), and a fixed
 //     Cache-Control: no-store setter for dynamic surfaces (NoStore, whose
 //     placement and override ordering stay app-owned), plus a spoof-aware
 //     client-IP resolver that
@@ -42,6 +43,10 @@
 //     WriteError),
 //   - request-prelude helpers for body limiting, method gating, and JSON
 //     decoding (LimitBody, RequireMethod, MethodNotAllowed, DecodeBody),
+//   - the request path http.ServeMux will actually route, with the verdict on
+//     whether it will route the given spelling or answer a 307 no registered
+//     pattern can intercept — the redirect a machine sender that does not
+//     follow redirects reads as success (CanonicalRequestPath),
 //   - a constant-time verifier for a single operator-configured static
 //     credential — an API key, bearer token, or basic-auth field — hashing
 //     the secret once at construction and comparing SHA-256 digests so no

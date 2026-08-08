@@ -239,3 +239,82 @@ func SessionCreateRateLimit(path string) Middleware {
 		WithRateLimitError("rate_limited", "session creation rate exceeded"),
 	)
 }
+
+// Failed-auth preset tuning: ten immediate attempts absorb an operator
+// retrying a rotated credential by hand, and the 6s refill turns a guessing
+// run at wire speed into ten attempts a minute. One home for the numbers so
+// the services guarding the same shape cannot drift apart.
+const (
+	failedAuthBurst    = 10
+	failedAuthInterval = 6 * time.Second // time to accrue one attempt token
+)
+
+const (
+	// failedAuthCode is the 429 envelope code every failed-auth throttle
+	// answers with. It is fixed rather than a parameter: the code is what an
+	// operator's log queries and alert rules key on across services, and the
+	// three consumers that hand-wrote this preset had already converged on this
+	// exact string while their messages deliberately differ.
+	failedAuthCode = "too_many_auth_failures"
+	// failedAuthDefaultMsg is what an empty msg falls back to: true of any
+	// credential, and deliberately silent about which one was presented.
+	failedAuthDefaultMsg = "too many failed authentication attempts"
+)
+
+// FailedAuthRateLimit returns middleware that throttles FAILED-credential
+// requests through the standard failed-auth token bucket: burst 10, one token
+// accrued every 6 seconds, and a 429 envelope of code
+// "too_many_auth_failures" carrying msg.
+//
+// when is the caller's failed-credential predicate, and only a request it
+// reports true for draws a token. A valid credential is therefore never
+// throttled, not even mid-flood, so the tuning does not have to leave room for
+// the app's own legitimate senders however many there are. A nil when limits
+// EVERY request the middleware sees, which is the wiring for a caller that has
+// already filtered the failed-auth class itself (see the second example below).
+//
+// msg is the caller's human message, because the credential differs per service
+// — a beat token, a bearer, an apikey — and naming it is what makes the refusal
+// legible to whoever configured it. An empty msg falls back to
+// "too many failed authentication attempts".
+//
+// What this bounds is the one-access-line-per-attempt log flood and the digest
+// cost of an attempt, not the guessing rate alone: a network-exposed listener
+// otherwise turns a wire-speed guessing flood into a wire-speed stream of 401s,
+// one access line each. Per-client fairness is out of scope for the same reason
+// RateLimiter's bucket is aggregate — a failed credential carries no trusted
+// client identity to key on, and a knob here would be one more thing to
+// configure wrong on a gate that must simply hold.
+//
+// Both wirings its consumers use stay possible, and the difference is
+// deliberate:
+//
+//	// Predicate through the limiter (pg-autodump, seadex-scout): the
+//	// middleware sees every request and the predicate decides.
+//	limiter := webhttp.FailedAuthRateLimit(func(r *http.Request) bool {
+//		return r.Method == http.MethodPost && r.URL.Path == "/dump" &&
+//			!presentsValidBearer(verify, r)
+//	}, "too many failed bearer attempts")
+//
+//	// Predicate outside the limiter (knell): the caller filters first and
+//	// hands the limiter only the failed-auth class, so an attempt costs one
+//	// fewer credential digest and the caller can attribute the 429 to its own
+//	// pre-route refusal counter.
+//	limited := webhttp.FailedAuthRateLimit(nil, "too many failed beat token attempts")(next)
+//
+// It is a preset over RateLimiter for the one-static-credential-on-one-route
+// shape; an app needing other numbers or a different envelope composes
+// RateLimiter directly.
+func FailedAuthRateLimit(when func(*http.Request) bool, msg string) Middleware {
+	if msg == "" {
+		msg = failedAuthDefaultMsg
+	}
+	// No nil branch on when: WithRateLimitWhen ignores a nil predicate, so a
+	// nil here leaves RateLimiter's default (draw a token from every request)
+	// in place, which is exactly the documented meaning. Re-checking it would
+	// be a second reading of the same rule, free to disagree with the first.
+	return RateLimiter(failedAuthBurst, failedAuthInterval,
+		WithRateLimitWhen(when),
+		WithRateLimitError(failedAuthCode, msg),
+	)
+}
