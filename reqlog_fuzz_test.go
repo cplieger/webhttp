@@ -1,7 +1,6 @@
 package webhttp_test
 
 import (
-	"context"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -136,7 +135,7 @@ func FuzzWithTemplatePathsUnder_neverLogsAPathUnderADeclaredPrefix(f *testing.F)
 			webhttp.WithLogger(slog.New(logCap)),
 			webhttp.WithTemplatePathsUnder(prefix))
 
-		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "http://x", nil)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://x", nil)
 		req.URL.Path = path
 		h.ServeHTTP(httptest.NewRecorder(), req)
 
@@ -220,7 +219,7 @@ func FuzzRequestLogger_loggedPathIsBounded(f *testing.F) {
 		} {
 			logCap := &captureHandler{}
 			opts := append([]webhttp.LogOption{webhttp.WithLogger(slog.New(logCap))}, tc.opts...)
-			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "http://x", nil)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://x", nil)
 			req.URL.Path = path
 			webhttp.RequestLogger(okHandler(), opts...).ServeHTTP(httptest.NewRecorder(), req)
 
