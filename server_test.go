@@ -99,7 +99,7 @@ func runAndShutdown(t *testing.T, opts ...webhttp.RunOption) error {
 	srv := webhttp.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() {
 		done <- webhttp.Run(ctx, srv, ln, func(context.Context) { shutdownCalled.Store(true) }, opts...)
@@ -187,7 +187,7 @@ func closedListener(t *testing.T) net.Listener {
 // against, so it is pinned rather than assumed.
 func TestRun_fatalServeErrorSkipsGracefulHooksByDefault(t *testing.T) {
 	var preDrainCalled, teardownCalled atomic.Bool
-	runErr := webhttp.Run(context.Background(), webhttp.NewServer(nil), closedListener(t),
+	runErr := webhttp.Run(t.Context(), webhttp.NewServer(nil), closedListener(t),
 		func(context.Context) { teardownCalled.Store(true) },
 		webhttp.WithPreDrain(func(context.Context) { preDrainCalled.Store(true) }))
 
@@ -280,7 +280,7 @@ func TestRun_serveExitRunsWhenCallerClosesServer(t *testing.T) {
 	}
 	_ = resp.Body.Close()
 
-	if err := srv.Shutdown(context.Background()); err != nil {
+	if err := srv.Shutdown(t.Context()); err != nil {
 		t.Fatalf("caller-driven Shutdown: %v", err)
 	}
 
@@ -322,7 +322,7 @@ func TestRun_serveExitNotRunOnGracefulPath(t *testing.T) {
 func TestRun_nilServeExitIgnored(t *testing.T) {
 	// The fatal path with WithServeExit(nil): the nil hook is skipped, not
 	// called, and the serve error still comes back.
-	runErr := webhttp.Run(context.Background(), webhttp.NewServer(nil), closedListener(t), nil,
+	runErr := webhttp.Run(t.Context(), webhttp.NewServer(nil), closedListener(t), nil,
 		webhttp.WithServeExit(nil))
 	if runErr == nil {
 		t.Error("Run = nil, want the serve error")
@@ -335,7 +335,7 @@ func TestRun_onShutdownNilIsSafe(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 	srv := webhttp.NewServer(okHandler())
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- webhttp.Run(ctx, srv, ln, nil) }() // nil onShutdown
 
@@ -370,7 +370,7 @@ func TestRun_slowOnShutdownStillRunsWithinGrace(t *testing.T) {
 		}
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() {
 		done <- webhttp.Run(ctx, srv, ln, onShutdown, webhttp.WithShutdownGrace(2*time.Second))
@@ -418,7 +418,7 @@ func TestRun_holdsRequestOpenAcrossShutdown(t *testing.T) {
 		teardownRan.Store(true)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() {
 		done <- webhttp.Run(ctx, srv, ln, onShutdown, webhttp.WithShutdownGrace(grace))
@@ -503,7 +503,7 @@ func TestRun_returnsShutdownDeadlineExceeded(t *testing.T) {
 		_ = srv.Close()
 	})
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() {
 		done <- webhttp.Run(ctx, srv, ln, nil, webhttp.WithShutdownGrace(25*time.Millisecond))
@@ -591,7 +591,7 @@ func TestRun_preDrainRunsBeforeShutdownDrain(t *testing.T) {
 	}
 	onShutdown := func(context.Context) { record("teardown") }
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() {
 		done <- webhttp.Run(ctx, srv, ln, onShutdown,
@@ -708,7 +708,7 @@ func TestAwaitDone_reportsCompletion(t *testing.T) {
 }
 
 func TestAwaitDone_reportsExpiry(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
 	defer cancel()
 
 	if webhttp.AwaitDone(ctx, make(chan struct{})) {
@@ -723,6 +723,8 @@ func TestAwaitDone_completionWinsWhenBothReadyAtOnce(t *testing.T) {
 	// reports a teardown that DID finish as still running, roughly half the time.
 	done := make(chan struct{})
 	close(done)
+	// Deliberately pre-cancelled (not t.Context()): the already-expired context
+	// IS the fixture.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -734,6 +736,7 @@ func TestAwaitDone_completionWinsWhenBothReadyAtOnce(t *testing.T) {
 }
 
 func TestAwaitDone_nilChannelIsBoundedByContext(t *testing.T) {
+	// Deliberately pre-cancelled (not t.Context()) to bound the nil-channel wait.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -748,7 +751,7 @@ func TestAwaitDone_waitsForALateCompletion(t *testing.T) {
 		time.Sleep(30 * time.Millisecond)
 		close(done)
 	}()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
 
 	if !webhttp.AwaitDone(ctx, done) {
@@ -759,6 +762,8 @@ func TestAwaitDone_waitsForALateCompletion(t *testing.T) {
 func TestCausedByCancellation(t *testing.T) {
 	liveCtx := t.Context()
 
+	// The three below stay on context.Background(): each is deliberately
+	// cancelled/expired up front, which is exactly what they are fixtures for.
 	cancelledCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -870,7 +875,7 @@ func TestRun_serveErrorTakesPrecedenceOverGraceExpiry(t *testing.T) {
 		}
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() {
 		done <- webhttp.Run(ctx, srv, ln, nil,
