@@ -75,9 +75,9 @@ type logConfig struct {
 	skipPaths       map[string]struct{}
 	skipFunc        func(*http.Request) bool
 	pathFunc        func(*http.Request) string
-	recordMetric    func(method, path string, status int, d time.Duration)
+	recordMetric    func(RequestMetric)
 	recordMetricReq func(r *http.Request, status int, d time.Duration)
-	recordRoute     func(method, path string, status int, d time.Duration)
+	recordRoute     func(RequestMetric)
 	logLevel        func(r *http.Request, status int) slog.Level
 	clientIPFunc    func(*http.Request) string
 	clientIPTrusted []*net.IPNet
@@ -468,6 +468,30 @@ func boundLoggedMethod(m string) string {
 	return overlongMethodMarker
 }
 
+// RequestMetric is one completed request as a metric hook observes it: the
+// labels and the latency, already bounded by whichever hook produced it.
+//
+// It is a struct rather than four parameters because two of them are adjacent
+// strings: a hook implemented as func(path, method string, ...) compiles, runs
+// forever, and silently labels every series with the wrong dimension — and
+// nothing in a metric can look wrong afterwards, since both values are
+// plausible strings. Named fields make the implementor read Method and Path
+// instead of counting positions. The stdlib passes multi-value hook data the
+// same way: net/http/httptrace's GotConn and DNSDone take GotConnInfo and
+// DNSDoneInfo rather than positional arguments.
+type RequestMetric struct {
+	// Method is the request method, bounded by the hook that produced it.
+	Method string
+	// Path is the label the hook chose: a bounded request path for
+	// [WithRecordMetric], or the matched route template for
+	// [WithRecordRouteMetric] (MetricLabelUnmatched when nothing matched).
+	Path string
+	// Status is the response status actually written.
+	Status int
+	// Latency is how long the handler took.
+	Latency time.Duration
+}
+
 // WithRecordMetric registers a hook invoked once per logged request with the
 // final method, path, status, and latency. Both text arguments are the values
 // the access line RECORDED, so they carry the same bounds: the path is the path
@@ -485,7 +509,7 @@ func boundLoggedMethod(m string) string {
 // unless a path policy already collapses the path onto route templates — reach
 // for WithRecordRouteMetric, whose labels are bounded by construction. The three
 // metric options are mutually exclusive; whichever is applied last wins.
-func WithRecordMetric(fn func(method, path string, status int, d time.Duration)) LogOption {
+func WithRecordMetric(fn func(RequestMetric)) LogOption {
 	return func(c *logConfig) {
 		c.recordMetric = fn
 		c.recordMetricReq = nil
@@ -570,7 +594,7 @@ func WithRecordMetricRequest(fn func(r *http.Request, status int, d time.Duratio
 // WithMaxLoggedPath) do NOT reach these labels: they govern the recorded path
 // of the LOG LINE, while this hook's path is the matched route. A path policy
 // and this hook are complementary, not alternatives.
-func WithRecordRouteMetric(fn func(method, path string, status int, d time.Duration)) LogOption {
+func WithRecordRouteMetric(fn func(RequestMetric)) LogOption {
 	return func(c *logConfig) {
 		if fn == nil {
 			return
@@ -960,11 +984,11 @@ func (c *logConfig) safeRecordMetric(r *http.Request, path string, status int, d
 		// The labels are derived HERE rather than by the app, which is the
 		// point of the option: the bound is a property of the wiring.
 		method, route := RouteMetricLabels(r)
-		c.recordRoute(method, route, status, d)
+		c.recordRoute(RequestMetric{Method: method, Path: route, Status: status, Latency: d})
 	case c.recordMetricReq != nil:
 		c.recordMetricReq(r, status, d)
 	default:
-		c.recordMetric(boundLoggedMethod(r.Method), path, status, d)
+		c.recordMetric(RequestMetric{Method: boundLoggedMethod(r.Method), Path: path, Status: status, Latency: d})
 	}
 }
 

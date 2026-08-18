@@ -104,7 +104,7 @@ func (sw *Writer) Comment(text string) error {
 type ServeOption func(*serveConfig)
 
 type serveConfig struct {
-	onConnect func(w *Writer, floor, head uint64) error
+	onConnect func(w *Writer, b ReplayBounds) error
 	topic     string
 }
 
@@ -114,12 +114,25 @@ func WithTopic(topic string) ServeOption {
 	return func(c *serveConfig) { c.topic = topic }
 }
 
+// ReplayBounds is the span a subscriber's Last-Event-ID replay covered.
+//
+// The two ends are a struct rather than adjacent uint64 parameters because
+// inverting them is invisible: both are plausible ids, a handshake carrying
+// them the wrong way round still parses, and the client then computes a gap
+// backwards and concludes it missed nothing.
+type ReplayBounds struct {
+	// Floor is the oldest id still replayable.
+	Floor uint64
+	// Head is the newest id delivered.
+	Head uint64
+}
+
 // OnConnect installs a hook that runs after the subscriber is registered and
 // after any Last-Event-ID replay, before live delivery begins. It receives
 // the replay bounds so the application can write a handshake carrying them
 // (letting the client detect a replay gap) and any initial per-client state.
 // When no hook is installed, Serve writes a bare `: connected` comment.
-func OnConnect(fn func(w *Writer, floor, head uint64) error) ServeOption {
+func OnConnect(fn func(w *Writer, b ReplayBounds) error) ServeOption {
 	return func(c *serveConfig) { c.onConnect = fn }
 }
 
@@ -172,7 +185,7 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, opts ...ServeOption)
 	sw := &Writer{w: w}
 	if sc.onConnect != nil {
 		floor, head := h.Bounds()
-		if err := sc.onConnect(sw, floor, head); err != nil {
+		if err := sc.onConnect(sw, ReplayBounds{Floor: floor, Head: head}); err != nil {
 			return
 		}
 	} else if err := sw.Comment("connected"); err != nil {

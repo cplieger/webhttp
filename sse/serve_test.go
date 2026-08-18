@@ -152,8 +152,8 @@ func TestServeTopicFilter(t *testing.T) {
 func TestServeOnConnectHook(t *testing.T) {
 	h := NewHub()
 	h.Publish(Event{Data: []byte("pre")})
-	srv := startServer(t, h, OnConnect(func(w *Writer, floor, head uint64) error {
-		return w.Event(head, "connected", fmt.Appendf(nil, `{"floor":%d,"head":%d}`, floor, head))
+	srv := startServer(t, h, OnConnect(func(w *Writer, b ReplayBounds) error {
+		return w.Event(b.Head, "connected", fmt.Appendf(nil, `{"floor":%d,"head":%d}`, b.Floor, b.Head))
 	}))
 	resp, sc := openStream(t, srv.URL, nil)
 	defer resp.Body.Close()
