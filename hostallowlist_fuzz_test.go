@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cplieger/webhttp"
+	"github.com/cplieger/webhttp/v2"
 )
 
 // FuzzCanonicalHost asserts CanonicalHost never panics and holds four
@@ -100,7 +100,7 @@ func FuzzHostPolicyAllows(f *testing.F) {
 	f.Fuzz(func(t *testing.T, host, remoteAddr string, exempt bool) {
 		var opts []webhttp.HostAllowlistOption
 		if exempt {
-			opts = append(opts, webhttp.WithLoopbackExempt())
+			opts = append(opts, webhttp.WithLoopbackExempt(true))
 		}
 		p, _ := webhttp.ParseHostList([]string{allowed}, opts...)
 
@@ -182,7 +182,7 @@ func FuzzLoopbackRequest(f *testing.F) {
 			t.Errorf("forwarded headers changed the verdict %v -> %v: host=%q remoteAddr=%q", got, again, host, remoteAddr)
 		}
 
-		p, _ := webhttp.ParseHostList([]string{allowed}, webhttp.WithLoopbackExempt())
+		p, _ := webhttp.ParseHostList([]string{allowed}, webhttp.WithLoopbackExempt(true))
 		wantAllows := webhttp.CanonicalHost(host) == allowed || got
 		if allows := p.Allows(build()); allows != wantAllows {
 			t.Errorf("exempt HostPolicy.Allows = %v, want %v (allowlist match=%v, LoopbackRequest=%v): host=%q remoteAddr=%q",

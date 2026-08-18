@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cplieger/webhttp"
+	"github.com/cplieger/webhttp/v2"
 )
 
 func TestJSONHeaders(t *testing.T) {
@@ -160,5 +160,67 @@ func TestWriteError_omitsEmptyOptionalFields(t *testing.T) {
 	}
 	if strings.Contains(body, "request_id") {
 		t.Errorf("empty request_id not omitted: %s", body)
+	}
+}
+
+// TestWriteError_malformedCodeIsReplaced covers the envelope's code grammar on
+// the wire: ErrorCode is a machine token, so a value carrying a space (the
+// classic transposition — the sentence landing in the code slot) must not reach
+// a client. The encoder substitutes InvalidErrorCode and leaves the status and
+// the human message alone; it never panics, because this runs per request on an
+// error path. The diagnostic that accompanies the substitution is asserted in
+// the internal test, which can reset its once-per-process bound.
+func TestWriteError_malformedCodeIsReplaced(t *testing.T) {
+	cases := []struct {
+		name string
+		code webhttp.ErrorCode
+	}{
+		{"a sentence in the code slot", "host not allowed"},
+		{"uppercase", "Host_Not_Allowed"},
+		{"a newline", "host_not_allowed\ninjected"},
+		{"a hyphen", "host-not-allowed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			webhttp.WriteError(rr, req, http.StatusForbidden, tc.code, "host not allowed")
+
+			if rr.Code != http.StatusForbidden {
+				t.Errorf("status = %d, want 403 (a bad code must not change the status)", rr.Code)
+			}
+			var got webhttp.ErrorResponse
+			if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if got.Code != webhttp.InvalidErrorCode {
+				t.Errorf("Code = %q, want %q", got.Code, webhttp.InvalidErrorCode)
+			}
+			if got.Error != "host not allowed" {
+				t.Errorf("Error = %q, want the human message untouched", got.Error)
+			}
+		})
+	}
+}
+
+// TestWriteError_wellFormedCodesSurvive pins the grammar's accepting half: the
+// tokens this library and its consumers actually spell must pass through
+// untouched, so the guard cannot quietly rewrite a real code.
+func TestWriteError_wellFormedCodesSurvive(t *testing.T) {
+	for _, code := range []webhttp.ErrorCode{
+		"host_not_allowed", "rate_limited", "too_many_auth_failures",
+		"timeout", "internal_error", "sse_unavailable", "http2_upgrade_failed",
+	} {
+		t.Run(string(code), func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			webhttp.WriteError(rr, nil, http.StatusBadRequest, code, "message")
+			var got webhttp.ErrorResponse
+			if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if got.Code != code {
+				t.Errorf("Code = %q, want %q unchanged", got.Code, code)
+			}
+		})
 	}
 }

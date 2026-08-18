@@ -15,14 +15,18 @@ type RateLimitOption func(*rateLimitConfig)
 type rateLimitConfig struct {
 	when      func(*http.Request) bool
 	responder ErrorResponder
-	code      string
+	code      ErrorCode
 	msg       string
 }
 
 // WithRateLimitError sets the error code and message written in the 429 JSON
 // envelope (via WriteError). Defaults to "rate_limited" / "rate limit
 // exceeded".
-func WithRateLimitError(code, msg string) RateLimitOption {
+//
+// code is the machine token and msg the sentence; they are separately typed
+// (see ErrorCode) so the pair cannot be supplied transposed. An empty code
+// omits the field.
+func WithRateLimitError(code ErrorCode, msg string) RateLimitOption {
 	return func(c *rateLimitConfig) {
 		c.code, c.msg = code, msg
 	}
@@ -255,7 +259,7 @@ const (
 	// operator's log queries and alert rules key on across services, and the
 	// three consumers that hand-wrote this preset had already converged on this
 	// exact string while their messages deliberately differ.
-	failedAuthCode = "too_many_auth_failures"
+	failedAuthCode ErrorCode = "too_many_auth_failures"
 	// failedAuthDefaultMsg is what an empty msg falls back to: true of any
 	// credential, and deliberately silent about which one was presented.
 	failedAuthDefaultMsg = "too many failed authentication attempts"

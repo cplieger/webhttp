@@ -144,18 +144,18 @@ type HostAllowlistOption func(*hostPolicyConfig)
 
 // hostPolicyConfig holds resolved HostPolicy configuration.
 type hostPolicyConfig struct {
-	code           string
+	code           ErrorCode
 	msg            string
 	loopbackExempt bool
 }
 
-// WithLoopbackExempt admits a request whenever BOTH its socket peer and its
-// Host are loopback, regardless of the allowlist — the container-internal
-// carve-out. It keeps a service's own loopback clients working under any
-// allowlist: a baked Docker healthcheck (curl http://127.0.0.1:PORT), an
-// in-container agent hitting localhost, a sidecar probe. Without it, an
-// allowlist of browser-facing hostnames rejects those callers and can brick a
-// health signal.
+// WithLoopbackExempt selects whether a request is admitted when BOTH its socket
+// peer and its Host are loopback, regardless of the allowlist — the
+// container-internal carve-out. Enabled (true) it keeps a service's own loopback
+// clients working under any allowlist: a baked Docker healthcheck (curl
+// http://127.0.0.1:PORT), an in-container agent hitting localhost, a sidecar
+// probe. Without it, an allowlist of browser-facing hostnames rejects those
+// callers and can brick a health signal.
 //
 // The carve-out is unreachable by the attacks a host allowlist defends against.
 // A DNS-rebinding request carries the ATTACKER'S hostname in Host, so it fails
@@ -164,18 +164,27 @@ type hostPolicyConfig struct {
 // a loopback socket peer, so it fails the peer test. Both conditions must hold,
 // and only genuinely local traffic can satisfy both.
 //
-// Off by default: a bare allowlist rejects everything not listed, loopback
-// included. Opt in when the service runs behind a loopback health check or
-// serves in-container clients.
-func WithLoopbackExempt() HostAllowlistOption {
-	return func(c *hostPolicyConfig) { c.loopbackExempt = true }
+// The default (false) matches leaving the option out: a bare allowlist rejects
+// everything not listed, loopback included. Passing false explicitly is how a
+// caller threads its own computed flag — a config field, an env var — without
+// branching around the option, and options are last-wins, so a later
+// WithLoopbackExempt(false) closes a carve-out an earlier true opened. Opt in
+// when the service runs behind a loopback health check or serves in-container
+// clients.
+func WithLoopbackExempt(exempt bool) HostAllowlistOption {
+	return func(c *hostPolicyConfig) { c.loopbackExempt = exempt }
 }
 
 // WithHostAllowlistError sets the error code and message written in the 403
 // JSON envelope (via WriteError) when a request's Host is not allowed. Defaults
 // to "host_not_allowed" / "host not allowed". Override it to name the app's own
 // configuration knob, e.g. "host not allowed; add it to KWEB_ALLOWED_HOSTS".
-func WithHostAllowlistError(code, msg string) HostAllowlistOption {
+//
+// code is the machine token and msg the sentence; they are separately typed
+// (see ErrorCode) so the pair cannot be supplied transposed. An empty code
+// omits the field, which is how an app with a bare {"error":…} taxonomy keeps
+// its envelope shape.
+func WithHostAllowlistError(code ErrorCode, msg string) HostAllowlistOption {
 	return func(c *hostPolicyConfig) {
 		c.code, c.msg = code, msg
 	}
@@ -188,7 +197,7 @@ func WithHostAllowlistError(code, msg string) HostAllowlistOption {
 // safe pass-through.
 type HostPolicy struct {
 	allowed        map[string]struct{}
-	code           string
+	code           ErrorCode
 	msg            string
 	loopbackExempt bool
 	active         bool

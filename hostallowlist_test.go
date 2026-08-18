@@ -7,7 +7,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/cplieger/webhttp"
+	"github.com/cplieger/webhttp/v2"
 )
 
 func TestCanonicalHost(t *testing.T) {
@@ -195,7 +195,7 @@ func TestLoopbackRequest(t *testing.T) {
 		for _, exempt := range []bool{false, true} {
 			var opts []webhttp.HostAllowlistOption
 			if exempt {
-				opts = append(opts, webhttp.WithLoopbackExempt())
+				opts = append(opts, webhttp.WithLoopbackExempt(true))
 			}
 			p, invalid := webhttp.ParseHostList([]string{"localhost", "webterm.example.com"}, opts...)
 			if len(invalid) != 0 {
@@ -334,7 +334,7 @@ func TestHostPolicyMiddleware(t *testing.T) {
 
 	t.Run("loopback carve-out", func(t *testing.T) {
 		// A browser-facing allowlist with NO loopback entry.
-		p, _ := webhttp.ParseHostList([]string{"webterm.example.com"}, webhttp.WithLoopbackExempt())
+		p, _ := webhttp.ParseHostList([]string{"webterm.example.com"}, webhttp.WithLoopbackExempt(true))
 		h := p.Middleware()(ok)
 		cases := []struct {
 			name, host, remoteAddr string
@@ -353,6 +353,42 @@ func TestHostPolicyMiddleware(t *testing.T) {
 			t.Run(tc.name, func(t *testing.T) {
 				if got, _ := do(h, tc.host, "", tc.remoteAddr); got != tc.want {
 					t.Errorf("Host %q peer %q = %d, want %d", tc.host, tc.remoteAddr, got, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("loopback carve-out is off by default and last-wins", func(t *testing.T) {
+		// The parameter form's contract: false is what leaving the option out
+		// means, and options resolve last-wins, so a caller can thread a
+		// computed flag without branching around the option.
+		cases := []struct {
+			name string
+			opts []webhttp.HostAllowlistOption
+			want int
+		}{
+			{"option omitted", nil, http.StatusForbidden},
+			{"false", []webhttp.HostAllowlistOption{webhttp.WithLoopbackExempt(false)}, http.StatusForbidden},
+			{"true", []webhttp.HostAllowlistOption{webhttp.WithLoopbackExempt(true)}, http.StatusOK},
+			{
+				"true then false closes it",
+				[]webhttp.HostAllowlistOption{webhttp.WithLoopbackExempt(true), webhttp.WithLoopbackExempt(false)},
+				http.StatusForbidden,
+			},
+			{
+				"false then true opens it",
+				[]webhttp.HostAllowlistOption{webhttp.WithLoopbackExempt(false), webhttp.WithLoopbackExempt(true)},
+				http.StatusOK,
+			},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				p, _ := webhttp.ParseHostList([]string{"webterm.example.com"}, tc.opts...)
+				h := p.Middleware()(ok)
+				// The healthcheck shape: loopback peer AND loopback Host, with
+				// no loopback entry in the allowlist.
+				if got, _ := do(h, "127.0.0.1:9848", "", "127.0.0.1:5000"); got != tc.want {
+					t.Errorf("loopback request = %d, want %d", got, tc.want)
 				}
 			})
 		}
