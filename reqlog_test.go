@@ -222,9 +222,9 @@ func TestRequestLogger_metricHookOnLoggedPath(t *testing.T) {
 		gotStatus          int
 		gotDuration        time.Duration
 	)
-	hook := func(method, path string, status int, d time.Duration) {
+	hook := func(m webhttp.RequestMetric) {
 		calls++
-		gotMethod, gotPath, gotStatus, gotDuration = method, path, status, d
+		gotMethod, gotPath, gotStatus, gotDuration = m.Method, m.Path, m.Status, m.Latency
 	}
 	h := webhttp.RequestLogger(statusHandler(http.StatusAccepted),
 		webhttp.WithLogger(discardLogger()),
@@ -248,7 +248,7 @@ func TestRequestLogger_metricHookOnLoggedPath(t *testing.T) {
 
 func TestRequestLogger_skipPathExcludedFromMetricHook(t *testing.T) {
 	var calls int
-	hook := func(_, _ string, _ int, _ time.Duration) { calls++ }
+	hook := func(webhttp.RequestMetric) { calls++ }
 	// A skip path is excluded from BOTH the access log and the metric hook: a
 	// stream's open-to-close duration plus a synthetic status is misleading.
 	h := webhttp.RequestLogger(statusHandler(http.StatusTeapot),
@@ -345,7 +345,7 @@ func TestRequestLogger_skipFuncSuppressesLogAndMetricButEchoesID(t *testing.T) {
 		webhttp.WithSkipFunc(func(r *http.Request) bool {
 			return strings.HasPrefix(r.URL.Path, "/ws/")
 		}),
-		webhttp.WithRecordMetric(func(_, _ string, _ int, _ time.Duration) { metricCalls++ }))
+		webhttp.WithRecordMetric(func(webhttp.RequestMetric) { metricCalls++ }))
 
 	rr := serve(h, http.MethodGet, "/ws/room-42", nil)
 
@@ -540,7 +540,7 @@ func TestWithSkipUpgrades(t *testing.T) {
 				webhttp.WithLogger(slog.New(logCap)),
 				webhttp.WithSkipUpgrades(true),
 				webhttp.WithClientIP(),
-				webhttp.WithRecordMetric(func(string, string, int, time.Duration) { metricCalls++ }),
+				webhttp.WithRecordMetric(func(webhttp.RequestMetric) { metricCalls++ }),
 			}
 			h := webhttp.RequestLogger(tc.handler(t), append(opts, tc.extraOpts...)...)
 
@@ -957,7 +957,7 @@ func TestRequestLogger_panickingMetricHookStillEmitsAccessLine(t *testing.T) {
 	logCap := &captureHandler{}
 	h := webhttp.RequestLogger(statusHandler(http.StatusAccepted),
 		webhttp.WithLogger(slog.New(logCap)),
-		webhttp.WithRecordMetric(func(_, _ string, _ int, _ time.Duration) { panic("metric boom") }))
+		webhttp.WithRecordMetric(func(webhttp.RequestMetric) { panic("metric boom") }))
 
 	// A panic in the metric hook must be contained, not propagated out of ServeHTTP.
 	func() {
@@ -1108,7 +1108,7 @@ func TestRequestLogger_metricHookVariantsMutuallyExclusive(t *testing.T) {
 	var classic, reqAware int
 	last := webhttp.RequestLogger(okHandler(),
 		webhttp.WithLogger(discardLogger()),
-		webhttp.WithRecordMetric(func(_, _ string, _ int, _ time.Duration) { classic++ }),
+		webhttp.WithRecordMetric(func(webhttp.RequestMetric) { classic++ }),
 		webhttp.WithRecordMetricRequest(func(*http.Request, int, time.Duration) { reqAware++ }))
 	serve(last, http.MethodGet, "/x", nil)
 	if classic != 0 || reqAware != 1 {
@@ -1119,7 +1119,7 @@ func TestRequestLogger_metricHookVariantsMutuallyExclusive(t *testing.T) {
 	first := webhttp.RequestLogger(okHandler(),
 		webhttp.WithLogger(discardLogger()),
 		webhttp.WithRecordMetricRequest(func(*http.Request, int, time.Duration) { reqAware++ }),
-		webhttp.WithRecordMetric(func(_, _ string, _ int, _ time.Duration) { classic++ }))
+		webhttp.WithRecordMetric(func(webhttp.RequestMetric) { classic++ }))
 	serve(first, http.MethodGet, "/x", nil)
 	if classic != 1 || reqAware != 0 {
 		t.Errorf("classic applied last: classic=%d reqAware=%d, want 1 and 0", classic, reqAware)
@@ -1132,7 +1132,7 @@ func TestRequestLogger_requestAwareMetricHookNilIsNoOp(t *testing.T) {
 	var classic int
 	h := webhttp.RequestLogger(okHandler(),
 		webhttp.WithLogger(discardLogger()),
-		webhttp.WithRecordMetric(func(_, _ string, _ int, _ time.Duration) { classic++ }),
+		webhttp.WithRecordMetric(func(webhttp.RequestMetric) { classic++ }),
 		webhttp.WithRecordMetricRequest(nil))
 
 	serve(h, http.MethodGet, "/x", nil)
@@ -1356,8 +1356,8 @@ func TestRequestLogger_withPathFuncFeedsLegacyMetricHook(t *testing.T) {
 	h := webhttp.RequestLogger(okHandler(),
 		webhttp.WithLogger(discardLogger()),
 		webhttp.WithPathFunc(func(*http.Request) string { return "/tmpl/{id}" }),
-		webhttp.WithRecordMetric(func(_, path string, _ int, _ time.Duration) {
-			gotPath = path
+		webhttp.WithRecordMetric(func(m webhttp.RequestMetric) {
+			gotPath = m.Path
 		}))
 
 	serve(h, http.MethodGet, "/tmpl/abc123", nil)
@@ -2085,8 +2085,8 @@ func TestRequestLogger_legacyMetricHookGetsTheBoundedValues(t *testing.T) {
 	var gotMethod, gotPath string
 	webhttp.RequestLogger(okHandler(),
 		webhttp.WithLogger(discardLogger()),
-		webhttp.WithRecordMetric(func(method, path string, _ int, _ time.Duration) {
-			gotMethod, gotPath = method, path
+		webhttp.WithRecordMetric(func(m webhttp.RequestMetric) {
+			gotMethod, gotPath = m.Method, m.Path
 		}),
 	).ServeHTTP(httptest.NewRecorder(), requestWithPath(strings.Repeat("M", 100), asciiPath(1000)))
 
@@ -2322,8 +2322,8 @@ func TestWithRecordRouteMetric_handsTheAppBoundedLabels(t *testing.T) {
 	handler := webhttp.Chain(routeMetricMux(),
 		webhttp.Logging(
 			webhttp.WithLogger(discardLogger()),
-			webhttp.WithRecordRouteMetric(func(method, path string, status int, d time.Duration) {
-				calls = append(calls, routeMetricCall{method: method, path: path, status: status, d: d})
+			webhttp.WithRecordRouteMetric(func(m webhttp.RequestMetric) {
+				calls = append(calls, routeMetricCall{method: m.Method, path: m.Path, status: m.Status, d: m.Latency})
 			}),
 		),
 		webhttp.Recoverer(),
@@ -2381,7 +2381,7 @@ func TestWithRecordRouteMetric_pathLabelIgnoresTheLogPathPolicy(t *testing.T) {
 	h := webhttp.RequestLogger(routeMetricMux(),
 		webhttp.WithLogger(discardLogger()),
 		webhttp.WithPathFunc(func(*http.Request) string { return "/redacted" }),
-		webhttp.WithRecordRouteMetric(func(_, path string, _ int, _ time.Duration) { gotPath = path }),
+		webhttp.WithRecordRouteMetric(func(m webhttp.RequestMetric) { gotPath = m.Path }),
 	)
 	h.ServeHTTP(httptest.NewRecorder(), requestWithPath(http.MethodGet, "/beat/abc123"))
 
@@ -2404,8 +2404,8 @@ func TestWithRecordRouteMetric_firesOnPanicAndSkipsSkippedPaths(t *testing.T) {
 		webhttp.Logging(
 			webhttp.WithLogger(discardLogger()),
 			webhttp.WithSkipPaths("/events"),
-			webhttp.WithRecordRouteMetric(func(method, path string, status int, _ time.Duration) {
-				calls = append(calls, routeMetricCall{method: method, path: path, status: status})
+			webhttp.WithRecordRouteMetric(func(m webhttp.RequestMetric) {
+				calls = append(calls, routeMetricCall{method: m.Method, path: m.Path, status: m.Status})
 			}),
 		),
 		webhttp.Recoverer(webhttp.WithRecoverLogger(discardLogger())),
@@ -2435,7 +2435,7 @@ func TestWithRecordRouteMetric_panickingHookStillEmitsAccessLine(t *testing.T) {
 	logCap := &captureHandler{}
 	h := webhttp.RequestLogger(okHandler(),
 		webhttp.WithLogger(slog.New(logCap)),
-		webhttp.WithRecordRouteMetric(func(string, string, int, time.Duration) { panic("metric boom") }))
+		webhttp.WithRecordRouteMetric(func(webhttp.RequestMetric) { panic("metric boom") }))
 
 	func() {
 		defer func() {
@@ -2476,25 +2476,25 @@ func TestWithRecordRouteMetric_mutuallyExclusiveWithTheOtherHooks(t *testing.T) 
 	}{
 		{"route after legacy", func(fire func(string)) []webhttp.LogOption {
 			return []webhttp.LogOption{
-				webhttp.WithRecordMetric(func(string, string, int, time.Duration) { fire("legacy") }),
-				webhttp.WithRecordRouteMetric(func(string, string, int, time.Duration) { fire("route") }),
+				webhttp.WithRecordMetric(func(webhttp.RequestMetric) { fire("legacy") }),
+				webhttp.WithRecordRouteMetric(func(webhttp.RequestMetric) { fire("route") }),
 			}
 		}, "route"},
 		{"route after request-aware", func(fire func(string)) []webhttp.LogOption {
 			return []webhttp.LogOption{
 				webhttp.WithRecordMetricRequest(func(*http.Request, int, time.Duration) { fire("request") }),
-				webhttp.WithRecordRouteMetric(func(string, string, int, time.Duration) { fire("route") }),
+				webhttp.WithRecordRouteMetric(func(webhttp.RequestMetric) { fire("route") }),
 			}
 		}, "route"},
 		{"legacy after route", func(fire func(string)) []webhttp.LogOption {
 			return []webhttp.LogOption{
-				webhttp.WithRecordRouteMetric(func(string, string, int, time.Duration) { fire("route") }),
-				webhttp.WithRecordMetric(func(string, string, int, time.Duration) { fire("legacy") }),
+				webhttp.WithRecordRouteMetric(func(webhttp.RequestMetric) { fire("route") }),
+				webhttp.WithRecordMetric(func(webhttp.RequestMetric) { fire("legacy") }),
 			}
 		}, "legacy"},
 		{"request-aware after route", func(fire func(string)) []webhttp.LogOption {
 			return []webhttp.LogOption{
-				webhttp.WithRecordRouteMetric(func(string, string, int, time.Duration) { fire("route") }),
+				webhttp.WithRecordRouteMetric(func(webhttp.RequestMetric) { fire("route") }),
 				webhttp.WithRecordMetricRequest(func(*http.Request, int, time.Duration) { fire("request") }),
 			}
 		}, "request"},
@@ -2520,7 +2520,7 @@ func TestWithRecordRouteMetric_nilIsNoOp(t *testing.T) {
 	var got string
 	webhttp.RequestLogger(routeMetricMux(),
 		webhttp.WithLogger(discardLogger()),
-		webhttp.WithRecordRouteMetric(func(method, _ string, _ int, _ time.Duration) { got = method }),
+		webhttp.WithRecordRouteMetric(func(m webhttp.RequestMetric) { got = m.Method }),
 		webhttp.WithRecordRouteMetric(nil),
 	).ServeHTTP(httptest.NewRecorder(), requestWithPath(http.MethodDelete, "/api/sessions/x"))
 
