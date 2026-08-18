@@ -13,7 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/cplieger/webhttp"
+	"github.com/cplieger/webhttp/v2"
 )
 
 func TestValidRequestID(t *testing.T) {
@@ -538,7 +538,7 @@ func TestWithSkipUpgrades(t *testing.T) {
 			var metricCalls int
 			opts := []webhttp.LogOption{
 				webhttp.WithLogger(slog.New(logCap)),
-				webhttp.WithSkipUpgrades(),
+				webhttp.WithSkipUpgrades(true),
 				webhttp.WithClientIP(),
 				webhttp.WithRecordMetric(func(string, string, int, time.Duration) { metricCalls++ }),
 			}
@@ -631,7 +631,7 @@ func TestWithSkipUpgrades_recordsTheRefusalAPredicateSuppresses(t *testing.T) {
 	observing := &captureHandler{}
 	webhttp.RequestLogger(refused,
 		webhttp.WithLogger(slog.New(observing)),
-		webhttp.WithSkipUpgrades(),
+		webhttp.WithSkipUpgrades(true),
 	).ServeHTTP(httptest.NewRecorder(), upgradeRequest())
 
 	recs := observing.snapshot()
@@ -661,6 +661,45 @@ func TestWithSkipUpgrades_absentLeavesUpgradesLogged(t *testing.T) {
 	}
 }
 
+// TestWithSkipUpgrades_falseMatchesAbsentAndLastWins pins the parameter form's
+// contract: false is exactly what leaving the option out means (so a caller can
+// pass its own computed flag without branching), and options resolve last-wins
+// in both directions.
+func TestWithSkipUpgrades_falseMatchesAbsentAndLastWins(t *testing.T) {
+	cases := []struct {
+		name      string
+		opts      []webhttp.LogOption
+		wantLines int
+	}{
+		{"false", []webhttp.LogOption{webhttp.WithSkipUpgrades(false)}, 1},
+		{"true", []webhttp.LogOption{webhttp.WithSkipUpgrades(true)}, 0},
+		{
+			"true then false restores the record",
+			[]webhttp.LogOption{webhttp.WithSkipUpgrades(true), webhttp.WithSkipUpgrades(false)},
+			1,
+		},
+		{
+			"false then true suppresses it",
+			[]webhttp.LogOption{webhttp.WithSkipUpgrades(false), webhttp.WithSkipUpgrades(true)},
+			0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logCap := &captureHandler{}
+			opts := append([]webhttp.LogOption{webhttp.WithLogger(slog.New(logCap))}, tc.opts...)
+			h := webhttp.RequestLogger(wsUpgradeHandler(t), opts...)
+
+			w := &hijackableRecorder{ResponseRecorder: httptest.NewRecorder()}
+			h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/ws", nil))
+
+			if got := len(logCap.snapshot()); got != tc.wantLines {
+				t.Errorf("got %d access lines for the completed upgrade, want %d", got, tc.wantLines)
+			}
+		})
+	}
+}
+
 // TestWithSkipUpgrades_panicAfterTheSwitchIsStillLogged pins the godoc claim
 // that suppressing the record does not hide a crash mid-session: Recoverer logs
 // the panic and its stack from its own line, which is where a failure after the
@@ -674,7 +713,7 @@ func TestWithSkipUpgrades_panicAfterTheSwitchIsStillLogged(t *testing.T) {
 		panic("session boom")
 	})
 	h := webhttp.Chain(next,
-		webhttp.Logging(webhttp.WithLogger(slog.New(logCap)), webhttp.WithSkipUpgrades()),
+		webhttp.Logging(webhttp.WithLogger(slog.New(logCap)), webhttp.WithSkipUpgrades(true)),
 		webhttp.Recoverer(webhttp.WithRecoverLogger(slog.New(logCap))),
 	)
 

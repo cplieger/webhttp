@@ -5,7 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/cplieger/webhttp"
+	"github.com/cplieger/webhttp/v2"
 )
 
 func TestParseCIDRs(t *testing.T) {

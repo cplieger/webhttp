@@ -146,14 +146,15 @@ func TestRateLimiter429DefaultRenderingUnchanged(t *testing.T) {
 func TestRateLimiterCustomResponder(t *testing.T) {
 	var calls int
 	var gotStatus int
-	var gotCode, gotMsg, gotRetryAfter string
-	responder := func(w http.ResponseWriter, _ *http.Request, status int, code, msg string) {
+	var gotCode ErrorCode
+	var gotMsg, gotRetryAfter string
+	responder := func(w http.ResponseWriter, _ *http.Request, status int, code ErrorCode, msg string) {
 		calls++
 		gotStatus, gotCode, gotMsg = status, code, msg
 		gotRetryAfter = w.Header().Get("Retry-After")
 		w.Header().Set("Content-Type", "application/xml")
 		w.WriteHeader(status)
-		_, _ = w.Write([]byte(`<error code="` + code + `">` + msg + `</error>`))
+		_, _ = w.Write([]byte(`<error code="` + string(code) + `">` + msg + `</error>`))
 	}
 	hits := 0
 	h := RateLimiter(1, 100*time.Second, WithRateLimitResponder(responder))(okHandler(&hits))
@@ -199,12 +200,13 @@ func TestRateLimiterCustomResponder(t *testing.T) {
 // WithRateLimitError are the ones handed to a custom responder, so an app keeps
 // one error taxonomy across both renderings.
 func TestRateLimiterResponderComposesWithRateLimitError(t *testing.T) {
-	var gotCode, gotMsg string
-	responder := func(w http.ResponseWriter, _ *http.Request, status int, code, msg string) {
+	var gotCode ErrorCode
+	var gotMsg string
+	responder := func(w http.ResponseWriter, _ *http.Request, status int, code ErrorCode, msg string) {
 		gotCode, gotMsg = code, msg
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(status)
-		_, _ = w.Write([]byte(code + ": " + msg))
+		_, _ = w.Write([]byte(string(code) + ": " + msg))
 	}
 	hits := 0
 	h := RateLimiter(1, 100*time.Second,

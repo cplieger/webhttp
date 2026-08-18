@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cplieger/webhttp"
+	"github.com/cplieger/webhttp/v2"
 )
 
 // FuzzClientIP_spoofProofAndCleanOutput fuzzes the raw, attacker-controlled

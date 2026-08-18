@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cplieger/webhttp"
+	"github.com/cplieger/webhttp/v2"
 )
 
 func TestReady_zeroValueIsNotReady(t *testing.T) {

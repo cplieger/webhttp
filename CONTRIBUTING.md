@@ -70,6 +70,27 @@ A few properties are load-bearing. Keep them when you change the code.
   gets no hook at all on the serve-exit path.
 - **`WriteError` is nil-safe.** It must not panic when `r` is nil; the
   `RequestID` field simply stays empty.
+- **The envelope's `code` is a machine token, and `errorEnvelope` is where that
+  is enforced.** `ErrorCode`'s grammar is `[a-z0-9_]` (empty means "omit the
+  field"), which is what every code in this library and in every consumer
+  spells. A code that breaks it is REFUSED, never repaired: the encoder
+  substitutes `InvalidErrorCode` and warns once per process. Two halves of that
+  are load-bearing. It must not panic — this runs per request on an error path,
+  so a panic would convert a handled 4xx into a dropped connection or, under
+  `Recoverer`, into a 500 that blames the server for the client's mistake; a
+  validating panic belongs at construction time, and an error code has no
+  construction step. And the check must stay in `errorEnvelope`, the single
+  funnel every library error body goes through (`WriteError` live,
+  `errorBodyJSON` pre-rendered), so no new writer can bypass it.
+- **`HSTS.Preload` requires `HSTS.IncludeSubdomains`, and the refusal drops the
+  directive rather than adding the flag.** The browsers' preload list rejects a
+  submission without `includeSubDomains`, or with a `max-age` under one year
+  (both are policed by `HSTS.Validate`), so emitting `preload` there advertises
+  a posture the operator does not get. Inferring `includeSubDomains` from
+  `preload` would widen a security commitment the caller never made — the same
+  reason `CanonicalHost` refuses to repair. `HSTS.Validate` is the one home of
+  the rule; `WithHSTS` logs it (an option cannot return an error) and
+  `HSTS.header` renders only what `Validate` accepts.
 - **Every 405 carries an `Allow` header, and a one-method 405 stays
   byte-identical.** RFC 9110 makes the header mandatory on a 405 and defines it
   as a comma-separated list, so `RequireMethod` is built on `MethodNotAllowed`,

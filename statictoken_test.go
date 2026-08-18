@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cplieger/webhttp"
+	"github.com/cplieger/webhttp/v2"
 )
 
 func TestStaticTokenVerifier(t *testing.T) {

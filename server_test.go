@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/webhttp"
+	"github.com/cplieger/webhttp/v2"
 )
 
 func TestNewServer_defaults(t *testing.T) {

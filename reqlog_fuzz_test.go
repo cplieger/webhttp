@@ -9,7 +9,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	"github.com/cplieger/webhttp"
+	"github.com/cplieger/webhttp/v2"
 )
 
 // FuzzValidRequestID pins the request-id charset trust boundary: for ANY input,

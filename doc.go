@@ -40,7 +40,9 @@
 //     embedded page bytes instead of 'unsafe-inline' (InlineScriptHashes;
 //     the policy string itself stays app-owned, passed via WithCSP),
 //   - JSON response and error helpers (WriteJSON, WriteJSONStatus, Ok,
-//     WriteError),
+//     WriteError), whose envelope keeps the machine-readable code (ErrorCode)
+//     typed apart from the human message and refuses to emit a code that is
+//     not a token,
 //   - request-prelude helpers for body limiting, method gating, and JSON
 //     decoding (LimitBody, RequireMethod, MethodNotAllowed, DecodeBody),
 //   - the request path http.ServeMux will actually route, with the verdict on
@@ -80,7 +82,7 @@
 // mechanism only; each consuming application layers its own route table, error
 // taxonomy, and named helpers on top.
 //
-// The sse subpackage (github.com/cplieger/webhttp/sse) adds a broadcast hub
+// The sse subpackage (github.com/cplieger/webhttp/v2/sse) adds a broadcast hub
 // for Server-Sent Events: replay ring with Last-Event-ID resume, topic
 // filtering, keepalives, client caps, and a shutdown drain gate. It is the
 // streaming counterpart to the request/response helpers here (RouteTimeout

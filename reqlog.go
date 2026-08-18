@@ -122,10 +122,10 @@ func WithSkipFunc(fn func(*http.Request) bool) LogOption {
 	return func(c *logConfig) { c.skipFunc = fn }
 }
 
-// WithSkipUpgrades suppresses the access record for a request whose response
-// SWITCHED PROTOCOLS — and for nothing else. It is what a WebSocket route
-// should use instead of a WithSkipFunc predicate that PREDICTS which requests
-// will upgrade.
+// WithSkipUpgrades selects whether the access record is suppressed for a request
+// whose response SWITCHED PROTOCOLS — and for nothing else. Enabled (true) it is
+// what a WebSocket route should use instead of a WithSkipFunc predicate that
+// PREDICTS which requests will upgrade.
 //
 // The decision comes from the response, not from the request. The record is
 // suppressed when the recorded status is 101 (the handshake went through the
@@ -191,8 +191,14 @@ func WithSkipFunc(fn func(*http.Request) bool) LogOption {
 // HTTP/2's extended-CONNECT upgrade (RFC 8441) answers 2xx rather than 101 and
 // is deliberately out of scope; it cannot arise for this option's audience
 // anyway, since a server that hijacks to speak WebSocket needs HTTP/1.1.
-func WithSkipUpgrades() LogOption {
-	return func(c *logConfig) { c.skipUpgrades = true }
+//
+// The default (false) matches leaving the option out: every request keeps its
+// record whatever status it ends on. Passing false explicitly is how a caller
+// threads its own computed flag without branching around the option, and options
+// are last-wins, so a later WithSkipUpgrades(false) restores the records an
+// earlier true suppressed.
+func WithSkipUpgrades(skip bool) LogOption {
+	return func(c *logConfig) { c.skipUpgrades = skip }
 }
 
 // redactedPathFallback is the fail-closed placeholder recorded as the path

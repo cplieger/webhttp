@@ -1,6 +1,7 @@
 package webhttp
 
 import (
+	"errors"
 	"log/slog"
 	"net/http"
 	"runtime/debug"
@@ -258,21 +259,135 @@ func WithCOOP(v string) SecurityOption {
 	return func(c *securityConfig) { c.coop = v }
 }
 
-// WithHSTS enables the Strict-Transport-Security header with the given max-age
-// and the includeSubDomains and preload directives. HSTS is OFF by default:
-// enable it only for a service reached exclusively over HTTPS, because a
-// browser that sees the header will refuse plain-HTTP and untrusted-certificate
-// connections to the host for the whole max-age window. A negative max-age is
-// clamped to zero (which instructs browsers to forget the policy).
-func WithHSTS(maxAge time.Duration, includeSubdomains, preload bool) SecurityOption {
-	secs := max(int64(maxAge.Seconds()), 0)
+// The two relational rules an HSTS value carries, both of them preload
+// submission criteria the browser preload list enforces (hstspreload.org):
+// preload is meaningless without includeSubDomains, and a preload submission
+// needs a max-age of at least one year. Both are policed, and for the same
+// reason: a policy asking for preload while failing a submission criterion is
+// a policy that will never be preloaded, which is silently not what the caller
+// asked for. Without Preload set, MaxAge is unconstrained — a short max-age is
+// a valid working policy, it just cannot be preloaded.
+var (
+	ErrHSTSPreloadWithoutSubdomains = errors.New("webhttp: HSTS preload requires IncludeSubdomains")
+	ErrHSTSPreloadMaxAgeTooShort    = errors.New("webhttp: HSTS preload requires MaxAge of at least one year")
+)
+
+// hstsPreloadMinMaxAge is the preload list's minimum max-age (one year), the
+// value hstspreload.org states as a submission requirement.
+const hstsPreloadMinMaxAge = 365 * 24 * time.Hour
+
+// HSTS is the Strict-Transport-Security policy passed to WithHSTS. The fields
+// are named rather than positional because two of them are booleans standing
+// for different directives: as a pair of adjacent arguments they could be
+// handed over transposed and the header would still build.
+//
+// The zero value is MEANINGFUL but is not "off": it renders "max-age=0", the
+// directive that tells a browser to FORGET an HSTS policy it already holds for
+// the host. HSTS off is leaving the option out of SecurityHeaders entirely.
+//
+// A negative MaxAge is clamped to zero (same "forget it" instruction), and
+// MaxAge is truncated to whole seconds, which is the only unit the header has.
+type HSTS struct {
+	// MaxAge is how long a browser should keep enforcing HTTPS for the host.
+	MaxAge time.Duration
+	// IncludeSubdomains extends the policy to every subdomain
+	// (includeSubDomains). Set it only when every subdomain is served over
+	// HTTPS; a browser that has seen it will refuse a plain-HTTP subdomain for
+	// the whole MaxAge window.
+	IncludeSubdomains bool
+	// Preload asks for inclusion in the browsers' built-in preload list, so the
+	// very first request to the host is upgraded. It REQUIRES IncludeSubdomains
+	// (see HSTS.Validate) and, for an actual submission, a MaxAge of at least a
+	// year. Preloading is effectively permanent from an operations point of
+	// view: removal takes months to reach users.
+	Preload bool
+}
+
+// Validate reports whether the policy is internally consistent: it returns
+// ErrHSTSPreloadWithoutSubdomains when Preload is set without
+// IncludeSubdomains, ErrHSTSPreloadMaxAgeTooShort when Preload is set with a
+// MaxAge under one year (which also catches the classic unit mistake — an
+// integer count of seconds assigned to a time.Duration field is nanoseconds,
+// so 31536000 renders max-age=0, "forget me", beside "preload me"), and nil
+// otherwise.
+//
+// It is the STRICT door for a caller that builds its HSTS value from
+// configuration and wants to refuse to boot on a contradiction — the same split
+// ParseCIDRs and ParseHostList offer, where the invalid input is returned and
+// the caller decides between rejecting it and proceeding. WithHSTS itself takes
+// the lenient half of that split, because a SecurityOption has no way to return
+// anything: it drops the offending directive and logs.
+func (h HSTS) Validate() error {
+	if !h.Preload {
+		return nil
+	}
+	if !h.IncludeSubdomains {
+		return ErrHSTSPreloadWithoutSubdomains
+	}
+	if h.MaxAge < hstsPreloadMinMaxAge {
+		return ErrHSTSPreloadMaxAgeTooShort
+	}
+	return nil
+}
+
+// header renders the Strict-Transport-Security value for h. It emits the
+// preload directive only for a policy that Validate accepts, so the refusal has
+// exactly one definition and takes effect here.
+func (h HSTS) header() string {
+	secs := max(int64(h.MaxAge.Seconds()), 0)
 	v := "max-age=" + strconv.FormatInt(secs, 10)
-	if includeSubdomains {
+	if h.IncludeSubdomains {
 		v += "; includeSubDomains"
 	}
-	if preload {
+	if h.Preload && h.Validate() == nil {
 		v += "; preload"
 	}
+	return v
+}
+
+// WithHSTS enables the Strict-Transport-Security header from the given policy.
+// HSTS is OFF by default: enable it only for a service reached exclusively over
+// HTTPS, because a browser that sees the header will refuse plain-HTTP and
+// untrusted-certificate connections to the host for the whole max-age window.
+//
+//	webhttp.SecurityHeaders(webhttp.WithHSTS(webhttp.HSTS{
+//		MaxAge:            365 * 24 * time.Hour,
+//		IncludeSubdomains: true,
+//		Preload:           true,
+//	}))
+//
+// A policy asking for Preload WITHOUT IncludeSubdomains is REFUSED, not
+// repaired: the header is emitted without the preload directive, and the
+// contradiction is logged at Warn naming the field to set (once per WithHSTS
+// call, which is wiring time rather than a request path). That is the honest
+// rendering — the browsers' preload list rejects such a submission
+// (hstspreload.org), so a header carrying the directive would advertise a
+// posture the operator does not actually get, and the failure would surface
+// only at submission time.
+//
+// The two rejected alternatives are worth recording. PANICKING is wrong for a
+// value that can legitimately come from configuration; the library's answer for
+// a caller that wants to fail closed at startup is HSTS.Validate, which returns
+// the same verdict as an error. And SILENTLY SETTING IncludeSubdomains would
+// widen a security policy the caller did not ask for: HSTS on every subdomain
+// is a strictly larger commitment than HSTS on one host, and inferring it from
+// a neighbouring flag is exactly the kind of repair CanonicalHost refuses for
+// the same reason.
+func WithHSTS(policy HSTS) SecurityOption {
+	if err := policy.Validate(); err != nil {
+		fix := "set HSTS.IncludeSubdomains, or clear HSTS.Preload"
+		if errors.Is(err, ErrHSTSPreloadMaxAgeTooShort) {
+			// Name the unit too: an integer count of seconds in a Duration
+			// field is nanoseconds, which is how a policy meant to say one
+			// year ends up saying max-age=0.
+			fix = "set HSTS.MaxAge to at least 365*24*time.Hour (a bare 31536000 is nanoseconds), or clear HSTS.Preload"
+		}
+		slog.Warn("webhttp: HSTS preload directive dropped from the header",
+			"error", err,
+			"fix", fix,
+		)
+	}
+	v := policy.header()
 	return func(c *securityConfig) { c.hsts = v }
 }
 

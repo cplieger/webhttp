@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cplieger/webhttp"
+	"github.com/cplieger/webhttp/v2"
 )
 
 // config carries hub-level settings; assembled by NewHub from Options.
@@ -79,6 +79,10 @@ func WithLogger(l *slog.Logger) Option {
 // Writer lets an OnConnect hook write frames onto the stream before live
 // delivery starts. Writes are unflushed until the hook returns (Serve
 // flushes once after the hook).
+//
+// A Writer is always supplied by Serve; there is no useful zero value and no
+// constructor. The zero Writer holds no destination, so calling Event or
+// Comment on one nil-dereferences.
 type Writer struct {
 	w io.Writer
 }

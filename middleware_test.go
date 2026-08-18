@@ -2,6 +2,7 @@ package webhttp_test
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
@@ -11,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/webhttp"
+	"github.com/cplieger/webhttp/v2"
 )
 
 // recordingMW returns a middleware that appends "<name>-in" before calling next
@@ -394,27 +395,37 @@ func TestSecurityHeaders_hsts(t *testing.T) {
 		{"off by default", nil, ""},
 		{
 			"max-age only",
-			[]webhttp.SecurityOption{webhttp.WithHSTS(24*time.Hour, false, false)},
+			[]webhttp.SecurityOption{webhttp.WithHSTS(webhttp.HSTS{MaxAge: 24 * time.Hour})},
 			"max-age=86400",
 		},
 		{
 			"includeSubDomains",
-			[]webhttp.SecurityOption{webhttp.WithHSTS(24*time.Hour, true, false)},
+			[]webhttp.SecurityOption{webhttp.WithHSTS(webhttp.HSTS{MaxAge: 24 * time.Hour, IncludeSubdomains: true})},
 			"max-age=86400; includeSubDomains",
 		},
 		{
 			"includeSubDomains and preload",
-			[]webhttp.SecurityOption{webhttp.WithHSTS(365*24*time.Hour, true, true)},
+			[]webhttp.SecurityOption{webhttp.WithHSTS(webhttp.HSTS{MaxAge: 365 * 24 * time.Hour, IncludeSubdomains: true, Preload: true})},
 			"max-age=31536000; includeSubDomains; preload",
 		},
 		{
-			"preload without subdomains",
-			[]webhttp.SecurityOption{webhttp.WithHSTS(time.Hour, false, true)},
-			"max-age=3600; preload",
+			// The relational guard: the preload list refuses a submission
+			// without includeSubDomains, so the directive is dropped rather
+			// than advertising a posture the operator does not get.
+			"preload without subdomains drops the directive",
+			[]webhttp.SecurityOption{webhttp.WithHSTS(webhttp.HSTS{MaxAge: time.Hour, Preload: true})},
+			"max-age=3600",
 		},
 		{
 			"negative max-age clamped to zero",
-			[]webhttp.SecurityOption{webhttp.WithHSTS(-1*time.Hour, false, false)},
+			[]webhttp.SecurityOption{webhttp.WithHSTS(webhttp.HSTS{MaxAge: -1 * time.Hour})},
+			"max-age=0",
+		},
+		{
+			// The zero value is meaningful and is NOT "off": it tells a browser
+			// to forget the policy. Leaving the option out is off.
+			"zero value forgets the policy",
+			[]webhttp.SecurityOption{webhttp.WithHSTS(webhttp.HSTS{})},
 			"max-age=0",
 		},
 	}
@@ -426,6 +437,103 @@ func TestSecurityHeaders_hsts(t *testing.T) {
 				t.Errorf("Strict-Transport-Security = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestHSTS_Validate(t *testing.T) {
+	cases := []struct {
+		name    string
+		policy  webhttp.HSTS
+		wantErr error
+	}{
+		{"zero value", webhttp.HSTS{}, nil},
+		{"max-age only", webhttp.HSTS{MaxAge: time.Hour}, nil},
+		{"subdomains", webhttp.HSTS{MaxAge: time.Hour, IncludeSubdomains: true}, nil},
+		{
+			"preload with subdomains",
+			webhttp.HSTS{MaxAge: 365 * 24 * time.Hour, IncludeSubdomains: true, Preload: true},
+			nil,
+		},
+		{
+			// Relational rule 1: the browsers' preload list refuses a
+			// submission without includeSubDomains.
+			"preload without subdomains",
+			webhttp.HSTS{MaxAge: 365 * 24 * time.Hour, Preload: true},
+			webhttp.ErrHSTSPreloadWithoutSubdomains,
+		},
+		{
+			// Relational rule 2: the list also requires a one-year max-age, so
+			// a preload policy under it would never be accepted.
+			"preload with a short max-age",
+			webhttp.HSTS{MaxAge: time.Hour, IncludeSubdomains: true, Preload: true},
+			webhttp.ErrHSTSPreloadMaxAgeTooShort,
+		},
+		{
+			// The unit mistake this catches in practice: 31536000 assigned to a
+			// Duration field is nanoseconds, so the header would have said
+			// max-age=0 ("forget me") beside "preload me".
+			"preload with seconds mistaken for a Duration",
+			webhttp.HSTS{MaxAge: 31536000, IncludeSubdomains: true, Preload: true},
+			webhttp.ErrHSTSPreloadMaxAgeTooShort,
+		},
+		{
+			// Exactly at the floor is accepted.
+			"preload at exactly one year",
+			webhttp.HSTS{MaxAge: 365 * 24 * time.Hour, IncludeSubdomains: true, Preload: true},
+			nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.policy.Validate(); !errors.Is(got, tc.wantErr) {
+				t.Errorf("Validate() = %v, want %v", got, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestWithHSTS_preloadWithoutSubdomainsWarns pins the lenient half of the guard:
+// a SecurityOption cannot return an error, so the contradiction is reported
+// through the log while HSTS.Validate stays the strict door for a caller that
+// wants to refuse to boot. The header itself is asserted in
+// TestSecurityHeaders_hsts (the directive is dropped, not repaired).
+func TestWithHSTS_preloadWithoutSubdomainsWarns(t *testing.T) {
+	logCap := &captureHandler{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(logCap))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	webhttp.WithHSTS(webhttp.HSTS{MaxAge: 365 * 24 * time.Hour, Preload: true})
+
+	recs := logCap.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("got %d log records, want 1 warn naming the contradiction", len(recs))
+	}
+	if recs[0].Level != slog.LevelWarn {
+		t.Errorf("level = %v, want Warn", recs[0].Level)
+	}
+	m := attrsOf(recs[0])
+	if m["error"] == nil {
+		t.Error("missing error attr; the warn must carry the verdict Validate returns")
+	}
+	if m["fix"] == nil {
+		t.Error("missing fix attr; the warn must name the field to set")
+	}
+}
+
+// TestWithHSTS_validPolicyIsSilent keeps the warn a signal rather than noise: a
+// policy Validate accepts logs nothing at wiring time.
+func TestWithHSTS_validPolicyIsSilent(t *testing.T) {
+	logCap := &captureHandler{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(logCap))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	webhttp.WithHSTS(webhttp.HSTS{MaxAge: 365 * 24 * time.Hour, IncludeSubdomains: true, Preload: true})
+	webhttp.WithHSTS(webhttp.HSTS{})
+
+	if recs := logCap.snapshot(); len(recs) != 0 {
+		t.Errorf("got %d log records for valid policies, want none", len(recs))
 	}
 }
 
@@ -722,10 +830,10 @@ func TestRecoverer_customResponderRendersNonJSON(t *testing.T) {
 	logCap := &captureHandler{}
 	// A non-JSON endpoint supplies an ErrorResponder that writes its own content
 	// type and body; Recoverer must use it for the 500 in place of the JSON default.
-	responder := func(w http.ResponseWriter, _ *http.Request, status int, code, msg string) {
+	responder := func(w http.ResponseWriter, _ *http.Request, status int, code webhttp.ErrorCode, msg string) {
 		w.Header().Set("Content-Type", "application/xml")
 		w.WriteHeader(status)
-		_, _ = w.Write([]byte(`<error code="` + code + `">` + msg + `</error>`))
+		_, _ = w.Write([]byte(`<error code="` + string(code) + `">` + msg + `</error>`))
 	}
 	panicky := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic("boom") })
 	h := webhttp.Recoverer(
@@ -779,7 +887,7 @@ func TestRecoverer_customResponderNotCalledOnCommittedResponse(t *testing.T) {
 	// The commit gate applies to a custom responder too: a handler that commits
 	// then panics must not have the responder write a second status or body.
 	var responderCalls int
-	responder := func(w http.ResponseWriter, r *http.Request, status int, code, msg string) {
+	responder := func(w http.ResponseWriter, r *http.Request, status int, code webhttp.ErrorCode, msg string) {
 		responderCalls++
 		webhttp.WriteError(w, r, status, code, msg)
 	}
@@ -874,7 +982,7 @@ func TestRecoverer_responderPanicBeforeCommitFallsBackToJSON500(t *testing.T) {
 	// A custom responder that panics BEFORE writing any header or body
 	// (pre-commit). The response is still uncommitted, so the recovery must fall
 	// back to the default JSON 500 and the client still receives a 500.
-	responder := func(http.ResponseWriter, *http.Request, int, string, string) {
+	responder := func(http.ResponseWriter, *http.Request, int, webhttp.ErrorCode, string) {
 		panic("responder boom")
 	}
 	panicky := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic("boom") })
