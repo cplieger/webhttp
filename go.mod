@@ -1,6 +1,6 @@
 module github.com/cplieger/webhttp
 
-go 1.26.7
+go 1.27.0
 
 // v1.5.0 shipped same-day sse API that v1.6.0 reshapes: sse.Replay(sinceID,
 // topic) was replaced by the parameterless snapshot sse.Buffered(), and the
