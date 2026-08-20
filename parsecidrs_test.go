@@ -1,6 +1,7 @@
 package webhttp_test
 
 import (
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -61,5 +62,57 @@ func TestParseCIDRs_feedsClientIP(t *testing.T) {
 	only, _ := webhttp.ParseCIDRs([]string{"192.0.2.1"})
 	if got := webhttp.ClientIP(r, only...); got != "203.0.113.9" {
 		t.Errorf("ClientIP with /32 = %q, want 203.0.113.9", got)
+	}
+}
+
+// TestParseCIDRs_v4in6PeerMatchesIPv4Entry pins the IPv4-in-IPv6 equivalence
+// the trusted-proxy set relies on, which nothing else asserted.
+//
+// It matters operationally: a dual-stack listener delivers an IPv4 proxy's
+// r.RemoteAddr as "::ffff:10.0.0.7", so if that did not match a "10.0.0.0/8"
+// entry the peer would read as untrusted, X-Forwarded-For would be ignored, and
+// every access line would record the proxy instead of the client. It fails in
+// the safe direction, which is exactly why it would go unnoticed.
+//
+// It matters for the implementation too, and that is the durable reason to pin
+// it. net.IPNet.Contains normalizes both spellings for free, so the current code
+// gets this right without trying (ParseCIDRs pairs a 16-byte 4-in-6 IP with a
+// 4-byte mask for a bare IPv4 entry, and Contains still answers correctly). A
+// net/netip port does NOT: measured on go1.27.0,
+// netip.PrefixFrom(netip.MustParseAddr("::ffff:203.0.113.7"), 128).
+// Contains(netip.MustParseAddr("203.0.113.7")) is false, because netip.Addr
+// keeps Is4In6 distinct from Is4 and a faithful port would have to call Unmap()
+// on both the entry and the peer. This test is what would catch that.
+func TestParseCIDRs_v4in6PeerMatchesIPv4Entry(t *testing.T) {
+	nets, invalid := webhttp.ParseCIDRs([]string{"10.0.0.0/8", "192.0.2.1", "::1"})
+	if len(invalid) != 0 || len(nets) != 3 {
+		t.Fatalf("ParseCIDRs = %d nets, %v invalid; want 3 nets, no invalid", len(nets), invalid)
+	}
+
+	const client = "203.0.113.9"
+	cases := []struct {
+		name, peer string
+		wantClient string
+	}{
+		{"plain IPv4 peer in a CIDR entry", "10.0.0.7", client},
+		{"4-in-6 peer in the same CIDR entry", "::ffff:10.0.0.7", client},
+		{"plain IPv4 peer as a bare host entry", "192.0.2.1", client},
+		{"4-in-6 peer against that bare host entry", "::ffff:192.0.2.1", client},
+		{"IPv6 loopback entry, canonical spelling", "::1", client},
+		{"IPv6 loopback entry, expanded spelling", "0:0:0:0:0:0:0:1", client},
+		// The negative direction, so the test is not vacuous: an untrusted peer
+		// in either spelling keeps its own address and the header is ignored.
+		{"untrusted plain IPv4 peer", "198.51.100.20", "198.51.100.20"},
+		{"untrusted 4-in-6 peer", "::ffff:198.51.100.20", "::ffff:198.51.100.20"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.RemoteAddr = net.JoinHostPort(tc.peer, "5000")
+			r.Header.Set("X-Forwarded-For", client)
+			if got := webhttp.ClientIP(r, nets...); got != tc.wantClient {
+				t.Errorf("ClientIP(peer %s) = %q, want %q", tc.peer, got, tc.wantClient)
+			}
+		})
 	}
 }
