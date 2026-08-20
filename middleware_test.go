@@ -1098,7 +1098,8 @@ func TestRouteTimeout_underRequestLoggerCorrelatesHeaderAndBody(t *testing.T) {
 	})
 	h := webhttp.RequestLogger(
 		webhttp.RouteTimeout(slow, 20*time.Millisecond, "server too slow"),
-		webhttp.WithLogger(discardLogger()))
+		webhttp.WithLogger(discardLogger()),
+	)
 
 	rr := serve(h, http.MethodGet, "/", nil)
 
