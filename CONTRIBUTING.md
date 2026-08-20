@@ -34,7 +34,7 @@ set of small, independent pieces:
 
 ## Invariants to preserve
 
-A few properties are load-bearing. Keep them when you change the code.
+A few properties are essential. Keep them when you change the code.
 
 - **`StatusRecorder` stays transparent to `http.ResponseController`.** The
   whole reason the recorder is safe to wrap around streaming handlers is its
@@ -60,7 +60,7 @@ A few properties are load-bearing. Keep them when you change the code.
   window. `http.ErrServerClosed` is a clean stop, and a real serve error takes
   precedence over a shutdown error in the return value.
 - **`Run` has exactly two exits, and they never overlap.** When `Serve` returns
-  on its own — before `ctx` is cancelled — the graceful sequence must NOT run:
+  on its own, before `ctx` is cancelled, the graceful sequence must NOT run:
   `WithPreDrain` and `onShutdown` are both documented against a graceful stop
   (`ctx` is still live on this path and there is no drain to precede), and
   `srv.Shutdown` must not be called after `Serve` has already returned and
@@ -75,7 +75,7 @@ A few properties are load-bearing. Keep them when you change the code.
   field"), which is what every code in this library and in every consumer
   spells. A code that breaks it is REFUSED, never repaired: the encoder
   substitutes `InvalidErrorCode` and warns once per process. Two halves of that
-  are load-bearing. It must not panic — this runs per request on an error path,
+  are essential. It must not panic, because this runs per request on an error path,
   so a panic would convert a handled 4xx into a dropped connection or, under
   `Recoverer`, into a 500 that blames the server for the client's mistake; a
   validating panic belongs at construction time, and an error code has no
@@ -83,11 +83,11 @@ A few properties are load-bearing. Keep them when you change the code.
   funnel every library error body goes through (`WriteError` live,
   `errorBodyJSON` pre-rendered), so no new writer can bypass it.
 - **`HSTS.Preload` requires `HSTS.IncludeSubdomains`, and the refusal drops the
-  directive rather than adding the flag.** The browsers' preload list rejects a
+  directive and does not add the flag.** The browsers' preload list rejects a
   submission without `includeSubDomains`, or with a `max-age` under one year
   (both are policed by `HSTS.Validate`), so emitting `preload` there advertises
   a posture the operator does not get. Inferring `includeSubDomains` from
-  `preload` would widen a security commitment the caller never made — the same
+  `preload` would widen a security commitment the caller never made, for the same
   reason `CanonicalHost` refuses to repair. `HSTS.Validate` is the one home of
   the rule; `WithHSTS` logs it (an option cannot return an error) and
   `HSTS.header` renders only what `Validate` accepts.
@@ -96,8 +96,8 @@ A few properties are load-bearing. Keep them when you change the code.
   as a comma-separated list, so `RequireMethod` is built on `MethodNotAllowed`,
   which renders the set through `SetAllow`: entries verbatim (a method token is
   case-sensitive), blanks dropped (a sender must not generate an empty list
-  element), exact duplicates collapsed, and the empty VALUE kept — never an
-  omitted header — when no method is allowed. The single-method path returns the
+  element), exact duplicates collapsed, and the empty VALUE kept, never an
+  omitted header, when no method is allowed. The single-method path returns the
   entry unchanged, which is what keeps existing `RequireMethod` callers on the
   exact same header, status, and body. `HEAD` is never implied by `GET`: a route
   that registers `HEAD` only to stop `ServeMux` serving it from the `GET`
@@ -123,6 +123,18 @@ A few properties are load-bearing. Keep them when you change the code.
   distinct wire values onto allowlisted keys and silently widen an exact-match
   gate; anything that does not parse strictly returns `""` and is rejected.
   Matching stays purely textual: no name resolution, no IDN mapping.
+- **A case fold that gates behaviour stops at ASCII.** Use `equalASCIIFold` or
+  `lowerASCIIString` from `asciifold.go`, never `strings.EqualFold` or
+  `strings.ToLower`, when the comparison decides admission on an ASCII protocol
+  token (a `Host` authority, a bind host, a content coding). The two stdlib
+  helpers launder different runes into ASCII, and the sets do not overlap:
+  U+017F and U+212A pass `strings.EqualFold` while U+0130 does not, yet
+  `strings.ToLower` maps U+0130 to `i`. Either channel lets a non-ASCII
+  spelling canonicalize onto an allowlisted key, which is the widening
+  `CanonicalHost` exists to prevent, arriving through the fold instead of the
+  grammar. `asciifold_internal_test.go` sweeps every code point and fails if
+  the laundering set changes, so keep that test when the toolchain moves. A
+  display comparison is unaffected; only identity checks are covered.
 - **`SecurityHeaders` never builds a CSP.** A Content-Security-Policy is
   application-owned; the middleware only sets what `WithCSP` is given. HSTS
   stays off unless `WithHSTS` is passed.
