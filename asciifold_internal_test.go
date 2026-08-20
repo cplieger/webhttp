@@ -1,8 +1,10 @@
 package webhttp
 
 import (
+	"slices"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // TestEqualASCIIFold pins the relation the package's safety comparisons rest
@@ -83,5 +85,100 @@ func TestEqualASCIIFoldDivergesFromStringsEqualFold(t *testing.T) {
 	}
 	if equalASCIIFold("\u0130nput", "input") {
 		t.Error(`equalASCIIFold("\u0130nput", "input") = true, want false`)
+	}
+}
+
+// TestLowerASCIIString pins the string-shaped fold: ASCII case-insensitive,
+// byte-exact outside ASCII, and identity-returning (no copy) when there is
+// nothing to fold.
+func TestLowerASCIIString(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name, in, want string
+	}{
+		{name: "already lower", in: "webterm.example.com", want: "webterm.example.com"},
+		{name: "all upper", in: "WEBTERM.EXAMPLE.COM", want: "webterm.example.com"},
+		{name: "mixed", in: "Webterm.Example.COM", want: "webterm.example.com"},
+		{name: "empty", in: "", want: ""},
+		{name: "digits and punctuation untouched", in: "my_service-1.2:80", want: "my_service-1.2:80"},
+		// The whole point: a non-ASCII rune keeps its bytes, so a later
+		// byte-class check can refuse it. strings.ToLower would fold the
+		// first two into ASCII.
+		{name: "dotted capital I keeps its bytes", in: "k\u0130bana", want: "k\u0130bana"},
+		{name: "kelvin sign keeps its bytes", in: "\u212Aibana", want: "\u212Aibana"},
+		{name: "long s keeps its bytes", in: "localho\u017ft", want: "localho\u017ft"},
+		{name: "non-ascii beside ascii upper", in: "K\u212AX", want: "k\u212Ax"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := lowerASCIIString(tc.in); got != tc.want {
+				t.Errorf("lowerASCIIString(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+			// Idempotence: the fold is a projection.
+			if got := lowerASCIIString(tc.want); got != tc.want {
+				t.Errorf("lowerASCIIString not idempotent: lowerASCIIString(%q) = %q, want %q", tc.want, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLowerASCIIStringLaunderingSetIsExactlyTwoRunes is the tripwire behind
+// CanonicalHost's byte-exact claim, and it is an exhaustive statement rather
+// than a sample: over all 1,114,112 code points, exactly two runes lowercase
+// under strings.ToLower into a string made only of bytes CanonicalHost's
+// validHostname accepts — U+0130 to "i" and U+212A to "k". Measured identical
+// on go1.26.7 (Unicode 15) and go1.27.0 (Unicode 17), so the set is a property
+// of Unicode case mapping and not of one toolchain.
+//
+// Two things this catches that a fixed table cannot. A future Unicode bump
+// adding a third such rune fails here, naming it, instead of silently widening
+// every gate built on a Unicode fold. And it red-checks the local fold: if
+// lowerASCIIString ever started agreeing with strings.ToLower on these runes,
+// the second half fails.
+func TestLowerASCIIStringLaunderingSetIsExactlyTwoRunes(t *testing.T) {
+	t.Parallel()
+
+	hostByte := func(b byte) bool {
+		switch {
+		case b >= '0' && b <= '9', b >= 'a' && b <= 'z', b == '-', b == '_', b == '.':
+			return true
+		}
+		return false
+	}
+	allHostBytes := func(s string) bool {
+		if s == "" {
+			return false
+		}
+		for i := range len(s) {
+			if !hostByte(s[i]) {
+				return false
+			}
+		}
+		return true
+	}
+
+	var launder []rune
+	for r := rune(utf8.RuneSelf); r <= utf8.MaxRune; r++ {
+		if !utf8.ValidRune(r) {
+			continue
+		}
+		if allHostBytes(strings.ToLower(string(r))) {
+			launder = append(launder, r)
+		}
+	}
+	want := []rune{'\u0130', '\u212A'}
+	if !slices.Equal(launder, want) {
+		t.Errorf("runes whose strings.ToLower lands in the hostname byte class = %U, want %U;\n"+
+			"a rune added here launders a non-ASCII authority onto an ASCII allowlist key under any Unicode fold",
+			launder, want)
+	}
+
+	// The local fold refuses every one of them, which is what makes
+	// CanonicalHost's "no IDN mapping is performed" claim true.
+	for _, r := range launder {
+		if got := lowerASCIIString(string(r)); got != string(r) {
+			t.Errorf("lowerASCIIString(%q) = %q, want the input unchanged (U+%04X)", string(r), got, r)
+		}
 	}
 }
