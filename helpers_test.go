@@ -3,6 +3,7 @@ package webhttp_test
 import (
 	"context"
 	"log/slog"
+	"net"
 	"net/http"
 	"sync"
 )
@@ -98,3 +99,72 @@ type nilUnwrappingWriter struct {
 }
 
 func (n *nilUnwrappingWriter) Unwrap() http.ResponseWriter { return nil }
+
+// pipeListener is an in-memory net.Listener over net.Pipe, plus the client that
+// dials it. It exists so a Run test can live inside a testing/synctest bubble.
+//
+// The bubble is the point, and a real listener forecloses it: measured on
+// go1.27.0, Run over a loopback listener inside a bubble HANGS to the go-test
+// timeout, its Serve goroutine parked in internal/poll.runtime_pollWait at
+// net.(*TCPListener).Accept and reported as "[IO wait, synctest bubble 1]".
+// Accept on a socket is not a DURABLY blocking operation, so the synthetic clock
+// can never advance. A channel receive is, which is the whole difference here.
+//
+// Go 1.27's httptest.NewTestServer solves the same problem for a handler test,
+// but its in-memory listener lives in net/http/internal/nettest and is not
+// exported, and Run takes a net.Listener rather than building its own. So this
+// is the reachable equivalent, deliberately the same shape.
+type pipeListener struct {
+	conns  chan net.Conn
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newPipeListener() *pipeListener {
+	return &pipeListener{conns: make(chan net.Conn), closed: make(chan struct{})}
+}
+
+func (l *pipeListener) Accept() (net.Conn, error) {
+	select {
+	case c := <-l.conns:
+		return c, nil
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *pipeListener) Close() error {
+	l.once.Do(func() { close(l.closed) })
+	return nil
+}
+
+func (l *pipeListener) Addr() net.Addr { return pipeAddr{} }
+
+// dial hands the listener one end of a fresh pipe and returns the other.
+func (l *pipeListener) dial() (net.Conn, error) {
+	server, client := net.Pipe()
+	select {
+	case l.conns <- server:
+		return client, nil
+	case <-l.closed:
+		_ = server.Close()
+		_ = client.Close()
+		return nil, net.ErrClosed
+	}
+}
+
+// client returns an http.Client whose every request reaches this listener,
+// whatever host it names.
+func (l *pipeListener) client() *http.Client {
+	return &http.Client{Transport: &http.Transport{
+		DialContext: func(context.Context, string, string) (net.Conn, error) { return l.dial() },
+	}}
+}
+
+// pipeAddr is the address of an in-memory pipe listener. The value is never
+// dialed — pipeListener.client bypasses address resolution entirely — so it only
+// has to be a stable, printable net.Addr.
+type pipeAddr struct{}
+
+func (pipeAddr) Network() string { return "pipe" }
+func (pipeAddr) String() string  { return "pipe" }

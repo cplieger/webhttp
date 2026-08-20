@@ -10,6 +10,7 @@ import (
 	"net/http/httptrace"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/cplieger/webhttp/v2"
@@ -432,64 +433,79 @@ type limitProbeResult struct {
 // runLimitBodyProbe serves one POST of bodyLen bytes through wrap under a
 // maxBytes cap and reports what both ends observed. wrap composes the
 // middleware (or writer wrapper) under test around the reading handler.
+//
+// It runs inside a synctest bubble over httptest.NewTestServer's in-memory
+// network (Go 1.27), and both halves are load-bearing. The in-memory network is
+// what makes the bubble possible at all — a loopback listener parks a goroutine
+// on a socket poll, which never counts as durably blocked, so the synthetic
+// clock could not advance. And the bubble is what makes it fast: measured on
+// go1.27.0, one probe takes under 1 ms either way, but httptest.Server.Close
+// costs ~500 ms of REAL time on both the loopback and the in-memory listener,
+// and only inside a bubble is that a synthetic wait. Six probes ran in 3.55 s
+// of the package's 5.85 s before the conversion.
+//
+// What the in-memory network does NOT cost, verified rather than assumed:
+// resp.Close and httptrace's GotConnInfo.Reused both still report the real
+// transport outcome, which is the whole point of this probe.
 func runLimitBodyProbe(t *testing.T, wrap func(http.Handler) http.Handler, maxBytes int64, bodyLen int) limitProbeResult {
 	t.Helper()
 
 	var res limitProbeResult
-	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost { // the reuse probe below
+	synctest.Test(t, func(t *testing.T) {
+		h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost { // the reuse probe below
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			webhttp.LimitBody(w, r, maxBytes)
+			_, err := io.ReadAll(r.Body)
+			tooLarge, isTooLarge := errors.AsType[*http.MaxBytesError](err)
+			res.tooLarge = isTooLarge
+			if isTooLarge && tooLarge.Limit != maxBytes {
+				t.Errorf("MaxBytesError.Limit = %d, want the cap %d", tooLarge.Limit, maxBytes)
+			}
+			if err != nil && !isTooLarge {
+				t.Errorf("read err = %v (%T), want nil or *http.MaxBytesError", err, err)
+			}
+			if isTooLarge {
+				w.WriteHeader(http.StatusRequestEntityTooLarge)
+				return
+			}
 			w.WriteHeader(http.StatusOK)
-			return
+		})
+
+		srv := httptest.NewTestServer(t, wrap(h))
+		client := srv.Client()
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, srv.URL, strings.NewReader(strings.Repeat("z", bodyLen)))
+		if err != nil {
+			t.Fatalf("build request: %v", err)
 		}
-		webhttp.LimitBody(w, r, maxBytes)
-		_, err := io.ReadAll(r.Body)
-		var tooLarge *http.MaxBytesError
-		res.tooLarge = errors.As(err, &tooLarge)
-		if res.tooLarge && tooLarge.Limit != maxBytes {
-			t.Errorf("MaxBytesError.Limit = %d, want the cap %d", tooLarge.Limit, maxBytes)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("POST: %v", err)
 		}
-		if err != nil && !res.tooLarge {
-			t.Errorf("read err = %v (%T), want nil or *http.MaxBytesError", err, err)
+		res.status, res.clientClose = resp.StatusCode, resp.Close
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		// Whether the connection survived is the effect that actually matters (a
+		// closed connection is what stops a sender from streaming more), so observe
+		// it directly rather than trusting the header alone.
+		next, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, nil)
+		if err != nil {
+			t.Fatalf("build reuse probe: %v", err)
 		}
-		if res.tooLarge {
-			w.WriteHeader(http.StatusRequestEntityTooLarge)
-			return
+		next = next.WithContext(httptrace.WithClientTrace(next.Context(), &httptrace.ClientTrace{
+			GotConn: func(i httptrace.GotConnInfo) { res.reusedNext = i.Reused },
+		}))
+		resp2, err := client.Do(next)
+		if err != nil {
+			t.Fatalf("reuse probe: %v", err)
 		}
-		w.WriteHeader(http.StatusOK)
+		_, _ = io.Copy(io.Discard, resp2.Body)
+		resp2.Body.Close()
 	})
-
-	srv := httptest.NewServer(wrap(h))
-	t.Cleanup(srv.Close)
-	client := srv.Client()
-
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, srv.URL, strings.NewReader(strings.Repeat("z", bodyLen)))
-	if err != nil {
-		t.Fatalf("build request: %v", err)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		t.Fatalf("POST: %v", err)
-	}
-	res.status, res.clientClose = resp.StatusCode, resp.Close
-	_, _ = io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-
-	// Whether the connection survived is the effect that actually matters (a
-	// closed connection is what stops a sender from streaming more), so observe
-	// it directly rather than trusting the header alone.
-	next, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, nil)
-	if err != nil {
-		t.Fatalf("build reuse probe: %v", err)
-	}
-	next = next.WithContext(httptrace.WithClientTrace(next.Context(), &httptrace.ClientTrace{
-		GotConn: func(i httptrace.GotConnInfo) { res.reusedNext = i.Reused },
-	}))
-	resp2, err := client.Do(next)
-	if err != nil {
-		t.Fatalf("reuse probe: %v", err)
-	}
-	_, _ = io.Copy(io.Discard, resp2.Body)
-	resp2.Body.Close()
 	return res
 }
 
@@ -615,36 +631,43 @@ func TestLimitBody_underLimitLeavesConnectionReusable(t *testing.T) {
 // Unwrapping serves the too-large signal ONLY: the recorder the handler writes
 // through is untouched, so Logging still reports the handler's real status.
 func TestLimitBody_overLimitStillRecordsStatusForLogging(t *testing.T) {
-	logs := &captureHandler{}
-	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		webhttp.LimitBody(w, r, 8)
-		_, err := io.ReadAll(r.Body)
-		if _, isTooLarge := errors.AsType[*http.MaxBytesError](err); !isTooLarge {
-			t.Errorf("read err = %v, want *http.MaxBytesError", err)
+	synctest.Test(t, func(t *testing.T) {
+		logs := &captureHandler{}
+		h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			webhttp.LimitBody(w, r, 8)
+			_, err := io.ReadAll(r.Body)
+			if _, isTooLarge := errors.AsType[*http.MaxBytesError](err); !isTooLarge {
+				t.Errorf("read err = %v, want *http.MaxBytesError", err)
+			}
+			webhttp.WriteError(w, r, http.StatusRequestEntityTooLarge, "too_large", "request body too large")
+		})
+		srv := httptest.NewTestServer(t, webhttp.Chain(h, webhttp.Logging(webhttp.WithLogger(slog.New(logs)))))
+		// Client() before srv.URL is read, not a style choice: on the in-memory
+		// network URL is "" until the first Client/Start/StartTLS call
+		// populates it (with "http://example.com"), so the common
+		// build-request-from-URL-then-Do order silently yields
+		// `unsupported protocol scheme ""`.
+		client := srv.Client()
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, srv.URL, strings.NewReader(strings.Repeat("z", 128)))
+		if err != nil {
+			t.Fatalf("build request: %v", err)
 		}
-		webhttp.WriteError(w, r, http.StatusRequestEntityTooLarge, "too_large", "request body too large")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("POST: %v", err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		recs := logs.snapshot()
+		if len(recs) != 1 {
+			t.Fatalf("captured %d access lines, want 1", len(recs))
+		}
+		if got := attrsOf(recs[0])["status"]; got != int64(http.StatusRequestEntityTooLarge) {
+			t.Errorf("logged status = %v, want %d: the StatusRecorder must still observe the handler's writes", got, http.StatusRequestEntityTooLarge)
+		}
 	})
-	srv := httptest.NewServer(webhttp.Chain(h, webhttp.Logging(webhttp.WithLogger(slog.New(logs)))))
-	defer srv.Close()
-
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, srv.URL, strings.NewReader(strings.Repeat("z", 128)))
-	if err != nil {
-		t.Fatalf("build request: %v", err)
-	}
-	resp, err := srv.Client().Do(req)
-	if err != nil {
-		t.Fatalf("POST: %v", err)
-	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-
-	recs := logs.snapshot()
-	if len(recs) != 1 {
-		t.Fatalf("captured %d access lines, want 1", len(recs))
-	}
-	if got := attrsOf(recs[0])["status"]; got != int64(http.StatusRequestEntityTooLarge) {
-		t.Errorf("logged status = %v, want %d: the StatusRecorder must still observe the handler's writes", got, http.StatusRequestEntityTooLarge)
-	}
 }
 
 // A wrapper whose Unwrap never terminates (returns itself), and one that returns

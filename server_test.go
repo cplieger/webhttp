@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/cplieger/webhttp/v2"
@@ -330,152 +331,143 @@ func TestRun_nilServeExitIgnored(t *testing.T) {
 }
 
 func TestRun_onShutdownNilIsSafe(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	srv := webhttp.NewServer(okHandler())
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	go func() { done <- webhttp.Run(ctx, srv, ln, nil) }() // nil onShutdown
+	synctest.Test(t, func(t *testing.T) {
+		ln := newPipeListener()
+		srv := webhttp.NewServer(okHandler())
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- webhttp.Run(ctx, srv, ln, nil) }() // nil onShutdown
 
-	// Give Serve a moment, then cancel.
-	time.Sleep(50 * time.Millisecond)
-	cancel()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Errorf("Run = %v, want nil", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Run did not return after cancellation with nil onShutdown")
-	}
-}
-
-func TestRun_slowOnShutdownStillRunsWithinGrace(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	srv := webhttp.NewServer(okHandler())
-
-	var teardownDone atomic.Bool
-	onShutdown := func(ctx context.Context) {
-		// A teardown that takes real time must still complete: the shared grace
-		// budget gives it room after Shutdown returns.
-		select {
-		case <-time.After(150 * time.Millisecond):
-			teardownDone.Store(true)
-		case <-ctx.Done():
-		}
-	}
-
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	go func() {
-		done <- webhttp.Run(ctx, srv, ln, onShutdown, webhttp.WithShutdownGrace(2*time.Second))
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-	cancel()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Errorf("Run = %v, want nil", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Run did not return after cancellation")
-	}
-	if !teardownDone.Load() {
-		t.Error("slow onShutdown did not complete within the shared grace budget")
-	}
-}
-
-func TestRun_holdsRequestOpenAcrossShutdown(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	const (
-		grace    = 2 * time.Second
-		blockFor = 400 * time.Millisecond
-	)
-	started := make(chan struct{})
-	srv := webhttp.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		close(started)
-		time.Sleep(blockFor) // remain in-flight so Shutdown must wait for us
-		w.WriteHeader(http.StatusOK)
-	}))
-
-	var (
-		teardownDL    time.Time
-		teardownHasDL bool
-		teardownRan   atomic.Bool
-	)
-	onShutdown := func(ctx context.Context) {
-		teardownDL, teardownHasDL = ctx.Deadline()
-		teardownRan.Store(true)
-	}
-
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	go func() {
-		done <- webhttp.Run(ctx, srv, ln, onShutdown, webhttp.WithShutdownGrace(grace))
-	}()
-
-	addr := ln.Addr().String()
-	statusCh := make(chan int, 1)
-	go func() {
-		client := &http.Client{Timeout: 5 * time.Second}
-		resp, err := client.Get("http://" + addr + "/")
-		if err != nil {
-			statusCh <- 0
-			return
-		}
-		defer func() { _ = resp.Body.Close() }()
-		statusCh <- resp.StatusCode
-	}()
-
-	select {
-	case <-started:
-	case <-time.After(3 * time.Second):
+		// synctest.Wait replaces a 50ms "give Serve a moment" sleep: it returns
+		// once Run's Serve goroutine is durably blocked in Accept, so the server
+		// is provably up rather than probably up.
+		synctest.Wait()
 		cancel()
-		t.Fatal("handler never became in-flight")
-	}
+		if err := <-done; err != nil {
+			t.Errorf("Run = %v, want nil", err)
+		}
+	})
+}
 
-	t0 := time.Now()
-	cancel() // request is in-flight; graceful shutdown must let it finish
+// TestRun_slowOnShutdownStillRunsWithinGrace pins that a teardown taking real
+// time still completes, because the grace budget gives it room after Shutdown
+// returns. In synthetic time the teardown's own duration is exact, so the test
+// asserts WHEN Run returned rather than only that the teardown flag was set —
+// a teardown cut short at 0ms would satisfy the old boolean.
+func TestRun_slowOnShutdownStillRunsWithinGrace(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ln := newPipeListener()
+		srv := webhttp.NewServer(okHandler())
 
-	var runErr error
-	select {
-	case runErr = <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("Run did not return")
-	}
-	if runErr != nil {
-		t.Errorf("Run = %v, want nil", runErr)
-	}
+		const teardown = 150 * time.Millisecond
+		var teardownDone atomic.Bool
+		onShutdown := func(ctx context.Context) {
+			select {
+			case <-time.After(teardown):
+				teardownDone.Store(true)
+			case <-ctx.Done():
+			}
+		}
 
-	select {
-	case code := <-statusCh:
-		if code != http.StatusOK {
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() {
+			done <- webhttp.Run(ctx, srv, ln, onShutdown, webhttp.WithShutdownGrace(2*time.Second))
+		}()
+
+		synctest.Wait()
+		t0 := time.Now()
+		cancel()
+
+		if err := <-done; err != nil {
+			t.Errorf("Run = %v, want nil", err)
+		}
+		if !teardownDone.Load() {
+			t.Error("slow onShutdown did not complete within the shared grace budget")
+		}
+		// The drain of an idle server is instantaneous, so Run's return is the
+		// teardown's own duration and nothing else.
+		if got := time.Since(t0); got != teardown {
+			t.Errorf("Run returned %v after cancellation, want exactly the %v teardown", got, teardown)
+		}
+	})
+}
+
+// TestRun_holdsRequestOpenAcrossShutdown pins the ONE shared grace budget: an
+// in-flight request is drained first, and the teardown deadline still sits
+// exactly grace from when shutdown began rather than grace after the drain
+// finished.
+//
+// It runs inside a synctest bubble over an in-memory listener, which is what
+// makes "exactly" the right word. On a real clock the assertion could only be
+// `span <= grace + 250ms` — a tolerance wide enough that a per-phase timeout
+// pushing the deadline out by 100ms would have passed. In synthetic time the
+// span is an equality, and the two sleeps the test needed (400ms of in-flight
+// handler, 50ms of settling) cost nothing: the test went from 0.53s to 0.00s.
+func TestRun_holdsRequestOpenAcrossShutdown(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ln := newPipeListener()
+		const (
+			grace    = 2 * time.Second
+			blockFor = 400 * time.Millisecond
+		)
+		started := make(chan struct{})
+		srv := webhttp.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			close(started)
+			time.Sleep(blockFor) // remain in-flight so Shutdown must wait for us
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		var (
+			teardownDL    time.Time
+			teardownHasDL bool
+			teardownRan   atomic.Bool
+		)
+		onShutdown := func(ctx context.Context) {
+			teardownDL, teardownHasDL = ctx.Deadline()
+			teardownRan.Store(true)
+		}
+
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() {
+			done <- webhttp.Run(ctx, srv, ln, onShutdown, webhttp.WithShutdownGrace(grace))
+		}()
+
+		statusCh := make(chan int, 1)
+		go func() {
+			resp, err := ln.client().Get("http://pipe/")
+			if err != nil {
+				statusCh <- 0
+				return
+			}
+			defer func() { _ = resp.Body.Close() }()
+			statusCh <- resp.StatusCode
+		}()
+
+		<-started // the bubble deadlocks rather than hanging if this never fires
+
+		t0 := time.Now()
+		cancel() // request is in-flight; graceful shutdown must let it finish
+
+		if runErr := <-done; runErr != nil {
+			t.Errorf("Run = %v, want nil", runErr)
+		}
+		if code := <-statusCh; code != http.StatusOK {
 			t.Errorf("in-flight request status = %d, want 200 (held open across shutdown)", code)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("in-flight request never completed")
-	}
-
-	if !teardownRan.Load() || !teardownHasDL {
-		t.Fatal("onShutdown did not run with a deadline")
-	}
-	// One shared budget: the teardown deadline sits ~grace from when shutdown
-	// began (t0), even though Shutdown first spent ~blockFor draining the
-	// in-flight request. A per-phase timeout would push it out to ~grace+blockFor.
-	if span := teardownDL.Sub(t0); span > grace+250*time.Millisecond {
-		t.Errorf("teardown deadline is %v after shutdown start, want ~%v (shared budget, not ~%v)",
-			span, grace, grace+blockFor)
-	}
+		if !teardownRan.Load() || !teardownHasDL {
+			t.Fatal("onShutdown did not run with a deadline")
+		}
+		// One shared budget: the teardown deadline sits exactly grace from when
+		// shutdown began (t0), even though Shutdown first spent blockFor draining
+		// the in-flight request. A per-phase timeout would put it at
+		// grace+blockFor.
+		if span := teardownDL.Sub(t0); span != grace {
+			t.Errorf("teardown deadline is %v after shutdown start, want exactly %v (shared budget, not %v)",
+				span, grace, grace+blockFor)
+		}
+	})
 }
 
 func TestRun_returnsShutdownDeadlineExceeded(t *testing.T) {
