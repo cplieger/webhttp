@@ -26,6 +26,17 @@ import (
 // 192.0.2.1) compare equal. The function is idempotent:
 // CanonicalHost(CanonicalHost(x)) == CanonicalHost(x).
 //
+// Lowercasing is ASCII-ONLY (lowerASCIIString), not strings.ToLower, and that
+// is load-bearing rather than an optimization. Unicode simple case mapping
+// lowercases two already-assigned runes INTO ASCII — U+0130 LATIN CAPITAL
+// LETTER I WITH DOT ABOVE to "i" and U+212A KELVIN SIGN to "k" — so under
+// strings.ToLower a Host of "\u212Aibana.example" canonicalized to
+// "kibana.example" and an allowlist holding the ASCII name admitted it, from
+// any peer. That is the same widening the reject-never-repair rule below
+// exists to prevent, arriving through the case fold instead of the grammar.
+// With an ASCII fold every non-ASCII byte survives the fold and validHostname
+// then refuses it, which is what makes the byte-exact claim above true.
+//
 // Everything else returns "": stray or unmatched brackets, a bracketed
 // non-IPv6 ("[allowed.example]" — brackets are IPv6-only syntax), a
 // non-numeric, out-of-range, or empty port, a second port, more than one
@@ -66,7 +77,7 @@ func CanonicalHost(hostport string) string {
 		}
 		host = host[:i]
 	}
-	host = strings.TrimSuffix(strings.ToLower(host), ".") // at most one FQDN dot
+	host = strings.TrimSuffix(lowerASCIIString(host), ".") // at most one FQDN dot
 	if ip := net.ParseIP(host); ip != nil {
 		return ip.String() // IPv4 that carried a port or a trailing dot
 	}

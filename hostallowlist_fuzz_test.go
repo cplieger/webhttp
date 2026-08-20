@@ -4,8 +4,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/cplieger/webhttp/v2"
 )
@@ -34,6 +36,13 @@ func FuzzCanonicalHost(f *testing.F) {
 		"example.com..", "example.com:1:2", "example.com:", "example.com:99999",
 		"0177.0.0.1", "1.2.3.4.5", "my_service", "[::ffff:127.0.0.1]:80",
 		"[127.0.0.1]", "wébterm.example",
+		// The two case-fold laundering runes: strings.ToLower maps U+0130 to
+		// "i" and U+212A to "k", so under a Unicode fold each of these
+		// canonicalized to an ASCII key an allowlist could hold. They must
+		// reject. Measured identical on Unicode 15 and 17, so this is a
+		// permanent property of the mapping, not a release-specific one.
+		"\u212Aibana.example", "k\u0130bana.example", "\u212A\u0130.example",
+		"\u212Aibana.example:443", "\u212Aibana.example.",
 	} {
 		f.Add(s)
 	}
@@ -44,6 +53,18 @@ func FuzzCanonicalHost(f *testing.F) {
 		}
 		if lower := strings.ToLower(got); lower != got {
 			t.Errorf("CanonicalHost(%q)=%q is not lowercase", in, got)
+		}
+		// Canonical output is pure ASCII, which is what makes the allowlist's
+		// byte-exact matching claim true. A non-ASCII byte reaching the output
+		// would mean some rune survived the ASCII fold and validHostname, and
+		// the reverse direction is the live hazard this pins: strings.ToLower
+		// maps U+0130 to "i" and U+212A to "k", so a Unicode fold here would
+		// let a non-ASCII authority produce an ASCII canonical key.
+		for i := range len(got) {
+			if got[i] >= utf8.RuneSelf {
+				t.Errorf("CanonicalHost(%q)=%q carries a non-ASCII byte %#x at %d", in, got, got[i], i)
+				break
+			}
 		}
 		if ip := net.ParseIP(in); ip != nil && got != ip.String() {
 			t.Errorf("CanonicalHost(%q)=%q, want IP canonical form %q", in, got, ip.String())
@@ -94,15 +115,26 @@ func FuzzHostPolicyAllows(f *testing.F) {
 	f.Add("webterm.example.com..", "203.0.113.9:5000", false)
 	f.Add("127.0.0.1", "127.0.0.1", true)
 	f.Add("[::ffff:127.0.0.1]:80", "[::1]:5", true)
+	// Case-fold laundering against the second allowlist entry. It exists
+	// BECAUSE the first one cannot express this class: "webterm.example.com"
+	// carries neither 'i' nor 'k', and those are the only two ASCII letters
+	// strings.ToLower can produce from a non-ASCII rune (U+0130 and U+212A),
+	// so no laundering input could ever have reached the old single-entry
+	// oracle. That is why the fuzzer never found the widening it was written
+	// to catch.
+	f.Add("\u212Aibana.example", "203.0.113.9:5000", false)
+	f.Add("k\u0130bana.example", "203.0.113.9:5000", false)
+	f.Add("\u212A\u0130bana.example:443", "203.0.113.9:5000", true)
 
-	// A fixed, active allowlist of one browser-facing host.
-	const allowed = "webterm.example.com"
+	// A fixed, active allowlist: one browser-facing host, plus one whose name
+	// carries the two letters a Unicode case fold can synthesize.
+	allowed := []string{"webterm.example.com", "kibana.example"}
 	f.Fuzz(func(t *testing.T, host, remoteAddr string, exempt bool) {
 		var opts []webhttp.HostAllowlistOption
 		if exempt {
 			opts = append(opts, webhttp.WithLoopbackExempt(true))
 		}
-		p, _ := webhttp.ParseHostList([]string{allowed}, opts...)
+		p, _ := webhttp.ParseHostList(allowed, opts...)
 
 		req := httptest.NewRequest(http.MethodGet, "http://placeholder/x", http.NoBody)
 		req.Host = host
@@ -113,7 +145,7 @@ func FuzzHostPolicyAllows(f *testing.F) {
 		}
 		// Admitted: it must be justified by exactly one of the two rules,
 		// re-derived independently below.
-		if name, ok := splitAuthority(host); ok && strings.TrimSuffix(strings.ToLower(name), ".") == allowed {
+		if name, ok := splitAuthority(host); ok && slices.Contains(allowed, strings.TrimSuffix(oracleLowerASCII(name), ".")) {
 			return
 		}
 		if exempt && oracleLoopbackHost(host) && loopbackAddr(remoteAddr) {
@@ -191,6 +223,23 @@ func FuzzLoopbackRequest(f *testing.F) {
 	})
 }
 
+// oracleLowerASCII lowercases the ASCII uppercase letters of s and leaves every
+// other byte alone. It is deliberately NOT strings.ToLower: that applies
+// Unicode simple case mapping, which lowercases U+0130 to "i" and U+212A to
+// "k", so an oracle written with it would launder exactly the way the
+// implementation must not — and an oracle sharing the defect it is meant to
+// catch proves nothing. This is the one dimension on which the oracles below
+// must diverge from the stdlib helper rather than merely from the package.
+func oracleLowerASCII(s string) string {
+	b := []byte(s)
+	for i := range b {
+		if b[i] >= 'A' && b[i] <= 'Z' {
+			b[i] += 'a' - 'A'
+		}
+	}
+	return string(b)
+}
+
 // splitAuthority splits an unbracketed authority into its name, stripping at
 // most one syntactically valid ":port" suffix; a second colon or a bad port
 // fails. Written from the RFC 3986 authority grammar, independent of
@@ -238,7 +287,7 @@ func oracleLoopbackHost(host string) bool {
 	if !ok {
 		return false
 	}
-	name = strings.TrimSuffix(strings.ToLower(name), ".")
+	name = strings.TrimSuffix(oracleLowerASCII(name), ".")
 	if name == "localhost" {
 		return true
 	}

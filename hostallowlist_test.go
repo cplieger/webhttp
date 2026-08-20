@@ -50,6 +50,20 @@ func TestCanonicalHost(t *testing.T) {
 		{"octal-looking ipv4", "0177.0.0.1", ""},
 		{"all-numeric dotted non-ip", "1.2.3.4.5", ""},
 		{"non-ascii name (use punycode)", "wébterm.example", ""},
+
+		// The case-fold laundering class. strings.ToLower applies Unicode
+		// simple case mapping, under which two ALREADY-ASSIGNED runes map into
+		// ASCII: U+0130 to "i" and U+212A to "k". Measured on go1.26.7
+		// (Unicode 15) and go1.27.0 (Unicode 17), those two are the complete
+		// set that lands in the byte class validHostname accepts, so a
+		// canonicalizer built on strings.ToLower turned each of these into an
+		// ASCII key an operator's allowlist could hold — the same widening the
+		// bracket and port shapes above pin, arriving through the fold instead
+		// of the grammar. The fold is ASCII-only, so they reject.
+		{"kelvin sign does not launder to k", "\u212Aibana.example", ""},
+		{"dotted capital I does not launder to i", "k\u0130bana.example", ""},
+		{"both laundering runes", "\u212A\u0130.example", ""},
+		{"laundering rune with a valid port", "\u212Aibana.example:443", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -231,6 +245,18 @@ func TestParseHostList(t *testing.T) {
 			[]string{"[allowed.example]", "allowed[.]example", "allowed.example:garbage:443", "example.com.."},
 			true, 0,
 			[]string{"[allowed.example]", "allowed[.]example", "allowed.example:garbage:443", "example.com.."},
+		},
+		{
+			// An operator entry spelled with a case-fold laundering rune is
+			// reported rather than silently canonicalized to its ASCII
+			// lookalike. Fail-loud is the right direction on both doors: the
+			// entry the operator meant is one keystroke away, and admitting the
+			// ASCII key from a non-ASCII entry would put a name in the map that
+			// no request spelling matches byte-for-byte.
+			"case-fold laundering entries reported",
+			[]string{"\u212Aibana.example", "k\u0130bana.example"},
+			true, 0,
+			[]string{"\u212Aibana.example", "k\u0130bana.example"},
 		},
 	}
 	for _, tc := range cases {
