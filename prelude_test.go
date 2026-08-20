@@ -386,8 +386,7 @@ func TestDecodeJSONInto_oversizeIsMaxBytesError(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
 	var p payload
 	err := webhttp.DecodeJSONInto(rr, req, &p, 16)
-	var maxErr *http.MaxBytesError
-	if !errors.As(err, &maxErr) {
+	if _, isTooLarge := errors.AsType[*http.MaxBytesError](err); !isTooLarge {
 		t.Fatalf("err = %v (%T), want a *http.MaxBytesError", err, err)
 	}
 }
@@ -620,8 +619,7 @@ func TestLimitBody_overLimitStillRecordsStatusForLogging(t *testing.T) {
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		webhttp.LimitBody(w, r, 8)
 		_, err := io.ReadAll(r.Body)
-		var tooLarge *http.MaxBytesError
-		if !errors.As(err, &tooLarge) {
+		if _, isTooLarge := errors.AsType[*http.MaxBytesError](err); !isTooLarge {
 			t.Errorf("read err = %v, want *http.MaxBytesError", err)
 		}
 		webhttp.WriteError(w, r, http.StatusRequestEntityTooLarge, "too_large", "request body too large")
@@ -667,8 +665,7 @@ func TestLimitBody_degenerateUnwrapChains(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(strings.Repeat("z", 128)))
 			webhttp.LimitBody(wrap(rr), req, 8) // must return, not spin
 			n, err := io.Copy(io.Discard, req.Body)
-			var tooLarge *http.MaxBytesError
-			if !errors.As(err, &tooLarge) {
+			if _, isTooLarge := errors.AsType[*http.MaxBytesError](err); !isTooLarge {
 				t.Fatalf("read err = %v (%T), want *http.MaxBytesError", err, err)
 			}
 			if n != 8 {
