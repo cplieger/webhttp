@@ -38,6 +38,10 @@ func FuzzClassifyBind(f *testing.F) {
 		"[::1%lo]:80", "127.0.0.1:", "localhost:http",
 		"9848", "127.0.0.1", "myhost", "", "127.0.0.1:80:90",
 		"::1:9848", "[::1:9848", "127.0.0.001:80", "0:0:0:0:0:0:0:1",
+		// Fold-laundering hosts: byte sequences Unicode simple folding maps
+		// onto the ASCII letters of "localhost". Each must classify as
+		// exposed, since no resolver maps them to loopback.
+		"localho\u017ft:80", "\u212A:80", "LOCALHO\u017fT:80",
 	}
 	for _, s := range seeds {
 		f.Add(s)

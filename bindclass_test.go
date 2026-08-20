@@ -49,10 +49,13 @@ func TestClassifyBind(t *testing.T) {
 		// address; ParseIP canonicalizes before IsLoopback.
 		{name: "4in6 loopback hex form", addr: "[::ffff:7f00:1]:80", want: webhttp.BindLoopback},
 		{name: "4in6 loopback uppercase hex", addr: "[::FFFF:127.0.0.1]:9848", want: webhttp.BindLoopback},
-		// strings.EqualFold is Unicode SIMPLE folding, so the long-s fold of
-		// "localhost" matches — documented on BindLoopback, shared with the
-		// two origin apps that already folded (kiro, pg-autodump).
-		{name: "unicode simple fold of localhost matches", addr: "localho\u017ft:80", want: webhttp.BindLoopback},
+		// The fold is ASCII-only, so a Unicode simple fold of "localhost"
+		// does NOT match: U+017F folds to 's' under Unicode, and honoring
+		// that would report an address as loopback that no resolver maps to
+		// loopback — a safety verdict more permissive than the thing it
+		// models. Case-insensitivity was the requirement (the origin bug was
+		// a case-SENSITIVE match); folding beyond ASCII was never part of it.
+		{name: "unicode simple fold of localhost is exposed", addr: "localho\u017ft:80", want: webhttp.BindExposed},
 		// net.ParseIP rejects zoned literals, so the hostname path
 		// classifies them: fail-public, matching all three origin copies.
 		{name: "zoned ipv6 loopback is exposed", addr: "[::1%lo]:80", want: webhttp.BindExposed},

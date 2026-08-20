@@ -214,14 +214,6 @@ func hasFoldPrefix(b []byte, lowerNeedle string) bool {
 	return true
 }
 
-// lowerASCII returns c lowercased if it is an ASCII uppercase letter, else c.
-func lowerASCII(c byte) byte {
-	if c >= 'A' && c <= 'Z' {
-		return c + ('a' - 'A')
-	}
-	return c
-}
-
 // isTagNameBoundary reports whether c ends an HTML tag name ('>', '/', or ASCII
 // whitespace).
 func isTagNameBoundary(c byte) bool {

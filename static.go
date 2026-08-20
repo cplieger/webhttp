@@ -206,7 +206,7 @@ func acceptsGzip(r *http.Request) bool {
 	for part := range strings.SplitSeq(r.Header.Get("Accept-Encoding"), ",") {
 		name, offered := encodingOffer(part)
 		switch {
-		case strings.EqualFold(name, "gzip"):
+		case equalASCIIFold(name, "gzip"):
 			return offered // explicit gzip is the most specific match
 		case name == "*":
 			wildcard = offered
