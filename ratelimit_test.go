@@ -356,16 +356,14 @@ func TestRateLimiter_concurrentAdmitsAtMostBurst(t *testing.T) {
 	const goroutines = 200
 	var admitted atomic.Int64
 	var wg sync.WaitGroup
-	wg.Add(goroutines)
 	for range goroutines {
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/x", nil))
 			if rec.Code == http.StatusOK {
 				admitted.Add(1)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 
