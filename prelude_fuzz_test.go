@@ -375,8 +375,7 @@ func FuzzLimitBodyWriterChain(f *testing.F) {
 		if n > effectiveCap {
 			t.Fatalf("read %d bytes past the %d-byte cap (shape=%v)", n, effectiveCap, shape)
 		}
-		var tooLarge *http.MaxBytesError
-		gotTooLarge := errors.As(err, &tooLarge)
+		tooLarge, gotTooLarge := errors.AsType[*http.MaxBytesError](err)
 		wantTooLarge := int64(bodyLen) > effectiveCap
 		if gotTooLarge != wantTooLarge {
 			t.Fatalf("MaxBytesError=%v (err=%v) for a %d-byte body under a %d-byte cap, want %v (shape=%v)",
