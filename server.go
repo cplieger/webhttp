@@ -123,6 +123,33 @@ func WithSlogErrorLog(level slog.Level) ServerOption {
 // http.ResponseController.SetReadDeadline/SetWriteDeadline. Note that
 // MaxBytesReader (see LimitBody) bounds body SIZE, not the time taken to send
 // it.
+//
+// # Fields left to the caller, and one that logs nothing
+//
+// NewServer returns the *http.Server, so any field it does not set is reachable
+// with a plain assignment and gets no option here — an option that only assigns
+// a field of the value the constructor hands back adds surface and no
+// capability. Three worth knowing about on Go 1.27:
+//
+//   - Server.MaxHeaderValueCount caps how many header VALUES a request may
+//     carry, defaulting to http.DefaultMaxHeaderValueCount (500). Set it
+//     directly: srv.MaxHeaderValueCount = 64. Measured on go1.27.0, and the
+//     reason it is called out rather than merely left alone: the 431 is
+//     answered BELOW the handler, so a request refused by this cap produces NO
+//     access-log line from Logging and NO headers from SecurityHeaders — a
+//     refusal class an operator watching webhttp's access log cannot see. Cap
+//     header count at a proxy, or alert on the server's own error log, if that
+//     matters. (MaxHeaderBytes, which NewServer does set, refuses the same way.)
+//   - Server.DisableClientPriority = true restores round-robin HTTP/2 stream
+//     scheduling in place of Go 1.27's RFC 9218 client-priority handling. This
+//     library expresses no opinion: priority is a property of the workload, not
+//     of the plumbing, and NewServer leaves Protocols nil so HTTP/2 arrives
+//     only over TLS anyway.
+//   - Server.Protocols is nil, which is net/http's default set and does NOT
+//     include unencrypted HTTP/2. That is what keeps the ReadHeaderTimeout
+//     guard above in force: Go 1.27 clears the header deadline after accepting
+//     an unencrypted h2 connection, and that path is unreachable unless a
+//     caller opts in by setting Protocols with UnencryptedHTTP2.
 func NewServer(handler http.Handler, opts ...ServerOption) *http.Server {
 	srv := &http.Server{
 		Handler:           handler,

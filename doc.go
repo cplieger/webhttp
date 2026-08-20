@@ -73,6 +73,27 @@
 // Chain(mux, Logging(), Recoverer(), SecurityHeaders()): logging outermost so a
 // recovered panic is logged as its 500 rather than a misleading 200.
 //
+// Because Middleware is that shape and nothing more, a stdlib middleware drops
+// into the same Chain with no adapter. net/http's own CSRF defence is the one
+// worth naming, since a Host allowlist is only half the cross-origin story and
+// this library deliberately does not wrap it:
+//
+//	cop := http.NewCrossOriginProtection()
+//	cop.SetDenyHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+//		webhttp.WriteError(w, r, http.StatusForbidden, "cross_origin_denied", "cross-origin request denied")
+//	}))
+//	h := webhttp.Chain(mux, Logging(), Recoverer(), hostPolicy.Middleware(), cop.Handler, SecurityHeaders())
+//
+// cop.Handler already satisfies Middleware, and SetDenyHandler is what makes the
+// refusal speak this package's error envelope — measured: a cross-site POST
+// answers 403 with {"error":…,"code":"cross_origin_denied","request_id":…} and
+// carries SecurityHeaders' headers, because the deny handler runs inside the
+// chain. Keep the Host allowlist OUTSIDE it: after DNS rebinding the Origin and
+// Host agree, so a same-origin check alone admits the request (CWE-346). A
+// webhttp wrapper for this would be permanent exported surface for a capability
+// a caller already has, which is the same reason there is no option for an
+// http.Server field NewServer leaves alone.
+//
 // webhttp is the inbound-server counterpart to httpx
 // (github.com/cplieger/httpx), which is the outbound-client toolkit: httpx
 // makes resilient requests going OUT, webhttp handles the requests coming IN.
