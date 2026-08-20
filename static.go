@@ -65,6 +65,22 @@ func WithStaticCacheControl(fn func(assetPath string) string) StaticOption {
 // else falls through to the identity http.FileServer, which serves the
 // index.html for "/" and handles Range, directories, and 404s.
 //
+// One inherited behavior worth knowing, because it changed under the library
+// rather than in it. Go 1.27 makes net/http answer 404 instead of 301 when
+// http.FileServer would REDIRECT a path whose escaped form contains %2F, since
+// with StripPrefix in play there is no reliable target to redirect to.
+// Differentially measured, bare http.FileServer against go1.26.7 and go1.27.0,
+// over ten shapes: exactly the three redirect shapes move — "/sub%2Fdir"
+// (directory reached without a trailing slash), "/sub%2Findex.html" and
+// "/%2Findex.html" (the index canonicalization) go 301 to 404. Every
+// non-redirect shape is unchanged, INCLUDING serving a file through an escaped
+// slash ("/sub%2Fdir/leaf.txt" is still 200) and a directory whose escaped
+// slash is followed by a real one ("/sub%2Fdir/" is still 200). StaticHandler
+// answered identically to a bare FileServer on all of them, so it inherits
+// exactly this and nothing more. It is not an open-redirect fix: the old
+// Location was a relative segment ("dir/", "./") computed from the path, never
+// a reflection of the caller's %2F.
+//
 // The error is non-nil only when walking fsys fails (an unreadable embedded
 // tree is a malformed build; fail startup rather than serve a partial site).
 // Serving is allocation-free per request apart from net/http's own work: all

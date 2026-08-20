@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"sync"
@@ -923,4 +924,54 @@ func TestRun_cleanShutdownIsNotMarkedAsGraceExpiry(t *testing.T) {
 	if errors.Is(err, webhttp.ErrShutdownGraceExpired) {
 		t.Error("a clean stop was marked as a grace expiry")
 	}
+}
+
+// TestMaxHeaderValueCountRefusalIsInvisibleToTheChain pins the claim NewServer's
+// doc makes about Go 1.27's Server.MaxHeaderValueCount: the 431 it answers is
+// produced BELOW the handler, so neither Logging's access line nor
+// SecurityHeaders' headers appear on it.
+//
+// It is a tripwire on a stdlib behavior the library documents rather than owns.
+// If net/http ever moves that refusal above the handler, the doc note becomes
+// wrong and this test says so — which is the only way a "your access log cannot
+// see this" claim stays true.
+func TestMaxHeaderValueCountRefusalIsInvisibleToTheChain(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		logs := &captureHandler{}
+		h := webhttp.Chain(okHandler(),
+			webhttp.Logging(webhttp.WithLogger(slog.New(logs))),
+			webhttp.SecurityHeaders(),
+		)
+		srv := httptest.NewTestServer(t, h)
+		srv.Config.MaxHeaderValueCount = 8 // set before Client() starts the server
+		client := srv.Client()
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, nil)
+		if err != nil {
+			t.Fatalf("build request: %v", err)
+		}
+		for range 40 { // well past the cap, counting Host and Connection too
+			req.Header.Add("X-Probe", "v")
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("GET: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode != http.StatusRequestHeaderFieldsTooLarge {
+			t.Fatalf("status = %d, want 431", resp.StatusCode)
+		}
+		if got := resp.Header.Get("X-Content-Type-Options"); got != "" {
+			t.Errorf("X-Content-Type-Options = %q on the 431; SecurityHeaders now reaches it, so NewServer's doc note is stale", got)
+		}
+		if n := len(logs.snapshot()); n != 0 {
+			t.Errorf("Logging emitted %d access lines for a 431; the refusal now reaches the chain, so NewServer's doc note is stale", n)
+		}
+		// The default is what a caller gets when the field is left alone, and the
+		// doc names the number.
+		if http.DefaultMaxHeaderValueCount != 500 {
+			t.Errorf("http.DefaultMaxHeaderValueCount = %d, want 500 (NewServer's doc names it)", http.DefaultMaxHeaderValueCount)
+		}
+	})
 }

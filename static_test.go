@@ -460,3 +460,59 @@ func TestServeGzip(t *testing.T) {
 		}
 	})
 }
+
+// TestStaticHandlerEscapedSlashFallThrough pins the behavior StaticHandler
+// inherits from http.FileServer for a path carrying an escaped slash, which Go
+// 1.27 changed under the library: net/http answers 404 rather than 301 wherever
+// FileServer would REDIRECT such a path, because with StripPrefix in play there
+// is no reliable target.
+//
+// It is a tripwire on a stdlib behavior, not on webhttp's own code, and that is
+// deliberate: StaticHandler's documented contract is that unknown, Range and
+// 404 shapes fall through to the identity FileServer, so what that handler does
+// with them IS part of the contract consumers observe. Differentially measured
+// against go1.26.7, only the three redirect shapes moved; the file and
+// trailing-slash shapes here are unchanged on both toolchains and pin that the
+// change did not reach further than the redirect.
+func TestStaticHandlerEscapedSlashFallThrough(t *testing.T) {
+	fsys := fstest.MapFS{
+		"sub/dir/leaf.txt":   {Data: []byte("leaf\n")},
+		"sub/index.html":     {Data: []byte("sub index\n")},
+		"index.html":         {Data: []byte("root index\n")},
+		"sub/dir/index.html": {Data: []byte("dir index\n")},
+	}
+	h, err := StaticHandler(fsys)
+	if err != nil {
+		t.Fatalf("StaticHandler: %v", err)
+	}
+
+	cases := []struct {
+		name, target string
+		wantStatus   int
+		wantBody     string
+	}{
+		{"directory without slash still redirects", "/sub/dir", http.StatusMovedPermanently, ""},
+		{"escaped slash in a redirect position 404s", "/sub%2Fdir", http.StatusNotFound, ""},
+		{"index canonicalization still redirects", "/sub/index.html", http.StatusMovedPermanently, ""},
+		{"escaped slash before index 404s", "/sub%2Findex.html", http.StatusNotFound, ""},
+		{"leading escaped slash before index 404s", "/%2Findex.html", http.StatusNotFound, ""},
+		{"a file through an escaped slash still serves", "/sub%2Fdir/leaf.txt", http.StatusOK, "leaf\n"},
+		{"a directory index through an escaped slash still serves", "/sub%2Fdir/", http.StatusOK, "dir index\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, tc.target, nil))
+			if rr.Code != tc.wantStatus {
+				t.Errorf("GET %q status = %d, want %d (body %q)", tc.target, rr.Code, tc.wantStatus, rr.Body.String())
+			}
+			if tc.wantBody != "" && rr.Body.String() != tc.wantBody {
+				t.Errorf("GET %q body = %q, want %q", tc.target, rr.Body.String(), tc.wantBody)
+			}
+			// A redirect must never reflect the caller's escaped form back.
+			if loc := rr.Header().Get("Location"); strings.Contains(strings.ToLower(loc), "%2f") {
+				t.Errorf("GET %q Location = %q, want no reflected escaped slash", tc.target, loc)
+			}
+		})
+	}
+}

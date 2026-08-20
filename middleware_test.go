@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/cplieger/webhttp/v2"
@@ -1177,5 +1178,90 @@ func TestNoStore_composesInChainOnEveryResponse(t *testing.T) {
 	}
 	if got := rr.Header().Get("Cache-Control"); got != "no-store" {
 		t.Errorf("Cache-Control on a 404 = %q, want %q", got, "no-store")
+	}
+}
+
+// TestCrossOriginProtectionComposesWithChain pins the package doc's claim that
+// net/http.CrossOriginProtection needs no wrapper here: its Handler method
+// satisfies Middleware directly, and SetDenyHandler makes the refusal speak this
+// package's error envelope with the request-id correlation.
+//
+// It exists because the alternative — a webhttp.CrossOriginProtection option or
+// middleware — is a recurring proposal, and the answer is a compile-time fact
+// plus a wire assertion rather than an opinion. If either ever stops holding,
+// the doc recipe is wrong and this says so.
+func TestCrossOriginProtectionComposesWithChain(t *testing.T) {
+	cop := http.NewCrossOriginProtection()
+	cop.SetDenyHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		webhttp.WriteError(w, r, http.StatusForbidden, "cross_origin_denied", "cross-origin request denied")
+	}))
+
+	// The load-bearing line: cop.Handler is passed straight into Chain's
+	// ...Middleware parameter, so this compiling IS the proof that no adapter
+	// and no wrapper option is needed.
+	h := webhttp.Chain(okHandler(),
+		webhttp.Logging(webhttp.WithLogger(discardLogger())),
+		cop.Handler,
+		webhttp.SecurityHeaders(),
+	)
+
+	cases := []struct {
+		name, method, secFetch, origin string
+		wantStatus                     int
+	}{
+		{"safe GET is allowed even cross-site", http.MethodGet, "cross-site", "", http.StatusOK},
+		{"same-origin POST is allowed", http.MethodPost, "same-origin", "", http.StatusOK},
+		{"cross-site POST is denied", http.MethodPost, "cross-site", "", http.StatusForbidden},
+		{"foreign Origin POST is denied", http.MethodPost, "", "https://evil.example", http.StatusForbidden},
+		{"headerless POST is treated as non-browser", http.MethodPost, "", "", http.StatusOK},
+	}
+	for _, tc := range cases {
+		// The bubble goes INSIDE the subtest: t.Run panics with
+		// "t.Run called inside synctest bubble" the other way round.
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				srv := httptest.NewTestServer(t, h)
+				client := srv.Client()
+
+				req, err := http.NewRequestWithContext(t.Context(), tc.method, srv.URL+"/x", nil)
+				if err != nil {
+					t.Fatalf("build request: %v", err)
+				}
+				if tc.secFetch != "" {
+					req.Header.Set("Sec-Fetch-Site", tc.secFetch)
+				}
+				if tc.origin != "" {
+					req.Header.Set("Origin", tc.origin)
+				}
+				resp, err := client.Do(req)
+				if err != nil {
+					t.Fatalf("%s: %v", tc.method, err)
+				}
+				defer func() { _ = resp.Body.Close() }()
+
+				if resp.StatusCode != tc.wantStatus {
+					t.Errorf("status = %d, want %d", resp.StatusCode, tc.wantStatus)
+				}
+				// SecurityHeaders sits inside the deny handler's chain, unlike a
+				// refusal net/http answers below the handler (see
+				// TestMaxHeaderValueCountRefusalIsInvisibleToTheChain).
+				if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+					t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+				}
+				if tc.wantStatus != http.StatusForbidden {
+					return
+				}
+				var env webhttp.ErrorResponse
+				if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+					t.Fatalf("decode refusal envelope: %v", err)
+				}
+				if env.Code != "cross_origin_denied" {
+					t.Errorf("code = %q, want cross_origin_denied", env.Code)
+				}
+				if env.RequestID == "" {
+					t.Error("request_id is empty: the refusal lost its correlation id")
+				}
+			})
+		})
 	}
 }
