@@ -1950,6 +1950,29 @@ func TestWithMaxLoggedPath_nonPositiveKeepsTheDefault(t *testing.T) {
 				n, len(got), len(want))
 		}
 	}
+	// Non-positive means IGNORED, which is stronger than "the default stands":
+	// options are otherwise last-wins, so a 0 arriving after an explicit cap must
+	// leave that cap in place rather than widening the bound back to the default.
+	for _, n := range []int{0, -1} {
+		got := loggedPathOf(t, asciiPath(1000), webhttp.WithMaxLoggedPath(128), webhttp.WithMaxLoggedPath(n))
+		if want := asciiPath(128) + truncatedMarker; got != want {
+			t.Errorf("WithMaxLoggedPath(128) then WithMaxLoggedPath(%d): logged path is %d bytes, want the 128-byte cap to stand (%d)",
+				n, len(got), len(want))
+		}
+	}
+}
+
+func TestRequestLogger_cutsALoggedPathWithNoRuneStartToKeep(t *testing.T) {
+	// The value the cap receives is not always a well-formed path: a redaction
+	// transform that byte-slices one hands back the TAIL of a rune, and %-escapes
+	// decode to the same shape. When every byte before the cut is a continuation
+	// byte there is no rune boundary to back off to, so the whole prefix goes and
+	// the marker is all that is left — the cap has to stay total over such a
+	// value rather than walking past the front of the string.
+	const runeTail = "\x9f\x99\x82" // the trailing 3 bytes of U+1F642
+	if got := loggedPathOf(t, runeTail, webhttp.WithMaxLoggedPath(2)); got != truncatedMarker {
+		t.Errorf("logged path = %q, want %q", got, truncatedMarker)
+	}
 }
 
 func TestWithMaxLoggedPath_boundsACallerPathFuncReturn(t *testing.T) {

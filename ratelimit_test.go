@@ -315,6 +315,16 @@ func TestRateLimiterWithRateLimitWhenPassesThrough(t *testing.T) {
 	}
 }
 
+// countingHandler is a next handler with a NAMED, comparable type, so a test can
+// assert the middleware handed back this very handler. An http.HandlerFunc value
+// cannot express that: func values are not comparable.
+type countingHandler struct{ hits *int }
+
+func (h countingHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	*h.hits++
+	w.WriteHeader(http.StatusOK)
+}
+
 // TestRateLimiterNonPositiveDisables confirms a non-positive burst or interval
 // returns the handler unwrapped: every request passes, none is throttled.
 func TestRateLimiterNonPositiveDisables(t *testing.T) {
@@ -330,7 +340,15 @@ func TestRateLimiterNonPositiveDisables(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			hits := 0
-			h := RateLimiter(tc.burst, tc.interval)(okHandler(&hits))
+			next := countingHandler{hits: &hits}
+			h := RateLimiter(tc.burst, tc.interval)(next)
+			// "Off" is the identity, not merely permissiveness: the middleware
+			// hands back the very handler it was given, so a config-driven zero
+			// costs nothing per request and cannot build a bucket whose refill
+			// rate came from dividing by that zero.
+			if h != http.Handler(next) {
+				t.Errorf("RateLimiter(%d, %v) returned a wrapper, want the next handler itself", tc.burst, tc.interval)
+			}
 			for range 10 {
 				rec := httptest.NewRecorder()
 				h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/x", nil))

@@ -11,15 +11,22 @@ import (
 )
 
 func TestCanonicalHost(t *testing.T) {
+	// A 63-byte label — the DNS maximum, and the longest one the grammar
+	// accepts. Spelled out rather than computed so the case carries its own
+	// expectation; each decade ends in 9, so the length is countable by eye.
+	const maxLabel = "a123456789b123456789c123456789d123456789e123456789f123456789g12"
+
 	cases := []struct {
 		name, in, want string
 	}{
 		{"bare host", "example.com", "example.com"},
 		{"host with port", "example.com:9848", "example.com"},
+		{"highest port", "example.com:65535", "example.com"},
 		{"uppercase + trailing dot", "Webterm.Example.COM.", "webterm.example.com"},
 		{"trailing dot with port", "example.com.:443", "example.com"},
 		{"underscore label (compose service name)", "my_service:9848", "my_service"},
 		{"punycode a-label", "xn--wbterm-bva.example", "xn--wbterm-bva.example"},
+		{"longest label", maxLabel + ".example", maxLabel + ".example"},
 		{"ipv4", "192.168.1.5", "192.168.1.5"},
 		{"ipv4 with port", "192.168.1.5:443", "192.168.1.5"},
 		{"ipv6 bracketed with port", "[::1]:9848", "::1"},
@@ -33,6 +40,11 @@ func TestCanonicalHost(t *testing.T) {
 		// allowlist key, silently widening an exact-match gate (the
 		// adversarial-review finding this pins).
 		{"lone port is empty", ":9848", ""},
+		// An unbracketed colon-bearing value can only be an address, and no
+		// address carries an FQDN dot — that dot belongs to the DNS-name and
+		// IPv4 shapes. Stripping it here instead of refusing would admit this
+		// wire value as the "::1" allowlist key.
+		{"ipv6 literal with a trailing dot", "::1.", ""},
 		{"empty is empty", "", ""},
 		{"empty brackets", "[]", ""},
 		{"stray bracket + colon", "[:", ""},
@@ -44,6 +56,8 @@ func TestCanonicalHost(t *testing.T) {
 		{"double port", "example.com:1:2", ""},
 		{"empty port", "example.com:", ""},
 		{"port out of range", "example.com:99999", ""},
+		{"port one over the top", "example.com:65536", ""},
+		{"label one byte over the maximum", maxLabel + "h.example", ""},
 		{"double trailing dot", "example.com..", ""},
 		{"empty label", ".example.com", ""},
 		{"leading-zero ipv4 is not repaired", "127.0.0.001", ""},
