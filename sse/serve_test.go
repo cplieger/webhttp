@@ -2,7 +2,10 @@ package sse
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -121,6 +124,28 @@ func TestServeDeliversPublishedEvents(t *testing.T) {
 	})
 }
 
+func TestServeDeliversASecondEventOnTheSameStream(t *testing.T) {
+	// One event does not prove delivery continues. A stream that stopped after
+	// the first batch still SHOWS that batch — the frame bytes are already in
+	// net/http's buffer and go out when the handler returns — so the second
+	// event, published once the first has been read and therefore in a batch of
+	// its own, is the assertion that the loop survived a successful write and a
+	// successful flush.
+	synctest.Test(t, func(t *testing.T) {
+		h := NewHub()
+		srv := startServer(t, h)
+		resp, sc := openStream(t, srv, srv.URL, nil)
+		defer resp.Body.Close()
+		readUntil(t, sc, func(l string) bool { return l == ": connected" })
+		requireClients(t, h, 1)
+
+		h.Publish(Event{Data: []byte("first")})
+		readUntil(t, sc, func(l string) bool { return l == "data: first" })
+		h.Publish(Event{Data: []byte("second")})
+		readUntil(t, sc, func(l string) bool { return l == "data: second" })
+	})
+}
+
 func TestServeLastEventIDReplay(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := NewHub()
@@ -182,6 +207,13 @@ func TestServeOnConnectHook(t *testing.T) {
 		if !strings.Contains(joined, "event: connected") || !strings.Contains(joined, `{"floor":1,"head":1}`) {
 			t.Errorf("handshake lines = %v", lines)
 		}
+		// The hook runs BEFORE live delivery, so a hook that succeeded must leave
+		// the stream open. Its own frames prove nothing about that: they are
+		// buffered, and a stream abandoned right after the hook still delivers
+		// them when the handler returns.
+		requireClients(t, h, 1)
+		h.Publish(Event{Data: []byte("after-handshake")})
+		readUntil(t, sc, func(l string) bool { return l == "data: after-handshake" })
 	})
 }
 
@@ -273,6 +305,82 @@ func TestServeKeepalive(t *testing.T) {
 			t.Errorf("second keepalive after %v, want exactly %v (the ticker must repeat, not fire once)", got, 2*interval)
 		}
 	})
+}
+
+// TestServeKeepaliveDefaultInterval pins the interval a hub that configures
+// nothing gets. The test above cannot see it: it supplies its own. The default is
+// load-bearing — it sits below the common proxy idle timeouts (nginx 60s, ALB
+// 120s), so a default that collapsed to zero would leave every unconfigured hub
+// silent and its streams looking idle to the proxy that then cuts them. Under the
+// synthetic clock the wait is free.
+func TestServeKeepaliveDefaultInterval(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := NewHub()
+		srv := startServer(t, h)
+		resp, sc := openStream(t, srv, srv.URL, nil)
+		defer resp.Body.Close()
+		readUntil(t, sc, func(l string) bool { return l == ": connected" })
+
+		start := time.Now()
+		readUntil(t, sc, func(l string) bool { return l == ": keepalive" })
+		if got, want := time.Since(start), 15*time.Second; got != want {
+			t.Errorf("first keepalive after %v, want exactly %v", got, want)
+		}
+	})
+}
+
+// TestServeKeepaliveDisabled pins the documented "non-positive disables it"
+// contract, which is a silent stream rather than a zero-interval one: a ticker
+// cannot be built from a non-positive period at all, so the option has to be read
+// before any timer is created, and the stream must go on carrying events.
+func TestServeKeepaliveDisabled(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := NewHub(WithKeepalive(0))
+		srv := startServer(t, h)
+		resp, sc := openStream(t, srv, srv.URL, nil)
+		defer resp.Body.Close()
+		readUntil(t, sc, func(l string) bool { return l == ": connected" })
+		requireClients(t, h, 1)
+
+		// A virtual minute of silence — four times the default cadence — then an
+		// event, which is what proves the stream was still there to carry one.
+		time.Sleep(time.Minute)
+		h.Publish(Event{Data: []byte("still-live")})
+		lines := readUntil(t, sc, func(l string) bool { return l == "data: still-live" })
+		if joined := strings.Join(lines, "\n"); strings.Contains(joined, ": keepalive") {
+			t.Errorf("stream carried a keepalive with the interval disabled: %v", lines)
+		}
+	})
+}
+
+// TestServeRecordsUnclearableDeadlines covers the writer whose deadlines cannot
+// be cleared — an http2 connection, or a recorder. Clearing them is best-effort
+// by design, so the stream still has to serve; but the refusal is what a
+// severed-mid-flight stream is diagnosed from, so it must reach the log rather
+// than being dropped. A recorder supports Flush and not deadlines, which is
+// exactly that shape.
+func TestServeRecordsUnclearableDeadlines(t *testing.T) {
+	var logged bytes.Buffer
+	h := NewHub(WithLogger(slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug}))))
+
+	// Pre-cancelled, so the live loop returns on its first select instead of
+	// waiting for a client that will never disconnect.
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	rec := httptest.NewRecorder()
+	h.Serve(rec, httptest.NewRequest(http.MethodGet, "/events", http.NoBody).WithContext(ctx))
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 (unclearable deadlines must not refuse the stream)", rec.Code)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, ": connected") {
+		t.Errorf("body = %q, want the handshake comment", body)
+	}
+	for _, want := range []string{"sse: clear write deadline", "sse: clear read deadline"} {
+		if !strings.Contains(logged.String(), want) {
+			t.Errorf("log = %q, want it to record %q", logged.String(), want)
+		}
+	}
 }
 
 func TestServeNoFlusher500(t *testing.T) {

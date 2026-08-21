@@ -101,6 +101,13 @@ func TestLowerASCIIString(t *testing.T) {
 		{name: "mixed", in: "Webterm.Example.COM", want: "webterm.example.com"},
 		{name: "empty", in: "", want: ""},
 		{name: "digits and punctuation untouched", in: "my_service-1.2:80", want: "my_service-1.2:80"},
+		// Both ends of 'A'-'Z' are INCLUDED, and the endpoints need their own
+		// cases because the scan that decides whether to copy is what sees a
+		// byte first: an endpoint the scan skips stays unfolded even though the
+		// copy loop it precedes would have lowered it. The cases above cannot
+		// show that — their first uppercase byte is interior to the range.
+		{name: "leading A folds", in: "AURORA", want: "aurora"},
+		{name: "leading Z folds", in: "ZONE", want: "zone"},
 		// The whole point: a non-ASCII rune keeps its bytes, so a later
 		// byte-class check can refuse it. strings.ToLower would fold the
 		// first two into ASCII.

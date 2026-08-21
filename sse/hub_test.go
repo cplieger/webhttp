@@ -153,6 +153,27 @@ func TestHubSubscribeAtomicReplay(t *testing.T) {
 	}
 }
 
+func TestHubSubscribeFirstConnectGetsNoReplay(t *testing.T) {
+	// Replay belongs to a RESUMING client. A first connect carries no
+	// Last-Event-ID, so it starts from live traffic and learns what predates it
+	// from the OnConnect handshake's Bounds instead. Handing it the ring would
+	// deliver events it never asked to resume from — and to a client that
+	// reconnects on every page load, the whole buffer every time.
+	h := NewHub()
+	h.Publish(Event{Data: []byte("old-1")})
+	h.Publish(Event{Data: []byte("old-2")})
+	sub, replay, ok := h.subscribe("", 0, func() {})
+	if !ok {
+		t.Fatal("subscribe")
+	}
+	if len(replay) != 0 {
+		t.Errorf("replay = %+v, want nothing replayed to a first connect", replay)
+	}
+	if len(sub.ch) != 0 {
+		t.Errorf("channel holds %d events, want 0 (nothing was published after subscribe)", len(sub.ch))
+	}
+}
+
 func TestHubMaxClients(t *testing.T) {
 	h := NewHub(WithMaxClients(1))
 	if _, _, ok := h.subscribe("", 0, func() {}); !ok {
