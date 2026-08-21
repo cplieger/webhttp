@@ -2,7 +2,6 @@ package webhttp_test
 
 import (
 	"net"
-	"strings"
 	"testing"
 
 	"github.com/cplieger/webhttp/v2"
@@ -25,9 +24,21 @@ import (
 //  3. Totality of the host door — ClassifyBindHost never returns
 //     BindInvalid, and every result of either door is one of the three
 //     declared classes (String() never renders a number).
-//  4. Case-insensitivity — classification never depends on letter case
-//     ("LOCALHOST", "Localhost", IPv6 hex digits), the drift axis that
-//     produced web-terminal-server's spurious exposure warning.
+//  4. Case-insensitivity over ASCII case — classification never depends on
+//     letter case ("LOCALHOST", "Localhost", IPv6 hex digits), the drift axis
+//     that produced web-terminal-server's spurious exposure warning.
+//  5. No fold laundering — a BindLoopback verdict implies the host is pure
+//     ASCII, so no non-ASCII byte sequence can ever be read as loopback.
+//
+// Invariant 4 is stated over an ASCII-only case change, not strings.ToUpper /
+// strings.ToLower. Those apply full Unicode case mapping, which maps a
+// non-ASCII rune ONTO an ASCII letter (U+017F -> "S", U+212A -> "k"), so they
+// do not produce another spelling of the same host — they produce a DIFFERENT
+// host. "LOCALHOſT" uppercases to the literal "LOCALHOST", which is loopback
+// and correctly so, while "LOCALHOſT" itself is exposed and equally correctly
+// so: the classifier folds ASCII only, deliberately, and bindclass.go says why.
+// The weekly fuzz found that with the U+017F seed below, and invariant 5 is
+// what now carries the property those three seeds were added for.
 func FuzzClassifyBind(f *testing.F) {
 	seeds := []string{
 		":9848", "0.0.0.0:9848", "[::]:9848",
@@ -69,17 +80,61 @@ func FuzzClassifyBind(f *testing.F) {
 			}
 		}
 
-		// Invariant 3 (totality) + 4 on the host door, treating the raw
+		// Invariant 3 (totality) + 4 + 5 on the host door, treating the raw
 		// input as a bare host (the unsplit-input fallback path).
 		hostClass := webhttp.ClassifyBindHost(addr)
 		if hostClass == webhttp.BindInvalid {
 			t.Fatalf("ClassifyBindHost(%q) = BindInvalid; the host door must be total", addr)
 		}
-		if got := webhttp.ClassifyBindHost(strings.ToUpper(addr)); got != hostClass {
-			t.Fatalf("ClassifyBindHost case-sensitive: %q = %v but upper = %v", addr, hostClass, got)
+		if got := webhttp.ClassifyBindHost(asciiUpper(addr)); got != hostClass {
+			t.Fatalf("ClassifyBindHost ASCII-case-sensitive: %q = %v but ASCII-upper = %v", addr, hostClass, got)
 		}
-		if got := webhttp.ClassifyBindHost(strings.ToLower(addr)); got != hostClass {
-			t.Fatalf("ClassifyBindHost case-sensitive: %q = %v but lower = %v", addr, hostClass, got)
+		if got := webhttp.ClassifyBindHost(asciiLower(addr)); got != hostClass {
+			t.Fatalf("ClassifyBindHost ASCII-case-sensitive: %q = %v but ASCII-lower = %v", addr, hostClass, got)
+		}
+
+		// Invariant 5: nothing non-ASCII may be read as loopback. Both
+		// loopback paths are ASCII-only by construction — the name path folds
+		// ASCII, and net.ParseIP accepts only ASCII literals — so a
+		// BindLoopback verdict on a host carrying a byte above 0x7F would mean
+		// a homograph or a case fold had laundered into the safe class.
+		for _, probe := range []struct {
+			host  string
+			class webhttp.BindClass
+		}{{addr, hostClass}, {host, class}} {
+			if probe.class != webhttp.BindLoopback {
+				continue
+			}
+			for i := range len(probe.host) {
+				if probe.host[i] > 0x7f {
+					t.Fatalf("ClassifyBindHost(%q) = BindLoopback with the non-ASCII byte %#x at %d; a non-ASCII host must never read as loopback",
+						probe.host, probe.host[i], i)
+				}
+			}
 		}
 	})
+}
+
+// asciiUpper and asciiLower change the case of ASCII letters and return every
+// byte above 0x7F unchanged — the same fold bindclass.go's equalASCIIFold
+// applies. See FuzzClassifyBind's invariant 4 for why the strings package's
+// full-Unicode versions cannot state that invariant.
+func asciiUpper(s string) string {
+	b := []byte(s)
+	for i := range b {
+		if b[i] >= 'a' && b[i] <= 'z' {
+			b[i] -= 'a' - 'A'
+		}
+	}
+	return string(b)
+}
+
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i := range b {
+		if b[i] >= 'A' && b[i] <= 'Z' {
+			b[i] += 'a' - 'A'
+		}
+	}
+	return string(b)
 }
