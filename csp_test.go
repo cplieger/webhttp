@@ -37,7 +37,26 @@ func TestInlineScriptHashes(t *testing.T) {
 		{"scriptfoo is not a script tag", `<scriptfoo>nope</scriptfoo>`, nil},
 		{"gt inside quoted attribute does not end the tag", `<script data-x="a>b">q=6</script>`, []string{hashToken("q=6")}},
 		{"srcset is not src", `<script srcset="x">r=7</script>`, []string{hashToken("r=7")}},
+		// A bare "src" is not the external form the skip rule names ("src="), and
+		// the scanner must not read past the attribute bytes looking for the '='
+		// that is not there.
+		{"src with no value is not the external form", `<script src>x=8</script>`, []string{hashToken("x=8")}},
+		{"src with spaces around its = is still external", `<script src = "/x.js"></script>`, nil},
 		{"unclosed script yields nothing", `<script>never closed`, nil},
+		{"open tag never terminated yields nothing", `<script type=module`, nil},
+		{"input ending inside the tag name yields nothing", `<p><script`, nil},
+		// The close side needs the same tag-name boundary the open side has:
+		// "</scriptfoo>" is content, not this element's end tag, so the span runs
+		// on to the real one. Ending it early would hash bytes no browser hashes
+		// and ship a policy that blocks the page.
+		{
+			"a longer close tag name does not end the element",
+			`<script>a="</scriptfoo>";b=9</script>`,
+			[]string{hashToken(`a="</scriptfoo>";b=9`)},
+		},
+		// An end tag truncated by end-of-input never leaves script data either, so
+		// there is no span to hash.
+		{"close tag truncated at end of input yields nothing", `<script>x=10</script`, nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -66,6 +85,15 @@ func TestInlineStyleHashes(t *testing.T) {
 		{"newlines hashed verbatim", "<style>\n  d{left:0}\n</style>", []string{hashToken("\n  d{left:0}\n")}},
 		{"styles is not a style tag", `<styles>nope</styles>`, nil},
 		{"unclosed style yields nothing", `<style>never closed`, nil},
+		// The shared core's close-side boundary rule, on the tag whose plural is
+		// the natural collision: "</styles>" is content, not this element's end
+		// tag.
+		{
+			"a longer close tag name does not end the element",
+			`<style>a{content:"</styles>"}</style>`,
+			[]string{hashToken(`a{content:"</styles>"}`)},
+		},
+		{"close tag truncated at end of input yields nothing", `<style>j{z:0}</style`, nil},
 		{
 			"gt inside quoted attribute does not end the tag",
 			`<style media="all and (min-width:1px)" data-x="a>b">e{right:0}</style>`,

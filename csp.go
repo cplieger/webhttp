@@ -21,13 +21,16 @@ import (
 // no policy itself (a CSP is application-specific).
 //
 // The scanner is byte-precise and dependency-free: case-insensitive tag
-// matching, quote-aware attribute scanning (a '>' or "src=" inside a quoted
-// attribute value does not confuse it), and "src" matched only as a real
-// attribute name (srcset and data-src do not count). It is an extractor for
-// pages the APP controls, not an HTML sanitizer for untrusted input. It
-// returns an empty slice on script-less or malformed input; a caller whose
-// page is known to carry inline scripts should treat an empty result as a
-// malformed build and fail startup rather than degrade its policy.
+// matching on a tag-name boundary at BOTH ends (neither "<scriptfoo" nor
+// "</scriptfoo>" belongs to this element, matching the tokenizer), quote-aware
+// attribute scanning (a '>' or "src=" inside a quoted attribute value does not
+// confuse it), and "src" matched only as a real attribute name (srcset and
+// data-src do not count). It is an extractor for pages the APP controls, not an
+// HTML sanitizer for untrusted input. It returns an empty slice on script-less
+// or malformed input — an element whose end tag is truncated by end-of-input has
+// no span a browser would hash, so it yields nothing; a caller whose page is
+// known to carry inline scripts should treat an empty result as a malformed
+// build and fail startup rather than degrade its policy.
 func InlineScriptHashes(html []byte) []string {
 	return inlineElementHashes(html, "script", hasSrcAttr)
 }
@@ -91,7 +94,7 @@ func inlineElementHashes(html []byte, tag string, skip func(attrs []byte) bool) 
 		if gt < 0 {
 			break
 		}
-		closeIdx := indexFoldASCII(html, gt+1, closeTag)
+		closeIdx := findElementClose(html, gt+1, closeTag)
 		if closeIdx < 0 {
 			break
 		}
@@ -121,6 +124,29 @@ func findElementOpen(html []byte, from int, openTag string) int {
 		}
 		after := s + len(openTag)
 		if after >= len(html) || isTagNameBoundary(html[after]) {
+			return s
+		}
+		i = after
+	}
+}
+
+// findElementClose returns the index at or after `from` of the end tag that
+// closes the element — case-insensitive, and only where the tag name is followed
+// by a tag boundary, so "</scriptfoo>" does not end a <script> — or -1. It is the
+// close-side mirror of findElementOpen, and the boundary requirement is what
+// keeps the hashed span the span a browser hashes: the tokenizer leaves script or
+// style data only on "</name" followed by whitespace, '/' or '>', and at
+// end-of-input it does not leave it at all (those bytes are content). Ending the
+// span early would emit a token for content no browser ever hashes, so the policy
+// built from it would block the page it was computed from.
+func findElementClose(html []byte, from int, closeTag string) int {
+	for i := from; ; {
+		s := indexFoldASCII(html, i, closeTag)
+		if s < 0 {
+			return -1
+		}
+		after := s + len(closeTag)
+		if after < len(html) && isTagNameBoundary(html[after]) {
 			return s
 		}
 		i = after
