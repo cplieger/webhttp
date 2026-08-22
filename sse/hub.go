@@ -65,6 +65,11 @@ func NewHub(opts ...Option) *Hub {
 			opt(&cfg)
 		}
 	}
+	// The delivery buffer tracks the replay ring by default; an explicit
+	// WithClientBuffer wins whichever order the two options arrived in.
+	if !cfg.clientBufferSet {
+		cfg.clientBuffer = max(cfg.ringSize, 1)
+	}
 	return &Hub{
 		subscribers: make(map[*subscriber]struct{}),
 		ring:        newRing(cfg.ringSize),

@@ -97,6 +97,36 @@ func TestHubPublishFanout(t *testing.T) {
 	}
 }
 
+func TestNewHubClientBufferOrderIndependent(t *testing.T) {
+	// WithReplay supplies the delivery buffer's DEFAULT, so an explicit
+	// WithClientBuffer must win in BOTH option orders. That is why NewHub
+	// derives the buffer after the option loop instead of WithReplay assigning
+	// it: an option that writes a sibling's field makes the setting positional.
+	for _, tt := range []struct {
+		name string
+		call string // the call as a caller writes it, for the failure message
+		opts []Option
+		want int
+	}{
+		{name: "BufferThenReplay", call: "NewHub(WithClientBuffer(32), WithReplay(256))", opts: []Option{WithClientBuffer(32), WithReplay(256)}, want: 32},
+		{name: "ReplayThenBuffer", call: "NewHub(WithReplay(256), WithClientBuffer(32))", opts: []Option{WithReplay(256), WithClientBuffer(32)}, want: 32},
+		{name: "DerivedFromReplay", call: "NewHub(WithReplay(64))", opts: []Option{WithReplay(64)}, want: 64},
+		{name: "ReplayDisabled", call: "NewHub(WithReplay(0))", opts: []Option{WithReplay(0)}, want: 1},
+		{name: "Default", call: "NewHub()", want: 256},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := NewHub(tt.opts...)
+			sub, _, ok := h.subscribe("", 0, func() {})
+			if !ok {
+				t.Fatal("Setup: subscribe refused")
+			}
+			if got := cap(sub.ch); got != tt.want {
+				t.Errorf("%s subscriber buffer cap = %d, want %d", tt.call, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestHubSlowClientEviction(t *testing.T) {
 	h := NewHub(WithClientBuffer(1))
 	cancelled := false

@@ -20,14 +20,18 @@ type config struct {
 	clientBuffer int
 	maxClients   int
 	keepalive    time.Duration
+	// clientBufferSet records an explicit WithClientBuffer. NewHub derives
+	// clientBuffer from ringSize only while it is false, which is what makes
+	// the two buffer options order-independent.
+	clientBufferSet bool
 }
 
 func defaultConfig() config {
 	return config{
 		logger:       slog.Default(),
 		ringSize:     256,
-		clientBuffer: 256,
-		maxClients:   0, // unlimited
+		clientBuffer: 256, // fallback: NewHub derives it from ringSize unless set explicitly
+		maxClients:   0,   // unlimited
 		keepalive:    15 * time.Second,
 	}
 }
@@ -36,21 +40,24 @@ func defaultConfig() config {
 type Option func(*config)
 
 // WithReplay sets the replay ring capacity (default 256). The client-side
-// delivery buffer is sized to match unless WithClientBuffer overrides it.
+// delivery buffer is sized to match unless WithClientBuffer sets it explicitly,
+// in either option order.
 // A capacity of 0 disables replay: events still carry IDs, but a reconnect
 // starts from live traffic only.
 func WithReplay(n int) Option {
-	return func(c *config) {
-		c.ringSize = max(n, 0)
-		c.clientBuffer = max(c.ringSize, 1)
-	}
+	return func(c *config) { c.ringSize = max(n, 0) }
 }
 
 // WithClientBuffer sets the per-subscriber channel capacity (default: the
 // replay ring size). A subscriber that falls this many events behind is
-// evicted and relies on reconnect + replay.
+// evicted and relies on reconnect + replay. It overrides the WithReplay-derived
+// default regardless of the order the two options are passed; repeated, the
+// last one wins.
 func WithClientBuffer(n int) Option {
-	return func(c *config) { c.clientBuffer = max(n, 1) }
+	return func(c *config) {
+		c.clientBuffer = max(n, 1)
+		c.clientBufferSet = true
+	}
 }
 
 // WithMaxClients caps concurrent subscribers; Serve answers 503 beyond it.
