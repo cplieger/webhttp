@@ -493,11 +493,12 @@ type RequestMetric struct {
 }
 
 // WithRecordMetric registers a hook invoked once per logged request with the
-// final method, path, status, and latency. Both text arguments are the values
-// the access line RECORDED, so they carry the same bounds: the path is the path
-// policy's output capped by WithMaxLoggedPath, and the method is capped at 24
-// bytes, which keeps an over-long token out of a metric label as well as out of
-// the log. It fires from a deferred call, so a panicking handler is still
+// RequestMetric the access line RECORDED, so its two text fields carry exactly
+// the log line's bounds: Method is capped at 24 bytes, which keeps an over-long
+// token out of a metric label as well as out of the log, and Path is whatever
+// the path policy produced, capped by WithMaxLoggedPath. With NO path policy
+// configured — the default — Path is therefore the raw r.URL.Path truncated to
+// 512 bytes. It fires from a deferred call, so a panicking handler is still
 // recorded. Requests skipped via WithSkipPaths or WithSkipFunc are excluded
 // from the hook as well as from access logging: a
 // stream's open-to-close duration paired with a synthetic status is misleading,
@@ -577,10 +578,9 @@ func WithRecordMetricRequest(fn func(r *http.Request, status int, d time.Duratio
 // RouteMetricLabels for each label's derivation and for the one deliberate
 // divergence from the access line.
 //
-// fn takes the same (method, path, status, duration) arguments as
-// WithRecordMetric rather than a struct, so that switching a consumer from the
-// unbounded hook to this one changes the option name and nothing else, and one
-// recording function can be passed to either.
+// fn takes the same RequestMetric as WithRecordMetric, so switching a consumer
+// from the unbounded hook to this one changes the option name and nothing else,
+// and one recording function can be passed to either.
 //
 // Like the other metric hooks it fires from a deferred call (a panicking
 // handler is still recorded), is excluded on paths skipped via WithSkipPaths or
@@ -659,10 +659,9 @@ func routeMetricPath(r *http.Request) string {
 
 // RouteMetricLabels derives the bounded (method, path) label pair for a
 // per-request HTTP metric. It is the pure primitive behind
-// WithRecordRouteMetric, exported for an app that already has a
-// WithRecordMetricRequest hook for other reasons and wants the standard pair
-// inside it — but the OPTION is the recommended path, because a helper only
-// protects the consumers that remember to call it.
+// WithRecordRouteMetric, exported for any hook that already holds the request
+// and wants the standard pair inside it — but the OPTION is the recommended
+// path, because a helper only protects the consumers that remember to call it.
 //
 // The method label is r.Method when it is one of the nine standard methods —
 // GET, HEAD, POST, PUT, DELETE, CONNECT, OPTIONS, TRACE (RFC 9110 §9.3) and
