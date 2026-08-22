@@ -248,8 +248,13 @@ func DecodeBody(w http.ResponseWriter, r *http.Request, v any, errMsg string) bo
 }
 
 // DecodeBodyOptional limits the body to MaxJSONBody and attempts a JSON decode
-// into v, ignoring any error. Use it when the body is optional and a missing or
-// malformed body should leave v at its zero value rather than fail the request.
+// into v, discarding every error. It does NOT reliably leave v at its zero
+// value: trailing data ({"a":1} junk) leaves the LEADING value in v where
+// DecodeBody rejects it, and an oversize body is indistinguishable from an
+// absent one — its *http.MaxBytesError is discarded too, so the handler answers
+// 200 from a zero value (or from one that preceded the excess) while net/http
+// closes the connection. DecodeJSONInto separates all five outcomes, with
+// errors.Is(err, io.EOF) marking the absent body.
 func DecodeBodyOptional(w http.ResponseWriter, r *http.Request, v any) {
 	LimitBody(w, r, MaxJSONBody)
 	_ = json.NewDecoder(r.Body).Decode(v)
