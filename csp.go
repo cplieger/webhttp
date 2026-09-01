@@ -106,7 +106,6 @@ func inlineElementHashes(html []byte, tag string, skip func(attrs []byte) bool) 
 	return out
 }
 
-// cspHash returns the CSP source token 'sha256-<std-base64>' for content.
 func cspHash(content []byte) string {
 	sum := sha256.Sum256(content)
 	return "'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'"
