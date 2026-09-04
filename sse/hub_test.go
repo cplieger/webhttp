@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestRing(t *testing.T) {
@@ -337,6 +338,35 @@ func TestWriteFrame(t *testing.T) {
 			}
 			if got := buf.String(); got != tt.want {
 				t.Errorf("frame = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWriteRetry(t *testing.T) {
+	tests := []struct {
+		name string
+		d    time.Duration
+		want string
+	}{
+		{name: "unset emits nothing", d: 0, want: ""},
+		{name: "negative emits nothing", d: -5 * time.Second, want: ""},
+		{name: "whole milliseconds", d: 1500 * time.Millisecond, want: "retry: 1500\n\n"},
+		{name: "seconds convert to milliseconds", d: 3 * time.Second, want: "retry: 3000\n\n"},
+		{name: "one millisecond is the floor", d: time.Millisecond, want: "retry: 1\n\n"},
+		// A positive delay must never render as 0, which on the wire means
+		// reconnect with no delay — the opposite of what the caller asked for.
+		{name: "sub-millisecond rounds up", d: 250 * time.Microsecond, want: "retry: 1\n\n"},
+		{name: "sub-millisecond remainder rounds up", d: 1500 * time.Microsecond, want: "retry: 1\n\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			if err := writeRetry(&buf, tt.d); err != nil {
+				t.Fatal(err)
+			}
+			if got := buf.String(); got != tt.want {
+				t.Errorf("writeRetry(w, %v) wrote %q, want %q", tt.d, got, tt.want)
 			}
 		})
 	}
