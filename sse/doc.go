@@ -1,8 +1,9 @@
 // Package sse provides a broadcast hub for Server-Sent Events: fan-out to
 // connected clients, a replay ring with monotonic event IDs so a reconnecting
 // client resumes via the standard Last-Event-ID header, proxy-defensive
-// response headers, keepalive comments, an optional concurrent-client cap,
-// per-subscriber topic filtering, and a shutdown drain gate.
+// response headers, keepalive comments, an optional reconnection-delay hint,
+// an optional concurrent-client cap, per-subscriber topic filtering, and a
+// shutdown drain gate.
 //
 // The Hub owns broadcast state; Serve adapts one HTTP request into a
 // subscriber. Events carry pre-marshaled bytes (the hub does no JSON), an
@@ -19,7 +20,10 @@
 // blocking: the standard EventSource client reconnects automatically,
 // presents Last-Event-ID, and the ring replays what it missed. Replay and
 // registration happen under one lock, so the replayed frames and the live
-// channel are gap-free and overlap-free.
+// channel are gap-free and overlap-free. How long the client waits before that
+// reconnect is its own default unless WithReconnectDelay sets the stream's
+// retry: field, which Serve writes ahead of the replay so the delay is already
+// in effect the first time the connection drops.
 //
 // A reconnect that presents an ID older than the ring's floor means events
 // were lost; the OnConnect hook receives the current (floor, head) bounds so

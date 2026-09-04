@@ -217,6 +217,61 @@ func TestServeOnConnectHook(t *testing.T) {
 	})
 }
 
+// TestServeReconnectDelayOpensTheStreamOnce pins where the retry: field goes
+// and how often. The delay must be in effect before the connection can drop,
+// so it opens the body ahead of replay and the handshake; and it is a property
+// of the connection, not of a frame, so it appears exactly once.
+func TestServeReconnectDelayOpensTheStreamOnce(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := NewHub(WithReconnectDelay(2 * time.Second))
+		for i := 1; i <= 3; i++ {
+			h.Publish(Event{Data: fmt.Appendf(nil, "e%d", i)})
+		}
+		srv := startServer(t, h)
+		resp, sc := openStream(t, srv, srv.URL, http.Header{"Last-Event-ID": {"1"}})
+		defer resp.Body.Close()
+
+		lines := readUntil(t, sc, func(l string) bool { return l == ": connected" })
+		if lines[0] != "retry: 2000" {
+			t.Fatalf("first stream line = %q, want %q (2s in milliseconds, ahead of replay and the handshake); lines = %v", lines[0], "retry: 2000", lines)
+		}
+		// Without replay in this stream, "it came first" would be true of an
+		// empty set and the ordering claim vacuous.
+		if joined := strings.Join(lines, "\n"); !strings.Contains(joined, "data: e2") || !strings.Contains(joined, "data: e3") {
+			t.Fatalf("Setup: stream replayed no frames, so the ordering assertion pins nothing; lines = %v", lines)
+		}
+
+		requireClients(t, h, 1)
+		h.Publish(Event{Data: []byte("live")})
+		live := readUntil(t, sc, func(l string) bool { return l == "data: live" })
+		for _, l := range live {
+			if strings.HasPrefix(l, "retry:") {
+				t.Errorf("live traffic carried a second retry: line %q, want the field written once per connection", l)
+			}
+		}
+	})
+}
+
+// TestServeOmitsReconnectDelayByDefault is the backward-compatibility guard: a
+// hub that configures nothing streams the bytes it always has, so an importer
+// that never sets the option sees no change. It is what goes red if the field
+// ever gains a non-zero default.
+func TestServeOmitsReconnectDelayByDefault(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := NewHub()
+		srv := startServer(t, h)
+		resp, sc := openStream(t, srv, srv.URL, nil)
+		defer resp.Body.Close()
+
+		lines := readUntil(t, sc, func(l string) bool { return l == ": connected" })
+		for _, l := range lines {
+			if strings.HasPrefix(l, "retry:") {
+				t.Errorf("unconfigured hub emitted %q, want no retry: field anywhere in the opening frames; lines = %v", l, lines)
+			}
+		}
+	})
+}
+
 func TestServeMaxClients503(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := NewHub(WithMaxClients(1))

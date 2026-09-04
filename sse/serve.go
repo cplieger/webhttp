@@ -15,11 +15,12 @@ import (
 
 // config carries hub-level settings; assembled by NewHub from Options.
 type config struct {
-	logger       *slog.Logger
-	ringSize     int
-	clientBuffer int
-	maxClients   int
-	keepalive    time.Duration
+	logger         *slog.Logger
+	ringSize       int
+	clientBuffer   int
+	maxClients     int
+	keepalive      time.Duration
+	reconnectDelay time.Duration
 	// clientBufferSet records an explicit WithClientBuffer. NewHub derives
 	// clientBuffer from ringSize only while it is false, which is what makes
 	// the two buffer options order-independent.
@@ -28,11 +29,12 @@ type config struct {
 
 func defaultConfig() config {
 	return config{
-		logger:       slog.Default(),
-		ringSize:     256,
-		clientBuffer: 256, // fallback: NewHub derives it from ringSize unless set explicitly
-		maxClients:   0,   // unlimited
-		keepalive:    15 * time.Second,
+		logger:         slog.Default(),
+		ringSize:       256,
+		clientBuffer:   256, // fallback: NewHub derives it from ringSize unless set explicitly
+		maxClients:     0,   // unlimited
+		keepalive:      15 * time.Second,
+		reconnectDelay: 0, // unset: Serve emits no retry: field
 	}
 }
 
@@ -71,6 +73,15 @@ func WithMaxClients(n int) Option {
 // non-positive value disables keepalives.
 func WithKeepalive(d time.Duration) Option {
 	return func(c *config) { c.keepalive = d }
+}
+
+// WithReconnectDelay sets the delay Serve advertises as the stream's SSE
+// `retry:` field: how long a client waits before it reconnects. 0 (the
+// default) emits no field, leaving the client's own default in place, and a
+// non-positive value is the same instruction. A positive value below a
+// millisecond rounds up to 1ms, since 0 on the wire means no delay at all.
+func WithReconnectDelay(d time.Duration) Option {
+	return func(c *config) { c.reconnectDelay = d }
 }
 
 // WithLogger sets the slog.Logger for connect/disconnect/eviction
@@ -181,6 +192,13 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, opts ...ServeOption)
 	writeStreamHeaders(w)
 	clearDeadlines(h.logger, rc)
 
+	// The delay has to be in effect before the first moment the connection can
+	// drop, so it precedes replay: a resuming client's replay runs to the whole
+	// ring, which would leave the stream's widest window uncovered.
+	if err := writeRetry(w, h.cfg.reconnectDelay); err != nil {
+		return
+	}
+
 	// Replay precedes the handshake so the OnConnect hook's bounds are
 	// consistent with what the client has already been sent.
 	for _, env := range replay {
@@ -274,6 +292,19 @@ func writeKeepalive(w io.Writer, rc *http.ResponseController) bool {
 		return false
 	}
 	return rc.Flush() == nil
+}
+
+// writeRetry emits the stream's reconnection-delay field, or nothing at all
+// for a non-positive delay. A positive sub-millisecond delay rounds UP to
+// 1ms: the wire unit is milliseconds and Milliseconds() truncates toward
+// zero, so a bare conversion would render it `retry: 0` and instruct the
+// client to reconnect with no delay at all.
+func writeRetry(w io.Writer, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	_, err := fmt.Fprintf(w, "retry: %d\n\n", max(d.Milliseconds(), 1))
+	return err
 }
 
 // writeFrame emits one SSE frame: optional id and event fields, then the
