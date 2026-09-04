@@ -149,14 +149,12 @@ A few properties are essential. Keep them when you change the code.
   fairness), and the empty-bucket 429 flows through `WriteError` so the
   throttled response stays the standard JSON envelope. Keep all three
   properties if you touch it.
-- **An unset SSE reconnection delay emits no `retry:` field.** `sse`'s
-  `WithReconnectDelay` is off at zero, and off means the stream carries no
-  `retry:` line at all, never one holding `0` (which tells the client to
-  reconnect with no delay). A hub that configures nothing therefore streams the
-  same bytes it always has. `Serve` writes the field ahead of any
-  `Last-Event-ID` replay, so the delay is in effect before the connection can
-  first drop, and a positive sub-millisecond delay rounds up to `1` rather than
-  truncating into that immediate-reconnect `0`.
+- **A `retry:` field of `0` is never emitted.** It would tell the client to
+  reconnect with no delay, so `sse`'s `WithReconnectDelay` avoids it from both
+  sides: unset (the off contract above) writes no `retry:` line at all rather
+  than one holding `0`, which is what keeps an unconfigured hub streaming the
+  same bytes it always has, and a positive sub-millisecond delay rounds up to
+  `1` rather than truncating to `0`. Keep both arms if you touch it.
 
 ## Local development
 

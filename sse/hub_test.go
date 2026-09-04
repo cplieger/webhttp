@@ -354,10 +354,10 @@ func TestWriteRetry(t *testing.T) {
 		{name: "whole milliseconds", d: 1500 * time.Millisecond, want: "retry: 1500\n\n"},
 		{name: "seconds convert to milliseconds", d: 3 * time.Second, want: "retry: 3000\n\n"},
 		{name: "one millisecond is the floor", d: time.Millisecond, want: "retry: 1\n\n"},
+		{name: "a fractional millisecond truncates", d: 1500 * time.Microsecond, want: "retry: 1\n\n"},
 		// A positive delay must never render as 0, which on the wire means
 		// reconnect with no delay — the opposite of what the caller asked for.
 		{name: "sub-millisecond rounds up", d: 250 * time.Microsecond, want: "retry: 1\n\n"},
-		{name: "sub-millisecond remainder rounds up", d: 1500 * time.Microsecond, want: "retry: 1\n\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
