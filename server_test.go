@@ -647,9 +647,7 @@ func TestRun_nilPreDrainIgnored(t *testing.T) {
 func TestWithSlogErrorLog_bridgesNetHTTPLinesIntoSlog(t *testing.T) {
 	// slog.Default is process-global, so this test must not run in parallel.
 	capture := &captureHandler{}
-	prev := slog.Default()
-	slog.SetDefault(slog.New(capture))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	swapDefaultLogger(t, slog.New(capture))
 
 	srv := webhttp.NewServer(nil, webhttp.WithSlogErrorLog(slog.LevelWarn))
 	if srv.ErrorLog == nil {
@@ -671,9 +669,7 @@ func TestWithSlogErrorLog_bridgesNetHTTPLinesIntoSlog(t *testing.T) {
 }
 
 func TestWithSlogErrorLog_lastAppliedWins(t *testing.T) {
-	prev := slog.Default()
-	slog.SetDefault(slog.New(&captureHandler{}))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	swapDefaultLogger(t, slog.New(&captureHandler{}))
 
 	// WithErrorLog remains the override for a custom logger.
 	custom := log.New(io.Discard, "", 0)

@@ -285,9 +285,7 @@ func TestRequestLogger_recorderCapturesHandlerStatus(t *testing.T) {
 }
 
 func TestRequestLogger_defaultLoggerWhenUnset(t *testing.T) {
-	prev := slog.Default()
-	slog.SetDefault(discardLogger())
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	swapDefaultLogger(t, discardLogger())
 
 	// No WithLogger option: exercises the slog.Default() fallback.
 	h := webhttp.RequestLogger(okHandler())

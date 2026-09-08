@@ -2,6 +2,7 @@ package webhttp
 
 import (
 	"context"
+	"log"
 	"log/slog"
 	"sync"
 	"testing"
@@ -49,13 +50,9 @@ func TestValidErrorCode(t *testing.T) {
 // tests ran before this one, and restored afterwards.
 func TestCheckedErrorCode(t *testing.T) {
 	logCap := &captureMessages{}
-	prevLogger := slog.Default()
-	slog.SetDefault(slog.New(logCap))
+	swapDefaultLogger(t, slog.New(logCap))
 	malformedCodeWarn = warnOnce{}
-	t.Cleanup(func() {
-		slog.SetDefault(prevLogger)
-		malformedCodeWarn = warnOnce{}
-	})
+	t.Cleanup(func() { malformedCodeWarn = warnOnce{} })
 
 	if got := checkedErrorCode("rate_limited"); got != "rate_limited" {
 		t.Errorf("checkedErrorCode(rate_limited) = %q, want it unchanged", got)
@@ -101,9 +98,7 @@ func TestCheckedErrorCode(t *testing.T) {
 // cannot silence an unrelated one.
 func TestWarnOnce(t *testing.T) {
 	logCap := &captureMessages{}
-	prevLogger := slog.Default()
-	slog.SetDefault(slog.New(logCap))
-	t.Cleanup(func() { slog.SetDefault(prevLogger) })
+	swapDefaultLogger(t, slog.New(logCap))
 
 	var w warnOnce
 	w.warn("first")
@@ -119,6 +114,19 @@ func TestWarnOnce(t *testing.T) {
 	if len(msgs) != 2 || msgs[0] != "first" || msgs[1] != "other instance" {
 		t.Errorf("messages = %v, want [first, other instance]", msgs)
 	}
+}
+
+// swapDefaultLogger is this package's copy of the three-global restore; the
+// reason log's writer and flags travel with slog's is on helpers_test.go's
+// swapDefaultLogger.
+func swapDefaultLogger(t *testing.T, logger *slog.Logger) {
+	prev, prevWriter, prevFlags := slog.Default(), log.Writer(), log.Flags()
+	slog.SetDefault(logger)
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevWriter)
+		log.SetFlags(prevFlags)
+	})
 }
 
 // captureMessages is a minimal concurrency-safe slog.Handler recording every

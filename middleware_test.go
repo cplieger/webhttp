@@ -203,9 +203,7 @@ func TestRecoverer_noPanicPassesThrough(t *testing.T) {
 }
 
 func TestRecoverer_nilOptionIgnoredAndDefaultLogger(t *testing.T) {
-	prev := slog.Default()
-	slog.SetDefault(discardLogger())
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	swapDefaultLogger(t, discardLogger())
 
 	// A nil option must be skipped; with no WithRecoverLogger the slog.Default()
 	// fallback is exercised.
@@ -500,9 +498,7 @@ func TestHSTS_Validate(t *testing.T) {
 // TestSecurityHeaders_hsts (the directive is dropped, not repaired).
 func TestWithHSTS_preloadWithoutSubdomainsWarns(t *testing.T) {
 	logCap := &captureHandler{}
-	prev := slog.Default()
-	slog.SetDefault(slog.New(logCap))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	swapDefaultLogger(t, slog.New(logCap))
 
 	webhttp.WithHSTS(webhttp.HSTS{MaxAge: 365 * 24 * time.Hour, Preload: true})
 
@@ -526,9 +522,7 @@ func TestWithHSTS_preloadWithoutSubdomainsWarns(t *testing.T) {
 // policy Validate accepts logs nothing at wiring time.
 func TestWithHSTS_validPolicyIsSilent(t *testing.T) {
 	logCap := &captureHandler{}
-	prev := slog.Default()
-	slog.SetDefault(slog.New(logCap))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	swapDefaultLogger(t, slog.New(logCap))
 
 	webhttp.WithHSTS(webhttp.HSTS{MaxAge: 365 * 24 * time.Hour, IncludeSubdomains: true, Preload: true})
 	webhttp.WithHSTS(webhttp.HSTS{})

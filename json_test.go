@@ -68,9 +68,7 @@ func TestWriteJSONStatus(t *testing.T) {
 
 func TestWriteJSONStatus_encodeFailureCommitsStatusAndWarns(t *testing.T) {
 	logCap := &captureHandler{}
-	prev := slog.Default()
-	slog.SetDefault(slog.New(logCap))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	swapDefaultLogger(t, slog.New(logCap))
 
 	rr := httptest.NewRecorder()
 	// A channel cannot be JSON-encoded, so Encode fails after the status is
