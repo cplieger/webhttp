@@ -2,11 +2,51 @@ package webhttp_test
 
 import (
 	"context"
+	"log"
 	"log/slog"
 	"net"
 	"net/http"
 	"sync"
+	"testing"
 )
+
+// swapDefaultLogger installs logger as the process default for the test and
+// restores all three globals slog.SetDefault writes. It also points the log
+// package at the installed handler and SKIPS that redirect for slog's own
+// default handler, so restoring slog alone leaves log writing into a buffer
+// nothing reads. slog goes back first: reinstalling a non-default handler
+// re-runs the redirect and would undo an earlier log restore.
+func swapDefaultLogger(t *testing.T, logger *slog.Logger) {
+	prev, prevWriter, prevFlags := slog.Default(), log.Writer(), log.Flags()
+	slog.SetDefault(logger)
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevWriter)
+		log.SetFlags(prevFlags)
+	})
+}
+
+// TestSwapDefaultLogger_restoresLogPackageGlobals pins the restore the rest of
+// this package's log assertions depend on: a leaked redirect silences every
+// later slog call in the binary, because the stock default handler emits
+// through log.Output.
+func TestSwapDefaultLogger_restoresLogPackageGlobals(t *testing.T) {
+	wantWriter, wantFlags := log.Writer(), log.Flags()
+
+	t.Run("swap", func(t *testing.T) {
+		swapDefaultLogger(t, slog.New(&captureHandler{}))
+		if log.Writer() == wantWriter {
+			t.Fatal("slog.SetDefault did not redirect log's writer, so this test cannot observe the restore")
+		}
+	})
+
+	if log.Writer() != wantWriter {
+		t.Error("log.Writer() not restored; later slog calls write into the swapped handler's buffer")
+	}
+	if got := log.Flags(); got != wantFlags {
+		t.Errorf("log.Flags() = %d, want %d", got, wantFlags)
+	}
+}
 
 // captureHandler is a slog.Handler that records every emitted record for
 // assertions. It is safe for concurrent use.
