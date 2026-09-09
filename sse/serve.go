@@ -16,6 +16,7 @@ import (
 // config carries hub-level settings; assembled by NewHub from Options.
 type config struct {
 	logger         *slog.Logger
+	keepaliveEvent string
 	ringSize       int
 	clientBuffer   int
 	maxClients     int
@@ -30,6 +31,7 @@ type config struct {
 func defaultConfig() config {
 	return config{
 		logger:         slog.Default(),
+		keepaliveEvent: "", // unset: each keepalive is the `: keepalive` comment
 		ringSize:       256,
 		clientBuffer:   256, // fallback: NewHub derives it from ringSize unless set explicitly
 		maxClients:     0,   // unlimited
@@ -68,11 +70,21 @@ func WithMaxClients(n int) Option {
 	return func(c *config) { c.maxClients = max(n, 0) }
 }
 
-// WithKeepalive sets the interval between `: keepalive` comments (default
-// 15s, below common proxy idle timeouts: nginx 60s, ALB 120s). A
-// non-positive value disables keepalives.
+// WithKeepalive sets the interval between keepalives (default 15s, below
+// common proxy idle timeouts: nginx 60s, ALB 120s). A non-positive value
+// disables them; WithKeepaliveEvent decides the form each one takes.
 func WithKeepalive(d time.Duration) Option {
 	return func(c *config) { c.keepalive = d }
+}
+
+// WithKeepaliveEvent makes each keepalive a NAMED event frame rather than the
+// default `: keepalive` comment, so a client can observe it: an EventSource
+// parser discards a comment. Consume it with addEventListener(name, ...).
+// The frame carries no id:, so a beat leaves Last-Event-ID on the last real
+// event, and it never enters the replay ring. An empty name keeps the comment;
+// a name holding a CR or LF is refused by NewHub, which logs one Warn.
+func WithKeepaliveEvent(name string) Option {
+	return func(c *config) { c.keepaliveEvent = name }
 }
 
 // WithReconnectDelay sets the delay Serve advertises as the stream's SSE
@@ -259,7 +271,7 @@ func (h *Hub) stream(ctx context.Context, w io.Writer, rc *http.ResponseControll
 				return
 			}
 		case <-keepaliveC:
-			if !writeKeepalive(w, rc) {
+			if !writeKeepalive(w, rc, h.cfg.keepaliveEvent) {
 				return
 			}
 		}
@@ -285,13 +297,34 @@ func writeBatch(w io.Writer, rc *http.ResponseController, sub *subscriber, env e
 	}
 }
 
-// writeKeepalive emits one keepalive comment and flushes it. Returns false
-// on a write or flush error.
-func writeKeepalive(w io.Writer, rc *http.ResponseController) bool {
-	if _, err := fmt.Fprint(w, ": keepalive\n\n"); err != nil {
+// writeKeepalive emits one keepalive in the configured form and flushes it.
+// Returns false on a write or flush error.
+func writeKeepalive(w io.Writer, rc *http.ResponseController, name string) bool {
+	if err := writeKeepaliveFrame(w, name); err != nil {
 		return false
 	}
 	return rc.Flush() == nil
+}
+
+// writeKeepaliveFrame writes one keepalive: a named event frame, or the comment
+// when no name is configured. The named form goes through writeFrame, so both
+// keepalive and event bytes come from one encoder, at id 0 (no id: field) and
+// empty data. The empty data: line is required: a frame carrying no data: field
+// at all leaves the parser's data buffer empty, and dispatch then returns
+// without creating an event (WHATWG HTML, "Interpreting an event stream").
+func writeKeepaliveFrame(w io.Writer, name string) error {
+	if name == "" {
+		_, err := fmt.Fprint(w, ": keepalive\n\n")
+		return err
+	}
+	return writeFrame(w, 0, name, nil)
+}
+
+// encodableEventName reports whether name fits one SSE `event:` field. A CR or
+// LF ends the field, so the remainder of such a name would be read as further
+// stream lines: caller text placed where the encoder decides framing.
+func encodableEventName(name string) bool {
+	return !strings.ContainsAny(name, "\r\n")
 }
 
 // writeRetry emits the stream's reconnection-delay field, or nothing at all

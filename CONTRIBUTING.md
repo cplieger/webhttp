@@ -149,6 +149,17 @@ A few properties are essential. Keep them when you change the code.
   fairness), and the empty-bucket 429 flows through `WriteError` so the
   throttled response stays the standard JSON envelope. Keep all three
   properties if you touch it.
+- **A named SSE keepalive is written by the stream, never published.** `sse`'s
+  `WithKeepaliveEvent` exists because an `EventSource` parser discards the
+  default `: keepalive` comment, so a client watchdog cannot see an idle healthy
+  stream at all. The fix is a frame the stream goroutine writes: `Serve` emits it
+  with no event ID, so a beat consumes no replay-ring slot, does not advance the
+  ID the next real event gets, and leaves the client's `Last-Event-ID` on the
+  last real event. Routing it through `Publish` instead would undo all four. The
+  frame's empty `data:` line is also load-bearing, since a frame with no `data:`
+  field is dropped before dispatch. An empty name keeps the comment, and a name
+  holding a CR or LF is refused at `NewHub` with one Warn, because it cannot be
+  encoded as one SSE field. Keep every one of those properties if you touch it.
 - **A `retry:` field of `0` is never emitted.** It would tell the client to
   reconnect with no delay, so `sse`'s `WithReconnectDelay` avoids it from both
   sides: unset (the off contract above) writes no `retry:` line at all rather
