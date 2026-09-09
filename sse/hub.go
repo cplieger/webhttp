@@ -70,6 +70,14 @@ func NewHub(opts ...Option) *Hub {
 	if !cfg.clientBufferSet {
 		cfg.clientBuffer = max(cfg.ringSize, 1)
 	}
+	// Checked here rather than per beat, and after the option loop so the Warn
+	// reaches a logger supplied after the name. The comment form is what the
+	// refusal falls back to: it is the keepalive that has been holding proxy
+	// idle timeouts off all along.
+	if !encodableEventName(cfg.keepaliveEvent) {
+		cfg.logger.Warn("sse: keepalive event name spans lines, keeping the comment keepalive", "name", cfg.keepaliveEvent)
+		cfg.keepaliveEvent = ""
+	}
 	return &Hub{
 		subscribers: make(map[*subscriber]struct{}),
 		ring:        newRing(cfg.ringSize),

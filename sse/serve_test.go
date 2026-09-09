@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -404,6 +405,73 @@ func TestServeKeepaliveDisabled(t *testing.T) {
 		lines := readUntil(t, sc, func(l string) bool { return l == "data: still-live" })
 		if joined := strings.Join(lines, "\n"); strings.Contains(joined, ": keepalive") {
 			t.Errorf("stream carried a keepalive with the interval disabled: %v", lines)
+		}
+	})
+}
+
+// TestServeKeepaliveEventReplacesTheComment pins the named keepalive on the
+// wire: a configured name makes each beat an event frame the EventSource parser
+// dispatches, on the same cadence and in place of the comment it throws away,
+// and it carries no id: so a beat cannot move the client's Last-Event-ID off the
+// last real event.
+func TestServeKeepaliveEventReplacesTheComment(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const interval = 20 * time.Millisecond
+		h := NewHub(WithKeepalive(interval), WithKeepaliveEvent("heartbeat"))
+		srv := startServer(t, h)
+		resp, sc := openStream(t, srv, srv.URL, nil)
+		defer resp.Body.Close()
+		readUntil(t, sc, func(l string) bool { return l == ": connected" })
+
+		start := time.Now()
+		lines := readUntil(t, sc, func(l string) bool { return l == "event: heartbeat" })
+		if got := time.Since(start); got != interval {
+			t.Errorf("first keepalive after %v, want exactly %v", got, interval)
+		}
+		for _, l := range lines {
+			if l == ": keepalive" {
+				t.Errorf("stream carried the comment keepalive as well as the named event; lines = %v", lines)
+			}
+			if strings.HasPrefix(l, "id:") {
+				t.Errorf("keepalive carried %q, want no id: field; lines = %v", l, lines)
+			}
+		}
+		if !sc.Scan() || sc.Text() != "data: " {
+			t.Errorf("line after event: heartbeat = %q, want %q — a frame with no data: field is discarded before dispatch", sc.Text(), "data: ")
+		}
+	})
+}
+
+// TestServeKeepaliveEventBypassesTheReplayRing is why the option exists rather
+// than the consumer publishing its own named beat. A beat is written by the
+// stream goroutine and assigned no event ID, so it occupies no ring slot a
+// resuming client needs and does not advance the ID a real event gets next.
+func TestServeKeepaliveEventBypassesTheReplayRing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const interval = 20 * time.Millisecond
+		h := NewHub(WithReplay(2), WithKeepalive(interval), WithKeepaliveEvent("heartbeat"))
+		srv := startServer(t, h)
+		resp, sc := openStream(t, srv, srv.URL, nil)
+		defer resp.Body.Close()
+		readUntil(t, sc, func(l string) bool { return l == ": connected" })
+		requireClients(t, h, 1)
+
+		// Three beats against a ring of two: a beat that took a slot would have
+		// evicted the whole window, not just crowded it.
+		for range 3 {
+			readUntil(t, sc, func(l string) bool { return l == "event: heartbeat" })
+		}
+		if got := h.Buffered(); len(got) != 0 {
+			t.Errorf("Buffered() = %+v after 3 keepalives, want the ring untouched", got)
+		}
+		if floor, head := h.Bounds(); floor != 0 || head != 0 {
+			t.Errorf("Bounds() = (%d,%d) after 3 keepalives, want (0,0)", floor, head)
+		}
+
+		h.Publish(Event{Data: []byte("real")})
+		lines := readUntil(t, sc, func(l string) bool { return l == "data: real" })
+		if !slices.Contains(lines, "id: 1") {
+			t.Errorf("first real event after 3 keepalives = %v, want it to carry id: 1", lines)
 		}
 	})
 }

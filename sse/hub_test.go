@@ -2,6 +2,9 @@ package sse
 
 import (
 	"bytes"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -367,6 +370,62 @@ func TestWriteRetry(t *testing.T) {
 			}
 			if got := buf.String(); got != tt.want {
 				t.Errorf("writeRetry(w, %v) wrote %q, want %q", tt.d, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWriteKeepalive(t *testing.T) {
+	tests := []struct {
+		name  string
+		event string
+		want  string
+	}{
+		{name: "no name writes the comment", event: "", want: ": keepalive\n\n"},
+		// Two properties in those bytes. The data: line is what makes the beat
+		// observable at all: a frame without one is discarded by the EventSource
+		// parser before it becomes an event. And neither form carries an id:, so
+		// a beat cannot move the client's Last-Event-ID off the last real event.
+		{name: "a name writes a dispatchable frame", event: "heartbeat", want: "event: heartbeat\ndata: \n\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			if !writeKeepalive(rec, http.NewResponseController(rec), tt.event) {
+				t.Fatal("writeKeepalive reported a write or flush failure")
+			}
+			if got := rec.Body.String(); got != tt.want {
+				t.Errorf("writeKeepalive(w, rc, %q) wrote %q, want %q", tt.event, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNewHubKeepaliveEventNameSpanningLines(t *testing.T) {
+	// A CR or LF ends the SSE field, so the rest of such a name would be read
+	// as further stream lines — a caller-authored id: or data: inside the beat.
+	// NewHub drops back to the comment, and the Warn reaches a logger the
+	// caller passed AFTER the name, which is why the check runs after the
+	// option loop rather than inside the option.
+	for _, tt := range []struct {
+		name     string
+		event    string
+		wantKept string
+		wantWarn bool
+	}{
+		{name: "PlainNameIsKept", event: "heartbeat", wantKept: "heartbeat"},
+		{name: "LineFeedIsRefused", event: "beat\nid: 99", wantWarn: true},
+		{name: "CarriageReturnIsRefused", event: "beat\rid: 99", wantWarn: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var logged bytes.Buffer
+			h := NewHub(WithKeepaliveEvent(tt.event), WithLogger(slog.New(slog.NewTextHandler(&logged, nil))))
+			if got := h.cfg.keepaliveEvent; got != tt.wantKept {
+				t.Errorf("NewHub(WithKeepaliveEvent(%q)) kept %q, want %q", tt.event, got, tt.wantKept)
+			}
+			gotWarn := strings.Contains(logged.String(), "sse: keepalive event name")
+			if gotWarn != tt.wantWarn {
+				t.Errorf("NewHub(WithKeepaliveEvent(%q)) logged %q, want a warn: %v", tt.event, logged.String(), tt.wantWarn)
 			}
 		})
 	}

@@ -1,9 +1,9 @@
 // Package sse provides a broadcast hub for Server-Sent Events: fan-out to
 // connected clients, a replay ring with monotonic event IDs so a reconnecting
 // client resumes via the standard Last-Event-ID header, proxy-defensive
-// response headers, keepalive comments, an optional reconnection-delay hint,
-// an optional concurrent-client cap, per-subscriber topic filtering, and a
-// shutdown drain gate.
+// response headers, keepalives as a comment or a client-visible named event,
+// an optional reconnection-delay hint, an optional concurrent-client cap,
+// per-subscriber topic filtering, and a shutdown drain gate.
 //
 // The Hub owns broadcast state; Serve adapts one HTTP request into a
 // subscriber. Events carry pre-marshaled bytes (the hub does no JSON), an
@@ -29,6 +29,15 @@
 // were lost; the OnConnect hook receives the current (floor, head) bounds so
 // an application can hand the client that information and let it refetch
 // authoritative state.
+//
+// # Keepalives
+//
+// An idle stream carries a keepalive so an intermediary does not read it as
+// dead and cut it. The default is an SSE comment, which the EventSource parser
+// discards, so a client watchdog measuring time since the last received event
+// has nothing to measure. WithKeepaliveEvent makes each one a named event frame
+// instead, and Serve writes it with no event ID, so it reaches an
+// addEventListener handler without consuming a replay-ring slot.
 //
 // The package has zero dependencies beyond the standard library.
 package sse
