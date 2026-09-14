@@ -1,6 +1,6 @@
 # webhttp
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/webhttp/v2.svg)](https://pkg.go.dev/github.com/cplieger/webhttp/v2)
+[![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/webhttp/v3.svg)](https://pkg.go.dev/github.com/cplieger/webhttp/v3)
 [![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/webhttp)](https://github.com/cplieger/webhttp/blob/main/go.mod)
 [![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/webhttp/badges/coverage.json)](https://github.com/cplieger/webhttp/actions/workflows/coverage.yml)
 [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/webhttp/badges/mutation.json)](https://github.com/cplieger/webhttp/issues?q=label%3Agremlins-tracker)
@@ -9,13 +9,13 @@
 
 > Resilient server-side HTTP plumbing for Go
 
-A standalone Go library bundling the server-side pieces almost every service ends up hand-rolling: request-id injection with one-line access logging, a flush/hijack-safe status recorder, composable middleware (panic recovery, security headers, per-route JSON timeout, a shared-bucket rate limiter, a no-store setter, a `Chain` combinator), a spoof-aware client-IP resolver, an exact-match Host allowlist against DNS rebinding, a bind-exposure classifier, an embedded-static file handler with content-hash ETags and precomputed gzip, a CSP inline-script hash extractor, JSON response and error helpers, request-prelude helpers, a request-path canonicalizer matching `ServeMux`'s own cleaning, a constant-time static-credential verifier, an HTTP readiness gate, a graceful server bootstrap with bounded-teardown and cancellation-classification helpers, and a Server-Sent-Events broadcast hub (the `sse` subpackage). Standard-library only, no external runtime dependencies.
+A standalone Go library bundling the server-side pieces almost every service ends up hand-rolling: request-id injection with one-line access logging, a flush/hijack-safe status recorder, composable middleware (panic recovery, security headers, per-route JSON timeout, a shared-bucket rate limiter, a no-store setter, a `Chain` combinator), a spoof-aware client-IP resolver, an exact-match Host allowlist against DNS rebinding, a bind-exposure classifier, an embedded-static file handler with content-hash ETags and precomputed gzip, a CSP inline-script hash extractor, JSON response and error helpers, request-prelude helpers, a request-path canonicalizer matching `ServeMux`'s own cleaning, a constant-time static-credential verifier, an HTTP readiness gate, a graceful server bootstrap with bounded-teardown and cancellation-classification helpers. Standard-library only, no external runtime dependencies.
 
 webhttp is the inbound-server counterpart to [httpx](https://github.com/cplieger/httpx): httpx makes resilient requests going _out_, webhttp handles the requests coming _in_. The two are complementary and share no code. It ships the mechanism only; each application layers its own route table, error taxonomy, and named helpers on top.
 
 ## Install
 
-`go get github.com/cplieger/webhttp/v2@latest`
+`go get github.com/cplieger/webhttp/v3@latest`
 
 ## Usage
 
@@ -30,7 +30,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/cplieger/webhttp/v2"
+	"github.com/cplieger/webhttp/v3"
 )
 
 func main() {
@@ -99,7 +99,7 @@ func main() {
 
 ## API
 
-The bullets below map the surface; symbol-level depth lives in the [godoc](https://pkg.go.dev/github.com/cplieger/webhttp/v2).
+The bullets below map the surface; symbol-level depth lives in the [godoc](https://pkg.go.dev/github.com/cplieger/webhttp/v3).
 
 ### Middleware
 
@@ -247,34 +247,6 @@ This is the HTTP serving-state gate, for a load balancer asking "should this ins
 `Run` has exactly two exits, and only one of them is the graceful sequence. When `Serve` returns on its own instead (a dead accept loop, or a `Shutdown`/`Close` the caller drove itself), `ctx` was never cancelled, the listener is already gone, and neither `WithPreDrain` nor `onShutdown` runs (both are defined against a graceful stop). `WithServeExit(fn)` is the teardown for that path: `fn` gets the whole grace as its budget (no drain spent any of it), `Run` does not call `srv.Shutdown` behind it, and exactly one of the two paths runs per call. It is opt-in, so a caller that registers nothing keeps today's behavior of returning the serve error with no hook at all. Because `ctx` is still live there, a teardown that waits on a goroutine keyed to it (a background loop stopped by the same signal context) must cancel it inside `fn`, or it waits out the whole grace for a goroutine nothing asked to stop.
 
 Streaming apps (SSE, WebSocket, long responses) MUST omit `WithWriteTimeout`, since a write deadline would cut off an in-progress stream. Bind the listener up front (for example with `net.ListenConfig.Listen`) so a port-in-use error surfaces synchronously before `Run`, and pass application teardown as `onShutdown`.
-
-### Server-sent events (`sse` subpackage)
-
-`github.com/cplieger/webhttp/v2/sse` is a broadcast hub for SSE endpoints, the streaming counterpart to the request/response helpers above (`RouteTimeout` deliberately cannot wrap a stream).
-
-```go
-hub := sse.NewHub(sse.WithMaxClients(64))
-
-mux.HandleFunc("GET /api/events", func(w http.ResponseWriter, r *http.Request) {
-	hub.Serve(w, r,
-		sse.WithTopic(r.URL.Query().Get("chat_id")),
-		sse.OnConnect(func(w *sse.Writer, b sse.ReplayBounds) error {
-			return w.Event(b.Head, "connected", fmt.Appendf(nil, `{"floor":%d,"head":%d}`, b.Floor, b.Head))
-		}))
-})
-
-hub.Publish(sse.Event{Name: "notify", Topic: chatID, Data: payload})
-// on shutdown, before srv.Shutdown:
-hub.Shutdown()
-```
-
-- `NewHub(opts ...Option)`: options `WithReplay(n)` (ring size, default 256; every event gets a monotonic ID, and a reconnect with `Last-Event-ID` replays what the client missed, gap-free and overlap-free), `WithClientBuffer(n)`, `WithMaxClients(n)` (503 beyond the cap; 0 = unlimited), `WithKeepalive(d)` (keepalive interval, default 15s, below common proxy idle timeouts), `WithKeepaliveEvent(name)` (send each keepalive as a named `event:` frame the client can observe, instead of the default `: keepalive` comment that `EventSource` discards; the frame carries no `id:` and never enters the replay ring, so a beat costs no ring slot and leaves `Last-Event-ID` on the last real event), `WithReconnectDelay(d)` (the stream's `retry:` field, milliseconds on the wire, written ahead of any replay; unset emits no field and the client keeps its own reconnection default), `WithLogger(l)`.
-- `(*Hub).Publish(Event)`: fan-out; assigns the ID, appends to the replay ring, evicts (cancels) a subscriber whose buffer is full and does not block; it relies on EventSource auto-reconnect plus replay. Nil-safe.
-- `(*Hub).Serve(w, r, opts ...ServeOption)`: owns the proxy-defensive headers (`no-transform`, `X-Accel-Buffering: no`), deadline clearing, `Last-Event-ID` replay, keepalives, and frame encoding. An `http.Flusher` reachable through an `Unwrap()` chain works, so wrapping middleware keeps streaming intact; the 500 `streaming_unsupported` refusal fires only when no flusher exists at any depth. Options: `WithTopic(t)` (receive broadcasts plus events scoped to `t`), `OnConnect(fn)` (write a handshake carrying the replay bounds as a `ReplayBounds{Floor, Head}`; a client whose last-seen ID is below `Floor` missed events and must refetch state).
-- `(*Hub).Bounds()` / `.ClientCount()` / `.Buffered()`: the replay bounds, subscriber count, and a snapshot of the replay window as `ReplayEvent{Event, ID}` values (for diagnostics endpoints and tests).
-- `(*Hub).SetMaxClients(n)`: replace the subscriber cap at runtime (for hot-reloaded configuration); lowering it does not evict connected clients.
-- `(*Hub).Shutdown()`: drain gate; cancels every client, and subsequent `Serve` calls get 503. Refusal responses use the standard `ErrorResponse` envelope (codes `sse_unavailable`, `streaming_unsupported`).
-- `(*Writer).Event(id, name, data) error` / `.Comment(text) error`: the frame writers an `OnConnect` handshake uses. `Event` writes one frame, omitting the `id:` field when `id` is 0 and the `event:` field when `name` is empty; `Comment` writes a `: text` line, which EventSource consumers ignore.
 
 ## Contributing
 

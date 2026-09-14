@@ -3,7 +3,7 @@ package webhttp_test
 import (
 	"testing"
 
-	"github.com/cplieger/webhttp/v2"
+	"github.com/cplieger/webhttp/v3"
 )
 
 // TestClassifyBind pins the classification table for configured "host:port"

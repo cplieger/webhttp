@@ -28,9 +28,7 @@ set of small, independent pieces:
 - the request-path canonicalizer `CanonicalRequestPath`,
 - the constant-time `StaticTokenVerifier`,
 - a readiness gate: `Ready`, `ReadinessHandler`,
-- a graceful server bootstrap: `NewServer`, `Run`,
-- the `sse` subpackage: a Server-Sent-Events broadcast hub with replay and
-  `Last-Event-ID` resume.
+- a graceful server bootstrap: `NewServer`, `Run`.
 
 ## Invariants to preserve
 
@@ -149,23 +147,6 @@ A few properties are essential. Keep them when you change the code.
   fairness), and the empty-bucket 429 flows through `WriteError` so the
   throttled response stays the standard JSON envelope. Keep all three
   properties if you touch it.
-- **A named SSE keepalive is written by the stream, never published.** `sse`'s
-  `WithKeepaliveEvent` exists because an `EventSource` parser discards the
-  default `: keepalive` comment, so a client watchdog cannot see an idle healthy
-  stream at all. The fix is a frame the stream goroutine writes: `Serve` emits it
-  with no event ID, so a beat consumes no replay-ring slot, does not advance the
-  ID the next real event gets, and leaves the client's `Last-Event-ID` on the
-  last real event. Routing it through `Publish` instead would undo all four. The
-  frame's empty `data:` line is also load-bearing, since a frame with no `data:`
-  field is dropped before dispatch. An empty name keeps the comment, and a name
-  holding a CR or LF is refused at `NewHub` with one Warn, because it cannot be
-  encoded as one SSE field. Keep every one of those properties if you touch it.
-- **A `retry:` field of `0` is never emitted.** It would tell the client to
-  reconnect with no delay, so `sse`'s `WithReconnectDelay` avoids it from both
-  sides: unset (the off contract above) writes no `retry:` line at all rather
-  than one holding `0`, which is what keeps an unconfigured hub streaming the
-  same bytes it always has, and a positive sub-millisecond delay rounds up to
-  `1` rather than truncating to `0`. Keep both arms if you touch it.
 
 ## Local development
 
@@ -208,8 +189,8 @@ up in `go.sum` and, for a zero-dependency library, that is a regression. Use
 plain `if got != want { t.Errorf(...) }`, table-driven subtests, and
 `httptest` throughout.
 
-Tests live beside the code, one `_test.go` file per source unit, in both the
-root package and `sse/`. Parser, validator, and encoder surfaces additionally
+Tests live beside the code, one `_test.go` file per source unit, in the root
+package. Parser, validator, and encoder surfaces additionally
 carry fuzz targets in `*_fuzz_test.go` files; add one when you introduce a new
 input-parsing surface. `helpers_test.go` holds the shared handlers and the
 capturing `slog.Handler`; `example_test.go` keeps runnable `Example` functions
