@@ -18,7 +18,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/cplieger/webhttp/v2"
+	"github.com/cplieger/webhttp/v3"
 )
 
 func TestNewServer_defaults(t *testing.T) {

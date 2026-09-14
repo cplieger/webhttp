@@ -4,7 +4,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/cplieger/webhttp/v2"
+	"github.com/cplieger/webhttp/v3"
 )
 
 // FuzzClassifyBind asserts the classifier never panics and holds four
