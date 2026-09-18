@@ -1,8 +1,6 @@
 # webhttp
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/webhttp/v3.svg)](https://pkg.go.dev/github.com/cplieger/webhttp/v3)
-[![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/webhttp)](https://github.com/cplieger/webhttp/blob/main/go.mod)
-[![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/webhttp/badges/mutation.json)](https://github.com/cplieger/webhttp/issues?q=label%3Agremlins-tracker)
+[![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/webhttp/v3.svg)](https://pkg.go.dev/github.com/cplieger/webhttp/v3) [![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/webhttp)](https://github.com/cplieger/webhttp/blob/main/go.mod) [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/webhttp/badges/mutation.json)](https://github.com/cplieger/webhttp/issues?q=label%3Agremlins-tracker)
 
 > Resilient server-side HTTP plumbing for Go
 
