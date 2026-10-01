@@ -56,7 +56,7 @@ func TestRequireMethod_mismatch(t *testing.T) {
 // RequireMethod is built on MethodNotAllowed, which renders a LIST. This pins
 // the single-method response byte for byte — header value, status, and raw body
 // — so the multi-method rendering can never change what today's single-method
-// callers (subflux's RequirePOST/RequireGET, vibekit's requirePOST) emit.
+// callers (subflux's RequirePOST/RequireGET, marotte's requirePOST) emit.
 func TestRequireMethod_singleMethodResponseIsByteIdentical(t *testing.T) {
 	const wantBody = `{"error":"method not allowed","code":"method_not_allowed"}` + "\n"
 	cases := []struct {
@@ -373,7 +373,7 @@ func TestDecodeJSONInto_trailingDataIsErrTrailingData(t *testing.T) {
 }
 
 // The oversize case surfaces as a *http.MaxBytesError so a caller can map it to
-// 413 (as vibekit does) while a malformed body maps to 400.
+// 413 (as marotte does) while a malformed body maps to 400.
 //
 // Green on go1.27rc2 as well as 1.26. If it ever fails under a
 // GOEXPERIMENT=jsonv2 build on a Go 1.26 toolchain, that is golang/go#77789
