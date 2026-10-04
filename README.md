@@ -2,15 +2,27 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/webhttp/v3.svg)](https://pkg.go.dev/github.com/cplieger/webhttp/v3) [![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/webhttp)](https://github.com/cplieger/webhttp/blob/main/go.mod) [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/webhttp/badges/mutation.json)](https://github.com/cplieger/webhttp/issues?q=label%3Agremlins-tracker)
 
-> Resilient server-side HTTP plumbing for Go
+webhttp hardens your Go `net/http` server with access logging, security headers, a client IP that cannot be spoofed and graceful shutdown.
 
-A standalone Go library bundling the server-side pieces almost every service ends up hand-rolling: request-id injection with one-line access logging, a flush/hijack-safe status recorder, composable middleware (panic recovery, security headers, per-route JSON timeout, a shared-bucket rate limiter, a no-store setter, a `Chain` combinator), a spoof-aware client-IP resolver, an exact-match Host allowlist against DNS rebinding, a bind-exposure classifier, an embedded-static file handler with content-hash ETags and precomputed gzip, a CSP inline-script hash extractor, JSON response and error helpers, request-prelude helpers, a request-path canonicalizer matching `ServeMux`'s own cleaning, a constant-time static-credential verifier, an HTTP readiness gate, a graceful server bootstrap with bounded-teardown and cancellation-classification helpers. Standard-library only, no external runtime dependencies.
+It replaces the middleware, proxy-header parsing and shutdown sequence you would otherwise write around `http.ServeMux`, and every piece stays a plain `http.Handler`. It ships no router, and your app keeps its own routes and error codes. It uses only the standard library, needs Go 1.27.1 or later and is licensed under Apache-2.0.
 
-webhttp is the inbound-server counterpart to [httpx](https://github.com/cplieger/httpx): httpx makes resilient requests going _out_, webhttp handles the requests coming _in_. The two are complementary and share no code. It ships the mechanism only; each application layers its own route table, error taxonomy, and named helpers on top.
+## Why use it
+
+webhttp is built for a Go service on `http.ServeMux` that faces a browser or sits behind a proxy.
+
+- `ClientIP` reads `X-Forwarded-For` only from a proxy you trust, so a client cannot fake its address.
+- A Host allowlist answers 403 to a `Host` you did not list, which stops DNS rebinding attacks.
+- The access log writes `log/slog` lines and caps the path at 512 bytes and the method at 24. Metric labels stay within ten method values and your registered routes.
+- `NewServer` leaves the write timeout off, so SSE and WebSocket streams stay open. `Run` drains in-flight requests within a 5-second grace period by default.
+- `StaticHandler` serves an `embed.FS` with content-hash ETags and gzip computed once at startup.
+
+Consider [chi](https://github.com/go-chi/chi) if you want a router with route groups, inline middleware and sub-router mounting. Consider [golang.org/x/time/rate](https://pkg.go.dev/golang.org/x/time/rate) if you need a token bucket per client or one that waits instead of refusing.
 
 ## Install
 
-`go get github.com/cplieger/webhttp/v3@latest`
+```sh
+go get github.com/cplieger/webhttp/v3@latest
+```
 
 ## Usage
 
@@ -34,9 +46,6 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("GET /readyz", webhttp.ReadinessHandler(ready))
 	mux.HandleFunc("POST /things", func(w http.ResponseWriter, r *http.Request) {
-		if !webhttp.RequireMethod(w, r, http.MethodPost) {
-			return
-		}
 		var body struct {
 			Name string `json:"name"`
 		}
@@ -46,35 +55,23 @@ func main() {
 		webhttp.WriteJSONStatus(w, http.StatusCreated, body)
 	})
 
-	// Browser-facing service? Decide your Host posture here: parse an
-	// operator allowlist with ParseHostList and add hostPolicy.Middleware()
-	// to the chain, placed before any cross-origin or CSRF check (see the
-	// Host allowlist section below). Machine-facing APIs can skip it.
-
-	// Compose middleware with Chain: the first listed is the outermost wrapper.
-	// Logging outermost means a panic recovered below it is logged as its 500,
-	// not a misleading 200.
+	// The first middleware listed is the outermost. Logging sits outside
+	// Recoverer so a recovered panic is logged as its 500.
 	handler := webhttp.Chain(mux,
 		webhttp.Logging(
-			webhttp.WithSkipPaths("/events"), // don't log long-lived streams
-			// The library derives the metric labels: the method from a closed
-			// ten-value set, the path from the matched route. Nothing here can
-			// mint a label series per scanner-invented URL or method token.
+			webhttp.WithSkipPaths("/events"), // a long-lived stream
 			webhttp.WithRecordRouteMetric(func(m webhttp.RequestMetric) {
-				// feed your metrics pipeline here
+				// m.Method and m.Path are bounded labels. Feed your metrics here.
 			}),
 		),
 		webhttp.Recoverer(),
 		webhttp.SecurityHeaders(),
 	)
 
-	// Streaming-safe defaults: ReadHeaderTimeout + IdleTimeout set,
-	// ReadTimeout/WriteTimeout left unset so SSE/WebSocket work out of the box.
-	// WithSlogErrorLog routes net/http's own connection-level lines (an accept
-	// error above all) into slog at a level your log rules can match.
+	// Only header reads and idle connections time out, so streams stay open.
 	srv := webhttp.NewServer(handler, webhttp.WithSlogErrorLog(slog.LevelError))
 
-	// Bind the listener up front so a port-in-use error surfaces synchronously.
+	// Bind first, so a port already in use fails here.
 	ln, err := net.Listen("tcp", ":8080")
 	if err != nil {
 		panic(err)
@@ -85,168 +82,66 @@ func main() {
 
 	ready.Set(true)
 	if err := webhttp.Run(ctx, srv, ln, func(context.Context) {
-		ready.Set(false) // application teardown on graceful shutdown
-	}); err != nil {
+		// application teardown after the drain
+	}, webhttp.WithPreDrain(func(context.Context) { ready.Set(false) })); err != nil {
 		panic(err)
 	}
 }
 ```
 
+A service that browsers reach should also refuse unknown `Host` names. Build a `HostPolicy` with `ParseHostList` and put its `Middleware()` in the chain ahead of any cross-origin or CSRF check. An API that only machines call can skip it. The examples on pkg.go.dev run under `go test`, which keeps them true.
+
 ## API
 
-The bullets below map the surface; symbol-level depth lives in the [godoc](https://pkg.go.dev/github.com/cplieger/webhttp/v3).
+- Middleware: `Chain`, `Recoverer`, `SecurityHeaders`, `Logging`, `RouteTimeout`, `RateLimiter` with its `SessionCreateRateLimit` and `FailedAuthRateLimit` presets, `NoStore`.
+- Logging and metrics: `RequestLogger` and its options, request-id helpers, `RouteMetricLabels`, `StatusRecorder`.
+- Trust checks: `ClientIP`, `ParseCIDRs`, `ParseHostList` and `HostPolicy`, `CanonicalHost`, `LoopbackOnly`, `ClassifyBind`, `NewStaticTokenVerifier`.
+- Requests and responses: `WriteJSON`, `WriteError` and `ErrorCode`, `DecodeBody`, `DecodeJSONInto`, `LimitBody`, `RequireMethod`, `MethodNotAllowed`, `CanonicalRequestPath`.
+- Static files: `StaticHandler`, `InlineScriptHashes`, `InlineStyleHashes`.
+- Server: `NewServer`, `Run` and its options, `Ready` and `ReadinessHandler`, `AwaitDone`, `CausedByCancellation`.
 
-### Middleware
+The full reference is on [pkg.go.dev](https://pkg.go.dev/github.com/cplieger/webhttp/v3).
 
-All middleware share the standard `func(http.Handler) http.Handler` shape (the `Middleware` type alias) and compose with `Chain`.
+## Middleware order and safety rules
 
-- `Chain(h, mw...) http.Handler`: wraps `h`; the first middleware listed is the outermost wrapper, so `Chain(h, A, B, C)` is `A(B(C(h)))`. A nil entry is skipped.
-- `Recoverer(opts ...RecoverOption) Middleware`: recovers a downstream panic, logs it at `Error` with the stack and request id, then writes a 500 via the configured `ErrorResponder` (the JSON `WriteError` by default). Re-panics `http.ErrAbortHandler`. Options: `WithRecoverLogger`, `WithPanicHook`, `WithRecoverResponder`.
-- `SecurityHeaders(opts ...SecurityOption) Middleware`: baseline response headers; always `X-Content-Type-Options: nosniff`, defaults `X-Frame-Options: DENY` and `Referrer-Policy: strict-origin-when-cross-origin`. Options: `WithCSP`, `WithFrameOptions`, `WithReferrerPolicy`, `WithPermissionsPolicy`, `WithCOOP`, `WithHSTS(HSTS{MaxAge, IncludeSubdomains, Preload})`. The HSTS knobs are named struct fields rather than two adjacent booleans, and both relational rules the browsers' preload list imposes are enforced: `Preload` needs `IncludeSubdomains` and a `MaxAge` of at least one year, so a policy failing either has the directive dropped from the header and the contradiction logged (the max-age rule also catches a bare `31536000` assigned to a `time.Duration` field, which is nanoseconds and would have rendered `max-age=0` beside `preload`). `HSTS.Validate() error` is the strict door for a caller that would rather refuse to boot; the zero `HSTS` is meaningful (`max-age=0`, forget the policy) and is not the same as leaving the option out (HSTS off).
-- `Logging(opts ...LogOption) Middleware`: `RequestLogger` in `Chain`-composable form; takes the same `LogOption` values.
-- `RouteTimeout(h, d, msg) http.Handler`: wraps `http.TimeoutHandler`; on timeout emits a 503 JSON `ErrorResponse` (`code: "timeout"`) carrying the context's request id.
-- `RateLimiter(burst int, interval time.Duration, opts ...RateLimitOption) Middleware`: throttles the wrapped handler through a single process-wide token bucket (`burst` tokens, one accrued every `interval`, one consumed per admitted request); an empty bucket answers 429 (`code: "rate_limited"`) with a `Retry-After` hint. The bucket is shared across all clients: it bounds the aggregate rate of an expensive shared route, not per-client fairness. A non-positive `burst` or `interval` disables limiting (handler returned unwrapped), so a config-driven zero cleanly means "no limit". Options: `WithRateLimitWhen(pred)` (throttle only matching requests), `WithRateLimitError(code ErrorCode, msg string)`, `WithRateLimitResponder(fn)` (render the 429 through your own `ErrorResponder` instead of the JSON envelope, the same hook `Recoverer` takes for its 500).
-- `SessionCreateRateLimit(path string) Middleware`: a `RateLimiter` preset for endpoints where each admitted request forks an expensive process; gates POST to `path` (exact match) at burst 6, one token per second. Other methods and paths pass through without consuming a token. Apps needing different tuning compose `RateLimiter` directly.
-- `FailedAuthRateLimit(when func(*http.Request) bool, msg string) Middleware`: a `RateLimiter` preset for a route guarded by one static credential; throttles requests `when` reports as presenting a failed credential at burst 10, one token per 6 seconds, answering 429 with the fixed code `too_many_auth_failures` and `msg`. A valid credential never draws a token, so the tuning does not have to leave room for the app's own senders. `msg` is the caller's because the credential differs per service (a bearer, an apikey, an app-specific token), and an empty one falls back to `too many failed authentication attempts`. What it bounds is the log volume and the digest cost of an attempt as much as the guessing rate: a network-exposed listener otherwise answers a wire-speed guessing run with a wire-speed stream of 401s, one access line each. A nil `when` throttles every request the middleware sees, which is the wiring for a caller that has already filtered the failed-auth class itself.
-- `NoStore() Middleware`: sets `Cache-Control: no-store` on every response passing through it, before the next handler runs. The value is fixed: this is the one header a dynamic surface needs, not a cache-policy API (per-asset policy belongs in `WithStaticCacheControl`). Placement and override ordering stay app-owned: the header is set, not locked, so a handler or inner middleware that needs its own value (a long-lived asset, a cacheable preview) simply `Set`s `Cache-Control` and wins, which is why the usual placement is innermost in the `Chain`. Scope it by mounting it on the subtree that needs it. It is not the middleware for a conditional no-store (a response uncacheable only when it carries a `Set-Cookie` has a different trigger and belongs with the code setting the cookie).
+`Chain(h, A, B, C)` builds `A(B(C(h)))`, so the first entry sees the request first. Any `func(http.Handler) http.Handler` fits in the chain. Put `Recoverer` inside `Logging`, as in `Chain(mux, Logging(), Recoverer())`. In the other order, the access line records 200 for a request whose client received a 500.
 
-Put `Recoverer` inside `Logging` (`Chain(mux, Logging(), Recoverer())`) so a panicked request is logged as its 500 rather than the status recorder's default 200. `SecurityHeaders` builds no Content-Security-Policy: a CSP must match the app's own script and style sources, so pass the exact policy via `WithCSP`; any header default can be omitted with an empty string. HSTS is off by default; enable it only for a service reached exclusively over HTTPS, since the header makes browsers refuse plain-HTTP and untrusted-cert connections for the whole max-age. `RouteTimeout` cannot wrap streaming or hijacking handlers (`http.TimeoutHandler` buffers the entire response); use per-request deadlines via `http.ResponseController` for those.
+Place a `HostPolicy` before any cross-origin or CSRF check. In a DNS rebinding attack, the page's `Origin` and the request's `Host` both name the attacker's domain, so a cross-origin check passes it and only the Host allowlist refuses it. Place `NoStore` innermost, so a handler that sets its own `Cache-Control` still wins.
 
-### Static assets and CSP
+`SecurityHeaders` always sends `X-Content-Type-Options: nosniff`, and by default `X-Frame-Options: DENY` and `Referrer-Policy: strict-origin-when-cross-origin`. It builds no Content-Security-Policy and sends no HSTS until you pass `WithCSP` or `WithHSTS`. Enable HSTS only for a service reached over HTTPS alone. A browser that has seen the header refuses plain-HTTP and untrusted-certificate connections to the host for the whole max-age.
 
-- `StaticHandler(fsys fs.FS, opts...) (http.Handler, error)`: serves an embedded (or any `fs.FS`) static tree; `embed.FS` reports a zero ModTime, so a bare `http.FileServer` never revalidates. The handler walks the tree once at construction, precomputing a content-hash (sha256) ETag per file and a gzip representation (kept only when smaller), and serves known assets with the ETag, the cache policy's `Cache-Control`, and `Vary: Accept-Encoding`; everything else falls through to the identity `http.FileServer`. The construction error is non-nil only when walking `fsys` fails (a malformed embed must abort startup).
-- `WithStaticCacheControl(fn func(assetPath string) string) StaticOption`: the per-asset `Cache-Control` policy; `fn` sees the normalized asset path and returns the header value, empty to omit. Default `no-cache` (the content-hash ETag makes revalidation a cheap 304).
-- `InlineScriptHashes(html []byte) []string`: returns a CSP `'sha256-<base64>'` source token per inline `<script>` element, hashing exactly the bytes a browser hashes; an extractor for pages the app controls, not an HTML sanitizer. Feed the tokens into the app's own policy string via `WithCSP`; a caller whose page is known to carry inline scripts must treat an empty result as a malformed build and fail startup rather than degrade to `'unsafe-inline'`.
-- `InlineStyleHashes(html []byte) []string`: the same for inline `<style>` elements, so `style-src` can be hash-pinned instead of `'unsafe-inline'` (a pre-JS loading overlay whose CSS must paint before the external stylesheet loads is the usual case). Shares the script scanner's core, so byte-boundary and malformed-tag behaviour cannot drift between the two. There is no skip rule to match the script scanner's external `src=` case, because a `<style>` element always carries its content inline. Note a style-src hash does not cover inline style **attributes** (`style="…"`), which `style-src-attr` governs and which need `'unsafe-hashes'`: an app whose markup or renderer sets style attributes cannot drop `'unsafe-inline'` on these tokens alone, though a renderer driving CSSOM property setters emits no attribute and is unaffected.
+`RouteTimeout` buffers the whole response, so never wrap a streaming or hijacking handler with it. [Middleware](docs/middleware.md) has each option and default.
 
-### Client IP
+Behind a proxy, `ClientIP` is safe only when the trusted set holds every proxy hop. `LoopbackOnly` is not authentication, because a proxy on the same loopback interface that removes every forwarding header passes it. An empty `NewStaticTokenVerifier` secret denies every value. When a page carries inline scripts, treat an empty `InlineScriptHashes` result as a startup error and never fall back to `'unsafe-inline'`.
 
-- `ClientIP(r, trusted...) string`: the best-effort client IP. With no trusted ranges (or when the direct peer is not inside one), `X-Forwarded-For` is ignored entirely and the host of `r.RemoteAddr` (the TCP peer, unspoofable at this layer) is returned. Only behind a trusted proxy is the header consulted, walked right-to-left past trusted hops to the first untrusted entry, the correct reading when a proxy appends the peer it saw (Caddy and most reverse proxies do; the leftmost entry is attacker-controlled). `X-Real-IP` is never consulted (client-settable). The caller supplies the trusted CIDRs; the library hardcodes none.
-- `ParseCIDRs(entries []string) (nets, invalid)`: parses an operator list of CIDRs or bare IPs (bare is `/32`/`/128`; blanks skipped) into the trusted-proxy set for `ClientIP`/`WithClientIP`; malformed entries are returned separately so a strict caller can reject them while a lenient one logs and uses the valid subset.
+## Graceful shutdown
 
-The trusted set must contain every proxy hop between the client and the server; if a hop is missing the walk stops there and that hop's address is returned.
+When `ctx` is cancelled, `Run` runs the `WithPreDrain` hook, then `srv.Shutdown` drains in-flight requests, then `onShutdown` runs. All three share one grace budget, 5 seconds unless you set `WithShutdownGrace`. Use the pre-drain hook to mark the instance unready or close long-lived streams, so they do not hold the drain open.
 
-### Host allowlist
+When `Serve` returns before `ctx` is cancelled, for example because the listener failed, neither hook runs. Pass `WithServeExit` to run your teardown in that case too. A `Run` error caused by the grace running out wraps `ErrShutdownGraceExpired`. [Server, readiness and shutdown](docs/server.md) has the full sequence.
 
-- `ParseHostList(entries []string, opts...) (*HostPolicy, invalid []string)`: parses an operator allowlist (a config array or a comma-split env var) into an immutable exact-match `HostPolicy`; malformed entries are returned separately (the `ParseCIDRs` shape).
-- `CanonicalHost(hostport string) string`: the strict canonicalizer both the entries and each request's `Host` go through (ASCII-only lowercasing, no port, no brackets, at most one trailing FQDN dot, IP literals normalized so different spellings of one address compare equal); returns `""` for anything malformed. The fold stops at ASCII deliberately: `strings.ToLower` maps U+212A and U+0130 into `k` and `i`, which would let a non-ASCII authority canonicalize onto an allowlisted ASCII key.
-- `(*HostPolicy).Middleware() Middleware`: rejects a request whose `Host` is not allowlisted with a 403 JSON `ErrorResponse` (`code: "host_not_allowed"`); an inactive policy returns the handler unwrapped.
-- `(*HostPolicy).Allows(r)` / `.Active()` / `.Size()`: the per-request decision and policy introspection.
-- `WithLoopbackExempt(bool) HostAllowlistOption`: when true, admits a request when both the socket peer and the `Host` are loopback, so a baked container healthcheck or in-container client keeps working under a browser-facing allowlist; unreachable by rebinding (the attack's `Host` is not loopback) and by remote forgery (a remote peer is not loopback). `false` is what leaving the option out means, and options resolve last-wins, so a caller can thread a computed flag without branching.
-- `WithHostAllowlistError(code ErrorCode, msg string) HostAllowlistOption`: override the 403 code and message to name the app's configuration knob. The code is separately typed from the message so the pair cannot be supplied transposed.
+## Related projects
 
-The gate breaks DNS rebinding (CWE-346): an attacker's page re-resolves its own hostname to this service's address, and the victim's browser then sends requests carrying the attacker's name in `Host`. Matching is exact and purely textual on the canonicalized `Host`: no name resolution (resolving would reopen the race the gate closes), `X-Forwarded-Host` ignored (client-controlled), and malformed `Host` values rejected rather than repaired (repair would collapse distinct wire values onto allowlisted keys). Configure non-ASCII names as Punycode A-labels; matching is byte-exact. Activation is fail-closed: a nil or all-blank entry list leaves the policy inactive (pass-through), but any non-blank entry engages the gate, so even an all-invalid list denies all rather than silently disabling protection. Place the middleware before any cross-origin or CSRF check: a rebinding request makes `Origin` and `Host` agree, so the exact-Host allowlist is what breaks that chain.
+- [httpx](https://github.com/cplieger/httpx) makes the requests your service sends out survive flaky servers. webhttp handles the requests coming in.
+- [health](https://github.com/cplieger/health) is the container liveness probe for a Docker `HEALTHCHECK`. `ReadinessHandler` answers a load balancer instead.
+- [auth](https://github.com/cplieger/auth) handles user logins and sessions. `NewStaticTokenVerifier` checks one configured machine credential.
 
-### Loopback-only endpoints
+## Documentation
 
-- `LoopbackOnly(refuse http.Handler) Middleware`: the middleware form of the loopback-only admission decision. It admits a request only when `LoopbackRequest` passes and `ProxiedRequest` finds no provenance header, and sends every other request to `refuse`. A nil `refuse` answers 403 with the standard error envelope and the code `loopback_only`. Pass your own handler to keep an envelope or wording your consumers already depend on.
-- `LoopbackRequest(r) bool`: reports whether a request is local. The socket peer must be loopback and the `Host` header must name the local host, so either leg failing refuses. It reads `r.RemoteAddr` and `r.Host` and nothing else: forwarded headers never admit a request and never refuse one. Both legs fail closed. The `Host` leg accepts every spelling `CanonicalHost` collapses: `localhost` in any case, `127.0.0.0/8` and `::1`, with an optional port or trailing FQDN dot.
-- `ProxiedRequest(h http.Header) bool`: reports whether the headers carry evidence that a proxy forwarded the request, or that a browser issued it. The set is `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Real-Ip`, `Sec-Fetch-Site` and `Origin`. It is a positive signal only, so a missing header is evidence of nothing. Use it directly when an app has its own admission pipeline and cannot take the middleware whole.
+- [Middleware](docs/middleware.md) covers ordering, recovery, security headers, timeouts, rate limiting and `NoStore`.
+- [Access logging and metrics](docs/access-logging.md) covers request ids, the log line, its bounds and the metric hooks.
+- [Client IP, hosts and credentials](docs/trust-checks.md) covers proxy trust, the Host allowlist and loopback checks.
+- [Requests and responses](docs/requests-and-responses.md) covers the JSON helpers, the error envelope, body decoding and path checks.
+- [Static assets and CSP hashes](docs/static-assets.md) covers embedded files, caching and hash-pinned inline scripts.
+- [Server, readiness and shutdown](docs/server.md) covers timeouts, readiness and the shutdown sequence.
 
-The middleware refuses provenance headers because the predicate cannot. An in-container CLI client sends none of them, so a request that carries one started outside the container. Host networking and a shared network namespace put a reverse proxy on the server's own loopback interface. Both nginx and Apache then rewrite `Host` to their upstream address by default, which satisfies the `Host` leg. The proxy itself satisfies the peer leg, so a remote request passes both. The gate has a ceiling: it admits a same-loopback proxy that removes every provenance header, because nothing then tells it apart from an in-container caller. Only authentication closes that gap; a header rule cannot.
+## Credits
 
-This gate is not `HostPolicy`. The allowlist answers whether the `Host` is one the operator named, so it admits a remote caller sending `Host: localhost` when the operator allows that name. This answers whether the request came from inside.
-
-### Bind classification
-
-- `ClassifyBind(addr string) BindClass`: classifies a configured listen address ("host:port") by exposure. `BindLoopback` covers loopback IP literals and "localhost" under an ASCII case fold (`LOCALHOST` matches, a non-ASCII lookalike does not); `BindExposed` covers wildcard binds, routable IPs, and any other hostname (no resolution is performed; an unresolvable name classifies as exposed); `BindInvalid` means the address is not "host:port" (the zero value, so an uninitialized class never reads as safe). Use it at startup to warn when an unauthenticated surface binds beyond loopback; what to do with an invalid input stays app policy (recipes in the godoc).
-- `ClassifyBindHost(host string) BindClass`: classifies a bare host (no port); never returns `BindInvalid`. The fallback door for portless bind values.
-- `(BindClass).String() string`: the class as a lowercase word for a log attribute: `invalid`, `loopback`, or `exposed`.
-
-### Status recorder
-
-`StatusRecorder` wraps an `http.ResponseWriter` to capture the response status while staying transparent to streaming: `Unwrap` lets `http.NewResponseController` reach the underlying writer's `Flusher`, `Hijacker`, and deadline setters, and it also implements `http.Flusher`/`http.Hijacker`/`io.ReaderFrom` directly, so a handler that type-asserts those interfaces on the writer still works and `io.Copy`/`http.ServeContent` keep the sendfile fast path.
-
-- `NewStatusRecorder(w) *StatusRecorder`: status defaults to 200.
-- `.WriteHeader(code)` / `.Write(b)`: records the first explicit code only; implicit 200 on first write.
-- `.Status() int` / `.Wrote() bool`: the recorded status, and whether the response is committed (the seam `Recoverer` uses to skip a double write onto an already-started response).
-- `.Unwrap()` / `.Flush()` / `.Hijack()` / `.ReadFrom(src)`: passthroughs returning the underlying writer's own results.
-
-### Request id and access logging
-
-- `HeaderRequestID`: the `X-Request-ID` header constant.
-- `ValidRequestID(s) bool`: 1 to 64 chars, each `[A-Za-z0-9_-]`.
-- `NewRequestID() string`: 16 random bytes, hex-encoded.
-- `WithRequestID(ctx, id)` / `RequestIDFromContext(ctx) string`: context threading.
-- `RequestLogger(next, opts...) http.Handler`: reuses a valid inbound `X-Request-ID` or mints a fresh id, echoes and threads it, records status via a `StatusRecorder`, and emits one `Info` access-log line per request. Its two attacker-controlled attributes are bounded by default (the path to 512 bytes, the method to 24), so a megabyte URL cannot buy a megabyte log line.
-- `WithLogger(l)` / `WithSkipPaths(paths...)` / `WithSkipFunc(fn)`: the logger and skip rules. Skipped requests still get an id minted, echoed, and threaded, but no access line and no metric hook (a stream's open-to-close duration paired with a synthetic status would mislead).
-- `WithSkipUpgrades(bool)`: when true, suppresses the record of a request whose response actually SWITCHED PROTOCOLS: a recorded status 101, or a hijack taken before any status was recorded (the two shapes a completed WebSocket handshake takes). Use it in place of a skip predicate over the upgrade route. A predicate has to answer before the handler runs, so it must model the handshake policy of whichever WebSocket library will answer, and it therefore deletes the handshake REFUSALS too. This option decides from the response instead, so the 400 for a malformed key, the 403 for a cross-origin or Host rejection, the 405 for a non-GET, and the 426 for missing upgrade headers all keep complete records on the same route. Suppression removes the whole record (no line, no metric hook, no level policy, no path transform); the request id is still minted and echoed. Two boundaries keep their record: a handler that never calls `WriteHeader` (the implicit 200 is not 101, so ordinary requests are untouched), and one that writes an explicit status and only then hijacks (a CONNECT tunnel answering 200 said what it answered). The interaction with the skip rules is one-way: `WithSkipPaths` and `WithSkipFunc` bypass the recorder before the handler runs, so a match there wins whatever the status turns out to be, and this option can only remove a record, never restore one. It takes no status argument; to quiet a noisy route without losing records, lower the level with `WithLogLevel` or `ProbeLogLevel`.
-- `WithTemplatePathsUnder(prefixes ...string)`: declare URL prefixes whose concrete paths carry a CREDENTIAL, and the access line records the matched route template for them (`/api/sessions/{id}`) instead of the path. The template comes from `r.Pattern`, so the router is the source of truth and a new upstream subroute logs correctly with no change here; the method prefix is stripped. A path under a declared prefix that matched NOTHING records the prefix plus `(unmatched)`, never the raw path, because an unrouted request under a credential-bearing prefix still contains the credential, and marking it unmatched makes a new subroute visible and does not mislabel it onto a route it is not. Paths outside every declared prefix are recorded unchanged, deliberately: a static mount's pattern is `/`, so templating everything would collapse every asset onto one line. Prefer this over hand-writing the equivalent `WithPathFunc`, which leaves the unmatched case to each caller. Pass the prefix the route-owning package exports (for example the terminal engine's `SessionsSubtreePath`), not a local literal.
-- `WithPathFunc(fn func(*http.Request) string)`: the recorded-path policy. fn's return replaces `r.URL.Path` in the access line, the legacy `WithRecordMetric` path argument, and the hook-failure diagnostics; it is the escape hatch for a path policy `WithTemplatePathsUnder` cannot express (a truncated form, a per-request decision); reach for that option first. Runs at emit time, after routing, so `r.Pattern` is populated (empty on unmatched, so return your own fail-closed placeholder for those). Skip rules test the raw path and skipped requests never call it; the request-derived metric hooks are unaffected (`WithRecordMetricRequest` receives the request and owns its own representation, and `WithRecordRouteMetric`'s path label is the matched route). Fail-closed: a panicking or empty-returning fn records `(path-redaction-failed)`, never the raw path.
-- `WithMaxLoggedPath(n int)`: the byte cap on the recorded path, replacing the 512-byte default. The cap applies to whatever the path policy produced (the raw `r.URL.Path`, a `WithTemplatePathsUnder` template, your own `WithPathFunc` return, and the fail-closed placeholders), so no policy can miss it. An over-cap value keeps at most `n` bytes, cut on a UTF-8 rune boundary (a split rune reaches the log store as U+FFFD), plus a `...(truncated)` marker so a reader knows the value was cut; a within-cap value is recorded byte-identical. It bounds the LOG only: request size stays `WithMaxHeaderBytes`' job. A non-positive `n` is ignored and the default stands, because a config-driven `0` would silently reopen the hole it closes. Tighten it when the route table is short (128 covers a service serving `/healthz`, `/metrics`, and one templated route). The method's 24-byte bound has no option, because the longest method in IANA's registry is `UPDATEREDIRECTREF` at 17 characters; anything longer records as a fixed `(overlong)` placeholder rather than a truncated token. Neither bound touches routing, the status, or the `Allow` header.
-- `WithClientIP(trusted ...*net.IPNet)` / `WithClientIPFunc(fn)`: add a `client_ip` attribute, resolved by the spoof-proof `ClientIP` or by your own function (for a dynamic or hot-reloaded trusted set). Mutually exclusive; the last one applied wins. Omitted entirely unless supplied, so the default line is unchanged.
-- `WithRecordMetric(fn)` / `WithRecordMetricRequest(fn)`: the older metric hooks, kept for the two cases named here. `WithRecordMetric` receives the values the access line recorded (length-bounded, but a raw path is still one label per URL a scanner invents); `WithRecordMetricRequest` receives the request itself, for a metric that genuinely needs something other than the standard pair (a per-tenant series keyed on an id the app validated). Both are emitted even when the handler panics. All three metric options are mutually exclusive; the last one applied wins. Prefer `WithRecordRouteMetric`: these two make the APP responsible for a cardinality bound it can get wrong.
-- `WithRecordRouteMetric(fn func(RequestMetric))`: the recommended metric hook. The library derives the `(method, path)` label pair (`RouteMetricLabels`) and hands it to fn as a `RequestMetric` whose fields are named, so the app never sees the raw request through this option, has no derivation to get wrong, and cannot mislabel a series by reading the two strings in the wrong order. Prefer it over calling `RouteMetricLabels` inside one of the other hooks: no call site can then get the derivation wrong. Fires from the same deferred emit (a panicking handler is still recorded, a panicking hook is isolated), is excluded on skipped paths, and is unaffected by the recorded-path policy options, which bound a log line rather than a label domain.
-- `RouteMetricLabels(r) (method, path string)`: the pure derivation behind that option, exported for any hook that already holds the request and wants the standard pair inside it. The **method** label is `r.Method` when it is one of the nine standard methods (GET, HEAD, POST, PUT, DELETE, CONNECT, OPTIONS, TRACE per RFC 9110 §9.3, and PATCH per RFC 5789), and a fixed `other` bucket for everything else: ten values by construction, whatever arrives on the request line, including a lowercase `get` (HTTP methods are case-sensitive, so it is not GET). The **path** label is the route the mux matched: `r.Pattern` with the method prefix stripped (`GET /beat/{id}` becomes `/beat/{id}`, so an unknown beat id mints nothing), the pattern itself when it names no method (`/beat/{id}`, a `/` catch-all), and a fixed `unmatched` when nothing matched. The series ceiling is therefore ten times one more than the route table, and no traffic can widen it, which matters because the hook fires outside every app auth gate and a minted series lasts for the process lifetime. **One divergence from the access line is deliberate**: for a non-standard method the line records the token verbatim (bounded to 24 bytes) while the metric records `other`, so match the two up by `request_id`.
-- `WithLogLevel(fn func(r *http.Request, status int) slog.Level)`: the access-line level policy (default: every line at `Info`). The canonical use is scrape-noise control on a polled service: 2xx/3xx at `Debug`, `Warn` for 4xx, `Error` for 5xx. Skipped paths never call it; a panicking policy falls back to `Info`.
-
-### JSON responses and errors
-
-- `JSONHeaders(w)`: `application/json` + `X-Content-Type-Options: nosniff`.
-- `WriteJSON(w, v)`: 200.
-- `WriteJSONStatus(w, code, v)`: headers, status, encode (encode failure logged at `Warn`, not returned).
-- `Ok(w)`: 200 `{"ok":true}`.
-- `WriteError(w, r, status, code ErrorCode, msg string)`: writes `ErrorResponse`; nil-safe when `r` is nil.
-- `ErrorCode`: the machine-readable token in the envelope's `code` field, typed apart from the human message so the two cannot be handed over transposed. Its grammar is a token, not a sentence: lowercase letters, digits and underscores (`host_not_allowed`), which is what every code in this library and its consumers already spells. The empty code means "omit the field". A code that breaks the grammar is neither emitted nor repaired and never panics: the envelope encoder substitutes `InvalidErrorCode` (`invalid_error_code`) and logs the offender once per process, because this runs per request on an error path.
-- `ErrorResponse{Error, Code, RequestID}`: `Code` and `RequestID` omitted when empty.
-- `ErrorResponder`: `func(w, r, status, code ErrorCode, msg string)`, the signature of `WriteError` (its canonical instance and the default); middleware that emits an error body takes one so a non-JSON endpoint can render its error on its own content type.
-
-`WriteError` pulls the request id from the request context so a client can correlate a failure with the access log; every library error envelope follows that scheme, with the field omitted when the context carries no id.
-
-### Request prelude
-
-- `MaxJSONBody`: 1 MiB default body cap.
-- `LimitBody(w, r, maxBytes)`: wraps the body in `http.MaxBytesReader`. A read past the cap fails with a `*http.MaxBytesError` (test with `errors.AsType`) and nothing is written, so the status is yours. It also asks `net/http` to close the connection rather than drain the sender's excess, reaching net/http's own writer through the `Unwrap` chain. This is best-effort, because a middleware that does not unwrap (or `RouteTimeout`, whose buffering writer cannot be unwrapped) blocks that signal. Detect an over-limit body on the read error, never on the close.
-- `RequireMethod(w, r, method) bool`: 405 + `false` on mismatch.
-- `MethodNotAllowed(w, r, allowed...)`: the 405 refusal on its own, for a route that permits SEVERAL methods and so has no single method to require. The `Allow` header names the whole set (`GET, POST`), the body is the standard `method_not_allowed` envelope. Route each method with the mux (or dispatch on `r.Method`) and refuse the rest with it.
-- `SetAllow(w, allowed...)`: just the RFC 9110 `Allow` header, for an `OPTIONS` responder or any other advertisement outside a 405.
-- `DecodeBody(w, r, v, errMsg) bool`: cap + decode (reject trailing data); 400 + `false` on failure.
-- `DecodeBodyOptional(w, r, v)`: cap + decode, error ignored — and "ignored" includes two errors a caller usually wants: a body holding a value plus trailing data leaves the leading value in `v` (`DecodeBody` rejects it), and an oversize body's `*http.MaxBytesError` is swallowed too, so it is indistinguishable from an absent one. Use `DecodeJSONInto` and branch on `errors.Is(err, io.EOF)` when the optional body needs those told apart.
-- `DecodeJSONInto(w, r, v, maxBytes) error`: the mechanism behind `DecodeBody`, for apps with their own error envelope or a per-endpoint cap; caps, decodes a single value, rejects trailing data, writes nothing, and returns the error: a `*http.MaxBytesError` (test with `errors.AsType`) for an oversize body, `ErrTrailingData` for a second JSON value, otherwise a malformed body. Map the result to your own status and envelope.
-
-`Allow` is mandatory on a 405 and is a comma-separated list, so the value is the caller's set joined with `", "`: entries verbatim (a method token is case-sensitive), blanks dropped (a sender must not emit an empty list element), exact duplicates collapsed, and no methods at all rendered as the empty value the spec defines as "this resource allows no methods". `HEAD` is never implied by `GET`: `net/http`'s `ServeMux` serves `HEAD` from a `GET` pattern, so a route whose `GET` has a side effect registers `HEAD` separately to reject it and must not advertise it. Pass `http.MethodHead` when the route really serves it.
-
-### Canonical request path
-
-- `CanonicalRequestPath(p string) (clean string, canonical bool)`: returns the request path `http.ServeMux` will route `p` as (`path.Clean`, with a non-root trailing slash put back, which is net/http's own `cleanPath`), and reports whether `p` already is that path.
-
-`ServeMux` canonicalizes the escaped request path before it selects a pattern, and answers 307 when the result differs, so no registered route can intercept the rewrite. For a browser that is invisible. For a machine sender it is not: a 307 is a **success** status to a client that does not follow redirects (`curl -fsS` without `-L`), so such a caller exits 0 having never reached the handler, with nothing recorded, no job run, and nothing saying the URL was malformed. A route whose only purpose is a side effect uses this to refuse the non-canonical spelling itself. The verdict decides whether to refuse; the cleaned path tells the caller whether the request cleans _into_ the namespace it guards (`//beat/api` does).
-
-Pass `r.URL.EscapedPath()` to reproduce the mux's cleaning decision exactly. Passing the decoded `r.URL.Path` instead makes the verdict strictly wider, because `%2e%2e` decodes to `..`: an encoded dot segment reads as non-canonical here while the mux draws no redirect for it. Both are legitimate, so pick the value deliberately. `canonical` is the verdict of the cleaning step alone, not "the mux will not redirect this request": the trailing-slash redirect (`/tree` to `/tree/` when a `/tree/` subtree is registered) fires on an already-canonical path and depends on the route table rather than the spelling, and a `CONNECT` request is not canonicalized at all. An empty `p` returns `/` and false, and a `p` with no leading slash is rooted before cleaning, so it can never be canonical. Route scope, the refusal's status and body, and any metric counting the class stay app-owned; this is a pure function over a string.
-
-### Static secret verification
-
-- `NewStaticTokenVerifier(configured) StaticTokenVerifier`: build once at startup from the single operator-configured secret guarding an endpoint.
-- `StaticTokenVerifier.Verify(presented) bool`: constant-time match of a presented credential; safe for concurrent use.
-
-The verification primitive for static machine credentials (an API key, a bearer token, a basic-auth user or password) where exactly one expected value comes from configuration. The configured secret is SHA-256-hashed once at construction; `Verify` hashes the presented value and compares the two fixed-length digests with `subtle.ConstantTimeCompare`, so no per-call timing varies with the secret's length or content. An empty configured secret fails closed: `Verify` returns `false` for every presented value, including the empty string (otherwise `sha256("")` equals `sha256("")` and an unset secret would grant access to any client presenting no credential). Treat an empty configured value as "auth not configured", never as "no credential required". This verifies one shared secret, not user identities; per-user credential stores, password hashing, and session management belong to the [auth](https://github.com/cplieger/auth) library.
-
-### Readiness
-
-- `Ready`: a concurrency-safe flag; zero value is not ready.
-- `(*Ready).Set(ready)` / `(*Ready).Ready() bool`
-- `ReadinessChecker`: the `Ready() bool` interface `*Ready` satisfies.
-- `ReadinessHandler(c) http.HandlerFunc`: 200 `{"status":"ok"}` when ready, else 503 `{"status":"unready","reason":"starting up or shutting down"}`.
-
-This is the HTTP serving-state gate, for a load balancer asking "should this instance receive traffic right now?". It is deliberately distinct from the [health](https://github.com/cplieger/health) library's container file-marker probe, which answers "is the process alive?" for a Docker `HEALTHCHECK`. The two are complementary, not the same endpoint.
-
-### Server
-
-- `NewServer(handler, opts...) *http.Server`: streaming-safe defaults: `ReadHeaderTimeout` 10s (slowloris guard), `IdleTimeout` 120s, `MaxHeaderBytes` 1 MiB; `ReadTimeout` and `WriteTimeout` unset so streaming works out of the box. Options: `WithReadTimeout`, `WithWriteTimeout`, `WithIdleTimeout`, `WithReadHeaderTimeout`, `WithMaxHeaderBytes`, `WithErrorLog`, `WithSlogErrorLog`.
-- `WithSlogErrorLog(level slog.Level) ServerOption`: routes net/http's own connection-level lines, above all `http: Accept error: ...; retrying` (the trace of an exhausted fd budget), into `slog` at `level`, so they arrive as level-carrying records instead of unstructured standard-logger output no level-based log rule can match. The level is deliberately the caller's choice (an accept failure is fatal to a probe-only service and a retryable degradation to others). It reads `slog.Default()` when the option is applied, so install the process logger first; `WithErrorLog` remains the override for any other `*log.Logger`, and the default is unchanged when neither is passed.
-- `Run(ctx, srv, ln, onShutdown, opts ...RunOption) error`: serves until `ctx` is cancelled, then shuts down gracefully: the pre-drain hook (if registered) runs first, then `srv.Shutdown` drains in-flight requests, then `onShutdown` runs for application teardown, all within one shared shutdown grace budget. Options: `WithShutdownGrace(d)` (default 5s); `WithPreDrain(fn)`, a hook invoked after `ctx` cancellation and strictly before the drain starts: the place to flip a readiness gate, cancel the server's `BaseContext`, or drain an SSE hub so long-lived streams release instead of holding the drain open for the whole grace window; `WithServeExit(fn)`, the opt-in teardown for the other exit.
-- `ErrShutdownGraceExpired`: the origin marker on a `Run` error caused by the shutdown grace running out. `Run`'s error has two possible deadline origins, a serve error carrying a deadline of the caller's own making and the graceful sequence outliving the grace, and both can satisfy `errors.Is(err, context.DeadlineExceeded)`, so a caller inferring the second from the bare deadline error is asserting what the value cannot prove. A grace expiry is wrapped so both `errors.Is(err, webhttp.ErrShutdownGraceExpired)` and `errors.Is(err, context.DeadlineExceeded)` hold; the wrapped error stays in the chain, so existing checks are unaffected. A real serve error still takes precedence over the shutdown error and is never marked. What to do about it, whether that is naming the grace constant to lift, the log level, or the exit code, stays app policy.
-- `AwaitDone(ctx, done) bool`: the bounded wait a teardown needs, reporting whether `done` closed before `ctx` expired. It creates no timeout of its own and logs nothing (teardown bodies and their diagnostics stay app-owned): `Run` hands `onShutdown` whatever remains of the one grace budget after the pre-drain phase and the drain spent their share, so a fresh deadline here would be a budget the shutdown sequence does not have. It re-checks `done` after `ctx` fires, which is the point: a drain that consumed the whole grace hands the teardown an already-expired context, and a `select` with both cases ready picks pseudo-randomly, so the naive two-case wait reports a teardown that did finish as still running a fraction of the time.
-- `CausedByCancellation(ctx, err) bool`: whether `err` is the observable form of _this_ context's cancellation, so a boundary can tell a routine stop apart from a fault that merely happened at the same moment. It proves the match and does not assume it, because a cancelled context alone is not evidence: a listener bind that genuinely failed while a signal arrived would otherwise read as a clean stop. It matches `context.Cause(ctx)` as well as `ctx.Err()`, since a `WithCancelCause` cause need not wrap `context.Canceled` and net/http surfaces the cause verbatim. The response (level, message, exit code, retry) stays the caller's.
-
-`Run` has exactly two exits, and only one of them is the graceful sequence. When `Serve` returns on its own instead (a dead accept loop, or a `Shutdown`/`Close` the caller drove itself), `ctx` was never cancelled, the listener is already gone, and neither `WithPreDrain` nor `onShutdown` runs (both are defined against a graceful stop). `WithServeExit(fn)` is the teardown for that path: `fn` gets the whole grace as its budget (no drain spent any of it), `Run` does not call `srv.Shutdown` behind it, and exactly one of the two paths runs per call. It is opt-in, so a caller that registers nothing keeps today's behavior of returning the serve error with no hook at all. Because `ctx` is still live there, a teardown that waits on a goroutine keyed to it (a background loop stopped by the same signal context) must cancel it inside `fn`, or it waits out the whole grace for a goroutine nothing asked to stop.
-
-Streaming apps (SSE, WebSocket, long responses) MUST omit `WithWriteTimeout`, since a write deadline would cut off an in-progress stream. Bind the listener up front (for example with `net.ListenConfig.Listen`) so a port-in-use error surfaces synchronously before `Run`, and pass application teardown as `onShutdown`.
+`RateLimiter`'s refill and `Retry-After` math follows [golang.org/x/time/rate](https://pkg.go.dev/golang.org/x/time/rate), including its guard against a clock that moves backwards.
 
 ## Contributing
 
-Issues and PRs are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
-conventions and how to run the checks locally.
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the conventions and how to run the checks locally.
 
 ## Disclaimer
 

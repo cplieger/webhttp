@@ -265,50 +265,13 @@ const (
 	failedAuthDefaultMsg = "too many failed authentication attempts"
 )
 
-// FailedAuthRateLimit returns middleware that throttles FAILED-credential
-// requests through the standard failed-auth token bucket: burst 10, one token
-// accrued every 6 seconds, and a 429 envelope of code
-// "too_many_auth_failures" carrying msg.
-//
-// when is the caller's failed-credential predicate, and only a request it
-// reports true for draws a token. A valid credential is therefore never
-// throttled, not even mid-flood, so the tuning does not have to leave room for
-// the app's own legitimate senders however many there are. A nil when limits
-// EVERY request the middleware sees, which is the wiring for a caller that has
-// already filtered the failed-auth class itself (see the second example below).
-//
-// msg is the caller's human message, because the credential differs per service
-// — a beat token, a bearer, an apikey — and naming it is what makes the refusal
-// legible to whoever configured it. An empty msg falls back to
-// "too many failed authentication attempts".
-//
-// What this bounds is the one-access-line-per-attempt log flood and the digest
-// cost of an attempt, not the guessing rate alone: a network-exposed listener
-// otherwise turns a wire-speed guessing flood into a wire-speed stream of 401s,
-// one access line each. Per-client fairness is out of scope for the same reason
-// RateLimiter's bucket is aggregate — a failed credential carries no trusted
-// client identity to key on, and a knob here would be one more thing to
-// configure wrong on a gate that must simply hold.
-//
-// Both wirings its consumers use stay possible, and the difference is
-// deliberate:
-//
-//	// Predicate through the limiter (pg-autodump, seadex-scout): the
-//	// middleware sees every request and the predicate decides.
-//	limiter := webhttp.FailedAuthRateLimit(func(r *http.Request) bool {
-//		return r.Method == http.MethodPost && r.URL.Path == "/dump" &&
-//			!presentsValidBearer(verify, r)
-//	}, "too many failed bearer attempts")
-//
-//	// Predicate outside the limiter (knell): the caller filters first and
-//	// hands the limiter only the failed-auth class, so an attempt costs one
-//	// fewer credential digest and the caller can attribute the 429 to its own
-//	// pre-route refusal counter.
-//	limited := webhttp.FailedAuthRateLimit(nil, "too many failed beat token attempts")(next)
-//
-// It is a preset over RateLimiter for the one-static-credential-on-one-route
-// shape; an app needing other numbers or a different envelope composes
-// RateLimiter directly.
+// FailedAuthRateLimit throttles requests for which when reports a failed
+// credential through one aggregate bucket (burst 10, one token per 6s),
+// answering 429 "too_many_auth_failures" with msg (empty: "too many failed
+// authentication attempts"). A valid credential never draws a token; a nil
+// when limits every request, for a caller that filters failed attempts first.
+// when runs on every request, and the access-line flood is bounded only with
+// the limiter outside Logging. Use RateLimiter directly for other numbers.
 func FailedAuthRateLimit(when func(*http.Request) bool, msg string) Middleware {
 	if msg == "" {
 		msg = failedAuthDefaultMsg
