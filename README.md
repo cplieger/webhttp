@@ -141,7 +141,7 @@ When `Serve` returns before `ctx` is cancelled, for example because the listener
 
 ## Contributing
 
-Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the conventions and how to run the checks locally.
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Disclaimer
 
