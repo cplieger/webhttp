@@ -250,47 +250,13 @@ func WithPathFunc(fn func(*http.Request) string) LogOption {
 }
 
 // WithTemplatePathsUnder declares URL prefixes whose concrete paths carry a
-// CREDENTIAL, so the access log records the matched ROUTE TEMPLATE for them
-// instead of the path itself: "/api/sessions/{id}" rather than
-// "/api/sessions/6f3a…". Prefer it over WithPathFunc for this job — it is the
-// same protection expressed as data, and the reason that matters is below.
-//
-// The template comes from r.Pattern, which http.ServeMux populates during
-// routing, so the router is the source of truth for what matched. The method
-// prefix ServeMux includes ("DELETE /api/sessions/{id}") is stripped, since the
-// method is already its own attribute on the line.
-//
-// Three cases, and the middle one is the whole point:
-//
-//   - a path under a declared prefix that MATCHED a route: the template.
-//   - a path under a declared prefix that matched NOTHING (a 404 on
-//     "/api/sessions/6f3a…/nope"): the prefix plus an "(unmatched)" marker.
-//     Never the raw path — an unrouted request under a credential-bearing
-//     prefix still has the credential in it, and this is exactly the leak a
-//     path policy exists to close. It is also visible as unmatched rather than
-//     mislabelled onto a route it is not, so a NEW upstream subroute shows up
-//     in the log as something to wire rather than disappearing.
-//   - a path outside every declared prefix: recorded unchanged. Deliberately
-//     not the template, because a static mount's pattern is "/" and logging
-//     that would collapse every asset onto one line, losing which asset 404'd.
-//     Credential-bearing routes are a per-route-family fact, not a per-app one,
-//     which is why this option takes prefixes rather than being a global switch.
-//
-// Why this exists as a declarative option rather than leaving callers to write
-// their own WithPathFunc: two apps in this fleet hand-rolled the identical
-// transform over the same upstream route table and DIVERGED on the unmatched
-// case — one returned "" (indistinguishable from a broken transform) and one
-// returned an "(unmapped)" marker. A free-form hook makes that outcome the
-// default. Expressed as data, the policy has one implementation, and the
-// unmatched-route decision is made once here instead of once per consumer.
-//
-// Pair it with the prefix the route-owning package exports (e.g. the terminal
-// engine's SessionsSubtreePath) rather than a local string literal, so the set
-// of credential-bearing routes stays owned by whoever declares those routes.
-//
-// A prefix that is empty is ignored. Applying this option replaces any
-// previously-set path policy (including WithPathFunc), and vice versa: there is
-// one recorded path, so the last policy applied wins.
+// CREDENTIAL, so the access log records the route template from r.Pattern
+// instead ("/api/sessions/{id}", ServeMux's method prefix stripped). A path under
+// a declared prefix that matched no route logs as the prefix plus "(unmatched)",
+// never the raw path; a path outside every prefix logs unchanged. Pass the prefix
+// the route-owning package exports (e.g. the terminal engine's
+// SessionsSubtreePath). An empty prefix is ignored. This option and WithPathFunc
+// replace each other: there is one recorded path, so the last applied wins.
 func WithTemplatePathsUnder(prefixes ...string) LogOption {
 	kept := make([]string, 0, len(prefixes))
 	for _, p := range prefixes {
@@ -736,30 +702,14 @@ func WithLogLevel(fn func(r *http.Request, status int) slog.Level) LogOption {
 	}
 }
 
-// ProbeLogLevel is the fleet-standard access-log level policy for routine
-// machine-probe endpoints — health checks, readiness probes, metrics scrapes
-// (Docker HEALTHCHECK curls, Gatus monitors, Prometheus). A request whose
-// r.URL.Path exactly matches one of paths logs at Debug when it succeeds
-// (status < 400), Warn on a 4xx, and Error on a 5xx; every other request
-// stays at the default Info.
-//
-// The point: a probe hitting a HEALTHY endpoint every 30 seconds is noise and
-// stays out of the shipped log stream (Debug is dropped below the operating
-// level — but becomes visible the moment an operator raises the level to
-// debug, when "is the probe even reaching me, from where" is the question),
-// while a FAILING probe — the readiness 503, the broken-install signal — is
-// exactly what an operator greps for and surfaces at Warn/Error with its
-// status, duration, and request id. Prefer this preset over skipping probe
-// paths entirely (a skip hides the failure too) and over leaving them at
-// Info (a line every 30s per prober). Skip lists remain the right tool for
-// STREAMS (SSE, WebSocket), where one open-to-close line is misleading by
-// shape, not merely noisy.
-//
-// It is a WithLogLevel policy under the hood, so the two are mutually
-// exclusive (last applied wins), it composes with the skip options (a
-// skipped path emits no line and never consults the policy), and a
-// panicking policy falls back to Info per the WithLogLevel contract. With
-// no paths every request logs at Info, as without the option.
+// ProbeLogLevel is the shared access-log level policy for machine-probe
+// endpoints (health checks, readiness probes, metrics scrapes). A request whose
+// r.URL.Path exactly matches one of paths logs at Debug on success (status <
+// 400), Warn on a 4xx and Error on a 5xx, so a healthy probe stays quiet and a
+// failing one surfaces; every other request stays at Info. It is a WithLogLevel
+// policy, so the two are mutually exclusive (last applied wins); a skipped path
+// never consults it, and a panicking policy falls back to Info. With no paths
+// every request logs at Info.
 func ProbeLogLevel(paths ...string) LogOption {
 	probe := make(map[string]struct{}, len(paths))
 	for _, p := range paths {
