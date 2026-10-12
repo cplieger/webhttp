@@ -85,6 +85,9 @@ func TestInlineStyleHashes(t *testing.T) {
 		{"newlines hashed verbatim", "<style>\n  d{left:0}\n</style>", []string{hashToken("\n  d{left:0}\n")}},
 		{"styles is not a style tag", `<styles>nope</styles>`, nil},
 		{"unclosed style yields nothing", `<style>never closed`, nil},
+		// A quote that never closes swallows the rest of the input into the
+		// opening tag, so the later "</style>" is attribute bytes, not an end tag.
+		{"unterminated attribute quote yields nothing", `<style data-x="a>b{c:0}</style>`, nil},
 		// The shared core's close-side boundary rule, on the tag whose plural is
 		// the natural collision: "</styles>" is content, not this element's end
 		// tag.
