@@ -29,6 +29,7 @@ func TestValidRequestID(t *testing.T) {
 		{"typical hex", "0123456789abcdef0123456789abcdef", true},
 		{"underscore and hyphen", "req_id-123", true},
 		{"all classes", "Aa0_-", true},
+		{"class edges", "azAZ09", true},
 		{"space", "bad id", false},
 		{"dot", "bad.id", false},
 		{"slash", "a/b", false},
@@ -1539,7 +1540,9 @@ func TestProbeLogLevel_mapsProbeStatusesToLevels(t *testing.T) {
 	}{
 		{"healthy probe at Debug", http.StatusOK, slog.LevelDebug},
 		{"redirect grouped with success", http.StatusNotModified, slog.LevelDebug},
+		{"first client error at Warn", http.StatusBadRequest, slog.LevelWarn},
 		{"client error at Warn", http.StatusNotFound, slog.LevelWarn},
+		{"first server error at Error", http.StatusInternalServerError, slog.LevelError},
 		{"server error at Error", http.StatusServiceUnavailable, slog.LevelError},
 	}
 	for _, tc := range cases {

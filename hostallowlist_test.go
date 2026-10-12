@@ -26,6 +26,7 @@ func TestCanonicalHost(t *testing.T) {
 		{"trailing dot with port", "example.com.:443", "example.com"},
 		{"underscore label (compose service name)", "my_service:9848", "my_service"},
 		{"punycode a-label", "xn--wbterm-bva.example", "xn--wbterm-bva.example"},
+		{"letter and digit range edges", "z0.example", "z0.example"},
 		{"longest label", maxLabel + ".example", maxLabel + ".example"},
 		{"ipv4", "192.168.1.5", "192.168.1.5"},
 		{"ipv4 with port", "192.168.1.5:443", "192.168.1.5"},
