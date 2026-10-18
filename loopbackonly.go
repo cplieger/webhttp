@@ -1,6 +1,9 @@
 package webhttp
 
-import "net/http"
+import (
+	"net/http"
+	"slices"
+)
 
 // LoopbackOnly is the MIDDLEWARE half of the loopback-only admission decision,
 // beside the LoopbackRequest predicate this package already exports.
@@ -82,7 +85,7 @@ var proxyProvenanceHeaders = []string{
 // signal only — never treat a missing header as evidence of anything.
 func ProxiedRequest(h http.Header) bool {
 	for _, name := range proxyProvenanceHeaders {
-		if h.Get(name) != "" {
+		if slices.ContainsFunc(h.Values(name), func(v string) bool { return v != "" }) {
 			return true
 		}
 	}

@@ -1,6 +1,6 @@
 # webhttp
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/webhttp/v3.svg)](https://pkg.go.dev/github.com/cplieger/webhttp/v3) [![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/webhttp)](https://github.com/cplieger/webhttp/blob/main/go.mod) [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/webhttp/badges/mutation.json)](https://github.com/cplieger/webhttp/issues?q=label%3Agremlins-tracker)
+[![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/webhttp/v4.svg)](https://pkg.go.dev/github.com/cplieger/webhttp/v4) [![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/webhttp)](https://github.com/cplieger/webhttp/blob/main/go.mod) [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/webhttp/badges/mutation.json)](https://github.com/cplieger/webhttp/issues?q=label%3Agremlins-tracker)
 
 webhttp hardens your Go `net/http` server with access logging, security headers, a client IP that cannot be spoofed and graceful shutdown.
 
@@ -10,7 +10,7 @@ It replaces the middleware, proxy-header parsing and shutdown sequence you would
 
 webhttp is built for a Go service on `http.ServeMux` that faces a browser or sits behind a proxy.
 
-- `ClientIP` reads `X-Forwarded-For` only from a proxy you trust, so a client cannot fake its address.
+- `ResolveClient` and `ClientIP` read `X-Forwarded-For` only from a proxy you trust, so a client cannot fake its address. `ResolveClient` also reports whether an unlisted proxy sent a forwarding header.
 - A Host allowlist answers 403 to a `Host` you did not list, which stops DNS rebinding attacks.
 - The access log writes `log/slog` lines and caps the path at 512 bytes and the method at 24. Metric labels stay within ten method values and your registered routes.
 - `NewServer` leaves the write timeout off, so SSE and WebSocket streams stay open. `Run` drains in-flight requests within a 5-second grace period by default.
@@ -21,7 +21,7 @@ Consider [chi](https://github.com/go-chi/chi) if you want a router with route gr
 ## Install
 
 ```sh
-go get github.com/cplieger/webhttp/v3@latest
+go get github.com/cplieger/webhttp/v4@latest
 ```
 
 ## Usage
@@ -37,7 +37,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/cplieger/webhttp/v3"
+	"github.com/cplieger/webhttp/v4"
 )
 
 func main() {
@@ -95,12 +95,12 @@ A service that browsers reach should also refuse unknown `Host` names. Build a `
 
 - Middleware: `Chain`, `Recoverer`, `SecurityHeaders`, `Logging`, `RouteTimeout`, `RateLimiter` with its `SessionCreateRateLimit` and `FailedAuthRateLimit` presets, `NoStore`.
 - Logging and metrics: `RequestLogger` and its options, request-id helpers, `RouteMetricLabels`, `StatusRecorder`.
-- Trust checks: `ClientIP`, `ParseCIDRs`, `ParseHostList` and `HostPolicy`, `CanonicalHost`, `LoopbackOnly`, `ClassifyBind`, `NewStaticTokenVerifier`.
+- Trust checks: `ClientIP`, `ResolveClient`, `ParseCIDRs`, `ParseHostList` and `HostPolicy`, `CanonicalHost`, `LoopbackOnly`, `ClassifyBind`, `NewStaticTokenVerifier`.
 - Requests and responses: `WriteJSON`, `WriteError` and `ErrorCode`, `DecodeBody`, `DecodeJSONInto`, `LimitBody`, `RequireMethod`, `MethodNotAllowed`, `CanonicalRequestPath`.
 - Static files: `StaticHandler`, `InlineScriptHashes`, `InlineStyleHashes`.
 - Server: `NewServer`, `Run` and its options, `Ready` and `ReadinessHandler`, `AwaitDone`, `CausedByCancellation`.
 
-The full reference is on [pkg.go.dev](https://pkg.go.dev/github.com/cplieger/webhttp/v3).
+The full reference is on [pkg.go.dev](https://pkg.go.dev/github.com/cplieger/webhttp/v4).
 
 ## Middleware order and safety rules
 
@@ -112,7 +112,7 @@ Place a `HostPolicy` before any cross-origin or CSRF check. In a DNS rebinding a
 
 `RouteTimeout` buffers the whole response, so never wrap a streaming or hijacking handler with it. [Middleware](docs/middleware.md) has each option and default.
 
-Behind a proxy, `ClientIP` is safe only when the trusted set holds every proxy hop. `LoopbackOnly` is not authentication, because a proxy on the same loopback interface that removes every forwarding header passes it. An empty `NewStaticTokenVerifier` secret denies every value. When a page carries inline scripts, treat an empty `InlineScriptHashes` result as a startup error and never fall back to `'unsafe-inline'`.
+Behind a proxy, `ClientIP` is safe only when the trusted set holds every proxy hop. It reads at most 64 entries of each forwarding header and treats a longer header as invalid. `LoopbackOnly` is not authentication, because a proxy on the same loopback interface that removes every forwarding header passes it. An empty `NewStaticTokenVerifier` secret denies every value. When a page carries inline scripts, treat an empty `InlineScriptHashes` result as a startup error and never fall back to `'unsafe-inline'`.
 
 ## Graceful shutdown
 

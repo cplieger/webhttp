@@ -52,6 +52,8 @@ When `ctx` is cancelled, `Run` sets one deadline, now plus the grace, and runs t
 
 Each step gets what the earlier steps left of the one budget, not a fresh window. `WithShutdownGrace(d)` sets the grace, 5 seconds by default.
 
+Once `srv.Shutdown` starts, `Run` closes every connection that has not sent a request yet. `net/http` would otherwise count each one as active for up to 5 seconds ([golang/go#22682](https://go.dev/issue/22682)), so one silent client would hold the drain open. `Run` tracks this through `srv.ConnState`, and a hook you set there before calling `Run` still sees every state change.
+
 `Run` treats `http.ErrServerClosed` as a clean stop. It returns the first other error it sees, a serve error before a shutdown error, or nil after a clean stop.
 
 ### The pre-drain hook

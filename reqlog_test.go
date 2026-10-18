@@ -7,13 +7,14 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
 
-	"github.com/cplieger/webhttp/v3"
+	"github.com/cplieger/webhttp/v4"
 )
 
 func TestValidRequestID(t *testing.T) {
@@ -755,17 +756,6 @@ func TestRequestLogger_rejectsCRLFInjectionInboundID(t *testing.T) {
 	}
 }
 
-// mustCIDR parses a CIDR for a test trusted-proxy set, failing the test on a
-// malformed literal.
-func mustCIDR(t *testing.T, s string) *net.IPNet {
-	t.Helper()
-	_, n, err := net.ParseCIDR(s)
-	if err != nil {
-		t.Fatalf("ParseCIDR(%q): %v", s, err)
-	}
-	return n
-}
-
 // serveWithPeer drives h with a request whose RemoteAddr and optional
 // X-Forwarded-For are set, so the client-IP resolution can be exercised.
 func serveWithPeer(h http.Handler, remoteAddr, xff string) {
@@ -817,7 +807,7 @@ func TestRequestLogger_withClientIPResolvesTrustedXFF(t *testing.T) {
 	logCap := &captureHandler{}
 	h := webhttp.RequestLogger(okHandler(),
 		webhttp.WithLogger(slog.New(logCap)),
-		webhttp.WithClientIP(mustCIDR(t, "192.0.2.0/24")))
+		webhttp.WithClientIP(netip.MustParsePrefix("192.0.2.0/24")))
 
 	// Peer 192.0.2.1 is a trusted proxy; it appended the client it saw.
 	serveWithPeer(h, "192.0.2.1:1234", "203.0.113.5")
@@ -850,7 +840,7 @@ func TestRequestLogger_clientIPOptionsMutuallyExclusive(t *testing.T) {
 	cap1 := &captureHandler{}
 	h1 := webhttp.RequestLogger(okHandler(),
 		webhttp.WithLogger(slog.New(cap1)),
-		webhttp.WithClientIP(mustCIDR(t, "192.0.2.0/24")),
+		webhttp.WithClientIP(netip.MustParsePrefix("192.0.2.0/24")),
 		webhttp.WithClientIPFunc(func(*http.Request) string { return "func-wins" }))
 	serveWithPeer(h1, "192.0.2.1:1234", "203.0.113.5")
 	if got := attrsOf(cap1.snapshot()[0])["client_ip"]; got != "func-wins" {
@@ -862,7 +852,7 @@ func TestRequestLogger_clientIPOptionsMutuallyExclusive(t *testing.T) {
 	h2 := webhttp.RequestLogger(okHandler(),
 		webhttp.WithLogger(slog.New(cap2)),
 		webhttp.WithClientIPFunc(func(*http.Request) string { return "func-loses" }),
-		webhttp.WithClientIP(mustCIDR(t, "192.0.2.0/24")))
+		webhttp.WithClientIP(netip.MustParsePrefix("192.0.2.0/24")))
 	serveWithPeer(h2, "192.0.2.1:1234", "203.0.113.5")
 	if got := attrsOf(cap2.snapshot()[0])["client_ip"]; got != "203.0.113.5" {
 		t.Errorf("client_ip = %v, want the trusted-XFF client 203.0.113.5", got)
@@ -894,7 +884,7 @@ func TestRequestLogger_withClientIPFuncNilKeepsPriorTrustedSet(t *testing.T) {
 	logCap := &captureHandler{}
 	h := webhttp.RequestLogger(okHandler(),
 		webhttp.WithLogger(slog.New(logCap)),
-		webhttp.WithClientIP(mustCIDR(t, "192.0.2.0/24")),
+		webhttp.WithClientIP(netip.MustParsePrefix("192.0.2.0/24")),
 		webhttp.WithClientIPFunc(nil))
 
 	serveWithPeer(h, "192.0.2.1:1234", "203.0.113.5")
