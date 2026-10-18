@@ -6,7 +6,7 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/cplieger/webhttp/v3"
+	"github.com/cplieger/webhttp/v4"
 )
 
 // TestCanonicalRequestPath pins the cleaned value and the verdict per spelling:

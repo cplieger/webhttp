@@ -3,126 +3,416 @@ package webhttp
 import (
 	"net"
 	"net/http"
+	"net/netip"
 	"slices"
 	"strings"
 )
 
-// ClientIP returns the best-effort client IP for r.
-//
-// The spoofing model is the point of this helper. X-Forwarded-For is set by
-// clients and intermediaries and is trivially forgeable, so it is consulted
-// ONLY when the immediate TCP peer (the host part of r.RemoteAddr) is a proxy
-// you control, i.e. it falls inside one of the caller-supplied trusted ranges:
-//
-//   - With NO trusted ranges, or when the direct peer is not inside one, the
-//     forwarded header is ignored entirely and the peer address (which cannot
-//     be spoofed at this layer) is returned. This is the safe default: no
-//     header a client sends can move the result off the real socket peer.
-//   - When the peer IS a trusted proxy, X-Forwarded-For is walked from the
-//     RIGHT. Each entry that is itself a trusted proxy is skipped (those are
-//     your own hops, which appended the address they saw); the first untrusted
-//     entry from the right is returned as the client. A malformed entry at that
-//     boundary stops the walk, and the peer is returned.
-//
-// The right-to-left, skip-trusted walk is the only correct reading when the
-// proxy APPENDS the peer it observed to X-Forwarded-For (as Caddy and most
-// reverse proxies do): the LEFTMOST entry is then whatever the client SENT and
-// is attacker-controlled, while the rightmost entries are the trustworthy hops.
-// Consequently the trusted set must contain EVERY proxy hop between the client
-// and this server; if a hop is missing from the set the walk stops there and
-// that hop's address is returned as the client.
-//
-// X-Real-IP is deliberately NOT consulted: it is client-settable and a proxy
-// such as Caddy does not overwrite it, so honoring it would reintroduce a spoof
-// vector. It can return as an explicit opt-in if a proxy that overwrites it is
-// ever adopted.
-//
-// The caller supplies the trusted CIDRs (typically the reverse proxy's address
-// range); the library hardcodes none. A malformed r.RemoteAddr with no port is
-// used verbatim as the host and, being unparseable, is never trusted.
-func ClientIP(r *http.Request, trusted ...*net.IPNet) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		// RemoteAddr had no host:port form; use it as-is.
-		host = r.RemoteAddr
-	}
-
-	peer := net.ParseIP(host)
-	// Consult X-Forwarded-For only when the immediate peer is a trusted proxy.
-	// With no trusted ranges (or an unparseable peer) this is always false, so
-	// the socket peer is returned: the spoof-proof default.
-	if peer == nil || !ipInTrusted(peer, trusted) {
-		return host
-	}
-
-	if xff := strings.Join(r.Header.Values("X-Forwarded-For"), ","); xff != "" {
-		// Values (not Get) so multiple X-Forwarded-For header LINES are treated
-		// as the single comma-joined value RFC 7230 defines, closing a spoof gap
-		// where a proxy that adds a separate line instead of comma-appending
-		// would otherwise leave Get reading only the client's spoofed first line.
-		// Walk right-to-left, skipping our own trusted hops; the first untrusted
-		// entry from the right is the client.
-		for _, part := range slices.Backward(strings.Split(xff, ",")) {
-			ip := net.ParseIP(strings.TrimSpace(part))
-			if ip == nil {
-				break // malformed boundary: stop, trust nothing further left
-			}
-			if ipInTrusted(ip, trusted) {
-				continue // our own proxy hop, keep walking left
-			}
-			return ip.String()
-		}
-	}
-	// Trusted peer but no usable forwarded entry: fall back to the peer.
-	return host
+// ClientResolution is ResolveClient's answer: the client address and how it
+// was found.
+type ClientResolution struct {
+	// IP is the client: the X-Forwarded-For entry the walk chose when
+	// Forwarded, otherwise Peer.
+	IP netip.Addr
+	// Peer is the host of r.RemoteAddr, unmapped; the zero Addr when it is
+	// not an IP address.
+	Peer netip.Addr
+	// Forwarded reports that IP came from X-Forwarded-For, which is read only
+	// when Peer is trusted.
+	Forwarded bool
+	// UntrustedForwarding reports that a peer outside the trusted set sent a
+	// Forwarded, X-Forwarded-For or X-Real-IP field holding a non-empty list
+	// element, which was ignored.
+	UntrustedForwarding bool
+	// IgnoredPublic reports that such an ignored header named a public
+	// address: global unicast and outside RFC 1918 and RFC 4193.
+	IgnoredPublic bool
 }
 
-// ipInTrusted reports whether ip is contained in any of the given trusted
-// networks.
-func ipInTrusted(ip net.IP, nets []*net.IPNet) bool {
-	for _, n := range nets {
-		if n != nil && n.Contains(ip) {
+// ResolveClient resolves r's client against the trusted proxy prefixes, which
+// must hold every hop, or the missing one is the client. Only a trusted peer
+// has X-Forwarded-For read, from the right past trusted hops: a proxy appends
+// the peer it saw, so the first untrusted entry is the client; a non-address
+// entry or trusted hops only answer the peer. A field of over 64 entries, or a
+// Forwarded element of over 16 pairs, is invalid whole and names no address.
+// X-Real-IP and Forwarded never set IP: Caddy passes a client's copy through (https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#defaults).
+// Addresses compare unmapped, so a dual-stack IPv4 peer matches; a zone never does.
+func ResolveClient(r *http.Request, trusted ...netip.Prefix) ClientResolution {
+	peer, err := netip.ParseAddr(peerHost(r.RemoteAddr))
+	if err == nil {
+		peer = peer.Unmap()
+	}
+	res := ClientResolution{IP: peer, Peer: peer}
+	fwd := parseForwarding(r.Header)
+	if !inTrusted(peer, trusted) {
+		res.UntrustedForwarding, res.IgnoredPublic = fwd.present(), fwd.public()
+		return res
+	}
+	if ip, ok := fwd.client(trusted); ok {
+		res.IP, res.Forwarded = ip, true
+	}
+	return res
+}
+
+// ClientIP returns ResolveClient's IP as text, for a log line or a rate-limit
+// key; a RemoteAddr that is not an IP address gives "invalid IP", the zero
+// Addr's text.
+func ClientIP(r *http.Request, trusted ...netip.Prefix) string {
+	return ResolveClient(r, trusted...).IP.String()
+}
+
+func peerHost(remoteAddr string) string {
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		return host
+	}
+	return remoteAddr
+}
+
+// inTrusted reports whether ip, unmapped, is inside a prefix. The second
+// Contains matches an IPv4-mapped prefix such as ::ffff:10.0.0.0/104.
+func inTrusted(ip netip.Addr, trusted []netip.Prefix) bool {
+	if !ip.IsValid() {
+		return false
+	}
+	mapped := netip.AddrFrom16(ip.As16())
+	for _, p := range trusted {
+		if p.Contains(ip) || (ip.Is4() && p.Contains(mapped)) {
 			return true
 		}
 	}
 	return false
 }
 
-// ParseCIDRs parses trusted reverse-proxy entries into the *net.IPNet set that
-// ClientIP and WithClientIP consult. Each entry is either CIDR notation
-// ("10.0.0.0/8") or a bare IP address ("192.168.1.5", "::1"), a bare address
-// being treated as a single host (/32 for IPv4, /128 for IPv6). Surrounding
-// whitespace is trimmed and blank entries are skipped.
-//
-// It returns the successfully parsed networks and, separately, the list of
-// entries that were neither a valid CIDR nor a valid IP. Returning both (rather
-// than failing on the first bad entry) lets a strict caller reject the input —
-// e.g. config-file validation surfacing the offending entry — while a lenient
-// caller logs the bad entries and proceeds with the valid subset, e.g. reading
-// a TRUSTED_PROXIES environment variable where one typo should not disable proxy
-// awareness entirely. Both usages share this one parser instead of each app
-// reimplementing the CIDR/bare-IP handling. The returned slice is passed
-// straight to ClientIP(r, nets...) or WithClientIP(nets...); an empty result
-// means "trust nothing", the spoof-proof default that logs the socket peer.
-func ParseCIDRs(entries []string) (nets []*net.IPNet, invalid []string) {
+// maxForwardingHops bounds the list elements read from one forwarding field,
+// far past any real proxy chain. A field holding more is refused at the next
+// element, so the elements kept stay bounded; the byte scan up to that point
+// stays linear in the header's length.
+const maxForwardingHops = 64
+
+// maxForwardedPairs bounds one Forwarded element's pairs. RFC 7239 registers
+// four parameters (https://www.iana.org/assignments/http-parameters) and none
+// may repeat in an element; the bound keeps the repeated-name check linear.
+const maxForwardedPairs = 16
+
+// forwarding is a request's forwarding fields, each parsed once by
+// parseForwarding; nothing else parses X-Forwarded-For, X-Real-IP or
+// Forwarded (ProxiedRequest only tests their presence). A field over
+// maxForwardingHops holds one zero element, so it is present, names nothing
+// and stops the walk; it is never read in part.
+type forwarding struct {
+	xff       []listEntry
+	realIP    []listEntry
+	forwarded []forwardedElement
+}
+
+// listEntry is one non-empty X-Forwarded-For or X-Real-IP list element.
+type listEntry struct {
+	// addr is the address the element names, unmapped, also when quoted,
+	// bracketed or with a port, since neither header has a grammar; the zero
+	// Addr when it names none or carries a zone.
+	addr netip.Addr
+	// bare reports that the element is an address alone, the only form the
+	// trust walk reads.
+	bare bool
+}
+
+// forwardedElement is one non-empty Forwarded list element.
+type forwardedElement struct {
+	// forNode is the for= node, unmapped; the zero Addr when the element is
+	// invalid or its for= is absent, "unknown" or obfuscated.
+	forNode netip.Addr
+	valid   bool
+}
+
+func parseForwarding(h http.Header) forwarding {
+	return forwarding{
+		xff:       parseList(h, "X-Forwarded-For"),
+		realIP:    parseList(h, "X-Real-Ip"),
+		forwarded: parseForwarded(h),
+	}
+}
+
+// client walks X-Forwarded-For from the right for the first untrusted entry;
+// false when an entry before it is not an address alone, or there is none.
+func (f forwarding) client(trusted []netip.Prefix) (netip.Addr, bool) {
+	for _, e := range slices.Backward(f.xff) {
+		if !e.bare {
+			return netip.Addr{}, false
+		}
+		if !inTrusted(e.addr, trusted) {
+			return e.addr, true
+		}
+	}
+	return netip.Addr{}, false
+}
+
+func (f forwarding) present() bool {
+	return len(f.xff) > 0 || len(f.realIP) > 0 || len(f.forwarded) > 0
+}
+
+func (f forwarding) public() bool {
+	entryPublic := func(e listEntry) bool { return isPublic(e.addr) }
+	return slices.ContainsFunc(f.xff, entryPublic) ||
+		slices.ContainsFunc(f.realIP, entryPublic) ||
+		slices.ContainsFunc(f.forwarded, func(e forwardedElement) bool {
+			return e.valid && isPublic(e.forNode)
+		})
+}
+
+func isPublic(ip netip.Addr) bool {
+	return ip.IsGlobalUnicast() && !ip.IsPrivate()
+}
+
+func parseList(h http.Header, name string) []listEntry {
+	elems, ok := listElements(h, name, false)
+	if !ok {
+		return []listEntry{{}}
+	}
+	entries := make([]listEntry, 0, len(elems))
+	for _, elem := range elems {
+		entries = append(entries, parseListEntry(elem))
+	}
+	return entries
+}
+
+func parseListEntry(elem string) listEntry {
+	ip, err := netip.ParseAddr(elem)
+	bare := err == nil
+	if !bare {
+		elem = strings.Trim(elem, `"`)
+		if ap, portErr := netip.ParseAddrPort(elem); portErr == nil {
+			ip = ap.Addr()
+		} else {
+			ip, _ = netip.ParseAddr(strings.TrimSuffix(strings.TrimPrefix(elem, "["), "]"))
+		}
+	}
+	if ip.Zone() != "" {
+		return listEntry{}
+	}
+	return listEntry{addr: ip.Unmap(), bare: bare}
+}
+
+// listElements reads h's name field as an RFC 9110 section 5.6.1 list: field
+// lines joined with "," (section 5.2), so a proxy adding a line cannot leave a
+// client's line read alone; split at each comma, outside quoted-strings only
+// when quoted is set; elements trimmed of OWS; empty elements dropped. It
+// returns false, having stopped reading, once the field holds more than
+// maxForwardingHops elements. X-Forwarded-For passes quoted false: it has no
+// quoted-string, and a client's stray quote must not swallow the entry a
+// proxy appends after it.
+func listElements(h http.Header, name string, quoted bool) ([]string, bool) {
+	field := strings.Join(h.Values(name), ",")
+	var elems []string
+	start, inQuote := 0, false
+	for i := 0; i < len(field); i++ {
+		switch c := field[i]; {
+		case quoted && inQuote && c == '\\':
+			i++
+		case quoted && c == '"':
+			inQuote = !inQuote
+		case c == ',' && !inQuote:
+			if elems = appendListElement(elems, field[start:i]); len(elems) > maxForwardingHops {
+				return nil, false
+			}
+			start = i + 1
+		}
+	}
+	if elems = appendListElement(elems, field[start:]); len(elems) > maxForwardingHops {
+		return nil, false
+	}
+	return elems, true
+}
+
+func appendListElement(elems []string, elem string) []string {
+	if elem = strings.Trim(elem, " \t"); elem != "" {
+		return append(elems, elem)
+	}
+	return elems
+}
+
+func parseForwarded(h http.Header) []forwardedElement {
+	raw, ok := listElements(h, "Forwarded", true)
+	if !ok {
+		return []forwardedElement{{}}
+	}
+	elems := make([]forwardedElement, 0, len(raw))
+	for _, elem := range raw {
+		forNode, ok := parseForwardedElement(elem)
+		elems = append(elems, forwardedElement{forNode: forNode, valid: ok})
+	}
+	return elems
+}
+
+// parseForwardedElement parses an RFC 7239 section 4 forwarded-element:
+// pairs of token "=" (token / quoted-string), separated by ";", with no
+// whitespace outside a quoted-string. Names fold ASCII case and none may
+// repeat, and an element holds at most maxForwardedPairs pairs. The for and
+// by values must be section 6 nodes; it returns the for node, or false for an
+// invalid element.
+func parseForwardedElement(elem string) (netip.Addr, bool) {
+	var forNode netip.Addr
+	seen := make([]string, 0, maxForwardedPairs)
+	for rest := elem; rest != ""; {
+		if after, ok := strings.CutPrefix(rest, ";"); ok {
+			rest = after
+			continue
+		}
+		if len(seen) == maxForwardedPairs {
+			return netip.Addr{}, false
+		}
+		name, value, after, ok := cutForwardedPair(rest)
+		if !ok || slices.ContainsFunc(seen, func(s string) bool { return equalASCIIFold(s, name) }) {
+			return netip.Addr{}, false
+		}
+		seen, rest = append(seen, name), after
+		switch {
+		case equalASCIIFold(name, "for"):
+			forNode, ok = parseNode(value)
+		case equalASCIIFold(name, "by"):
+			_, ok = parseNode(value)
+		}
+		if !ok {
+			return netip.Addr{}, false
+		}
+	}
+	return forNode, true
+}
+
+// cutForwardedPair reads one forwarded-pair from the front of s, its value
+// decoded; false unless the pair is well formed and ends s or a ";" follows.
+func cutForwardedPair(s string) (name, value, rest string, ok bool) {
+	n := tokenLen(s)
+	after, eq := strings.CutPrefix(s[n:], "=")
+	if n == 0 || !eq {
+		return "", "", "", false
+	}
+	if value, rest, ok = cutForwardedValue(after); !ok || (rest != "" && rest[0] != ';') {
+		return "", "", "", false
+	}
+	return s[:n], value, rest, true
+}
+
+// cutForwardedValue reads a token or an RFC 9110 section 5.6.4 quoted-string
+// from the front of s, returning it decoded and the rest of s.
+func cutForwardedValue(s string) (value, rest string, ok bool) {
+	if !strings.HasPrefix(s, `"`) {
+		n := tokenLen(s)
+		return s[:n], s[n:], n > 0
+	}
+	var b strings.Builder
+	for i := 1; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '"':
+			return b.String(), s[i+1:], true
+		case c == '\\' && i+1 < len(s) && quotedPairByte(s[i+1]):
+			i++
+			b.WriteByte(s[i])
+		case qdtextByte(c):
+			b.WriteByte(c)
+		default:
+			return "", "", false
+		}
+	}
+	return "", "", false
+}
+
+// tokenLen is the length of the RFC 9110 section 5.6.2 token at the front of s.
+func tokenLen(s string) int {
+	for i := range len(s) {
+		if !tokenByte(s[i]) {
+			return i
+		}
+	}
+	return len(s)
+}
+
+func tokenByte(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0
+}
+
+func qdtextByte(c byte) bool {
+	return c == '\t' || c == ' ' || c == 0x21 || c >= 0x23 && c <= 0x5b || c >= 0x5d && c <= 0x7e || c >= 0x80
+}
+
+func quotedPairByte(c byte) bool {
+	return c == '\t' || c >= 0x20 && c != 0x7f
+}
+
+// parseNode parses an RFC 7239 section 6 node: an IPv4 address, a bracketed
+// IPv6 one, "unknown" or an obfuscated name, then an optional decimal or
+// obfuscated port. It returns the address, unmapped; the zero Addr for
+// "unknown" and obfuscated names.
+func parseNode(node string) (netip.Addr, bool) {
+	name, port, hasPort := strings.Cut(node, ":")
+	inner, bracketed := strings.CutPrefix(node, "[")
+	if bracketed {
+		var after string
+		var closed bool
+		if name, after, closed = strings.Cut(inner, "]"); !closed {
+			return netip.Addr{}, false
+		}
+		if port, hasPort = strings.CutPrefix(after, ":"); !hasPort && after != "" {
+			return netip.Addr{}, false
+		}
+	}
+	if hasPort && !validNodePort(port) {
+		return netip.Addr{}, false
+	}
+	if !bracketed && (equalASCIIFold(name, "unknown") || obfuscated(name)) {
+		return netip.Addr{}, true
+	}
+	ip, err := netip.ParseAddr(name)
+	if err != nil || ip.Is6() != bracketed || ip.Zone() != "" {
+		return netip.Addr{}, false
+	}
+	return ip.Unmap(), true
+}
+
+func validNodePort(port string) bool {
+	return obfuscated(port) || port != "" && len(port) <= 5 && strings.Trim(port, "0123456789") == ""
+}
+
+// obfuscated reports an RFC 7239 section 6.3 obfnode or obfport: "_" then one
+// or more of ALPHA, DIGIT, ".", "_" and "-".
+func obfuscated(s string) bool {
+	rest, ok := strings.CutPrefix(s, "_")
+	return ok && rest != "" && strings.Trim(rest, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-") == ""
+}
+
+// ParseCIDRs parses trusted reverse-proxy entries into the prefix set
+// ResolveClient, ClientIP and WithClientIP take. An entry is a CIDR, masked to
+// its network, or a bare IP, a single-host prefix; an IPv4-mapped entry of 96
+// bits or more becomes its IPv4 prefix, so both spellings of a network are one
+// prefix. Entries are trimmed and blank ones skipped; one that parses as
+// neither, a zoned address included, comes back in invalid, in input order, so
+// a strict caller can reject the input and a lenient one can use the rest. An
+// empty set trusts nothing.
+func ParseCIDRs(entries []string) (prefixes []netip.Prefix, invalid []string) {
 	for _, e := range entries {
 		s := strings.TrimSpace(e)
 		if s == "" {
 			continue
 		}
-		if _, n, err := net.ParseCIDR(s); err == nil {
-			nets = append(nets, n)
-			continue
+		if p, ok := parseTrustedPrefix(s); ok {
+			prefixes = append(prefixes, p)
+		} else {
+			invalid = append(invalid, s)
 		}
-		if ip := net.ParseIP(s); ip != nil {
-			bits := 8 * net.IPv4len
-			if ip.To4() == nil {
-				bits = 8 * net.IPv6len
-			}
-			nets = append(nets, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
-			continue
-		}
-		invalid = append(invalid, s)
 	}
-	return nets, invalid
+	return prefixes, invalid
+}
+
+func parseTrustedPrefix(s string) (netip.Prefix, bool) {
+	p, err := netip.ParsePrefix(s)
+	if err != nil {
+		ip, addrErr := netip.ParseAddr(s)
+		if addrErr != nil || ip.Zone() != "" {
+			return netip.Prefix{}, false
+		}
+		p = netip.PrefixFrom(ip, ip.BitLen())
+	}
+	if ip := p.Addr(); ip.Is4In6() && p.Bits() >= 96 {
+		p = netip.PrefixFrom(ip.Unmap(), p.Bits()-96)
+	}
+	return p.Masked(), true
 }

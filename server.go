@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -223,33 +224,14 @@ func WithServeExit(fn func(ctx context.Context)) RunOption {
 	return func(c *runConfig) { c.serveExit = fn }
 }
 
-// Run serves srv on ln until ctx is cancelled, then shuts down gracefully.
-//
-// It starts srv.Serve(ln) in a goroutine (treating http.ErrServerClosed as a
-// clean stop) and blocks until either ctx is cancelled or Serve returns on its
-// own. On cancellation it computes a single shutdown deadline (now + the
-// shutdown grace period) and runs the shutdown sequence against it: first the
-// WithPreDrain hook if one is registered (readiness flips, stream releases —
-// see WithPreDrain), then srv.Shutdown with a context bounded by the deadline,
-// then, if onShutdown is non-nil, onShutdown with a context bounded by that
-// SAME deadline: each later phase runs within whatever grace budget REMAINS
-// after the earlier ones, not a fresh full window. Run returns the first
-// non-ErrServerClosed error it observes (a serve error, else a shutdown error),
-// or nil on a clean graceful stop. A shutdown error that IS the grace period
-// running out is additionally wrapped in ErrShutdownGraceExpired, so a caller
-// can identify that origin instead of guessing it from a bare
-// context.DeadlineExceeded; the wrapped error stays in the chain, so existing
-// errors.Is checks are unaffected.
-//
-// When Serve instead returns on its own, before ctx is cancelled, none of that
-// sequence runs: there is no drain to bound and nothing has asked the
-// application to stop. Run returns the serve error straight away, having
-// invoked only the opt-in WithServeExit hook when one is registered — that hook
-// is the sole way to get a bounded teardown on this path.
-//
-// The caller binds ln up front (for example with net.ListenConfig.Listen) so a
-// port-in-use error surfaces synchronously before Run is called, and passes
-// application teardown as onShutdown.
+// Run serves srv on ln until ctx is cancelled, then shuts down within one
+// grace period (WithShutdownGrace): the WithPreDrain hook, srv.Shutdown, then
+// onShutdown if non-nil, all bounded by the same deadline. When Serve returns
+// before ctx is cancelled, only the WithServeExit hook runs. Run returns a
+// serve error first, else the shutdown error (see ErrShutdownGraceExpired), and
+// treats http.ErrServerClosed as a clean stop. It sets srv.ConnState, calling
+// any hook already set first, and closes connections that have sent no request
+// once srv.Shutdown starts. Bind ln first so a port-in-use error precedes Run.
 func Run(ctx context.Context, srv *http.Server, ln net.Listener, onShutdown func(ctx context.Context), opts ...RunOption) error {
 	c := &runConfig{shutdownGrace: defaultShutdownGrace}
 	for _, o := range opts {
@@ -257,6 +239,16 @@ func Run(ctx context.Context, srv *http.Server, ln net.Listener, onShutdown func
 			o(c)
 		}
 	}
+
+	silent := &silentConns{conns: make(map[net.Conn]struct{})}
+	callerHook := srv.ConnState
+	srv.ConnState = func(conn net.Conn, state http.ConnState) {
+		if callerHook != nil {
+			callerHook(conn, state)
+		}
+		silent.track(conn, state)
+	}
+	srv.RegisterOnShutdown(silent.closeAll)
 
 	serveErr := make(chan error, 1)
 	go func() {
@@ -306,6 +298,44 @@ func Run(ctx context.Context, srv *http.Server, ln net.Listener, onShutdown func
 		return err
 	}
 	return graceExpiryError(shutdownErr)
+}
+
+// silentConns holds the connections still in http.StateNew, which
+// http.Server.Shutdown counts as active for 5 s
+// (https://go.dev/issue/22682), so that shutdown can close them at once.
+type silentConns struct {
+	conns    map[net.Conn]struct{}
+	mu       sync.Mutex
+	shutdown bool
+}
+
+func (s *silentConns) track(conn net.Conn, state http.ConnState) {
+	s.mu.Lock()
+	// After closeAll has swept the set, Serve can still report a connection it
+	// accepted just before its listener closed.
+	lateNew := state == http.StateNew && s.shutdown
+	switch {
+	case lateNew:
+	case state == http.StateNew:
+		s.conns[conn] = struct{}{}
+	default:
+		delete(s.conns, conn)
+	}
+	s.mu.Unlock()
+	if lateNew {
+		_ = conn.Close()
+	}
+}
+
+func (s *silentConns) closeAll() {
+	s.mu.Lock()
+	s.shutdown = true
+	conns := s.conns
+	s.conns = nil
+	s.mu.Unlock()
+	for conn := range conns {
+		_ = conn.Close()
+	}
 }
 
 // graceExpiryError marks a shutdown error that IS the grace period running out,

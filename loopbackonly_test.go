@@ -135,6 +135,12 @@ func TestProxiedRequest(t *testing.T) {
 		if !ProxiedRequest(h) {
 			t.Errorf("%s not detected", name)
 		}
+		h = http.Header{}
+		h.Add(name, "")
+		h.Add(name, "value")
+		if !ProxiedRequest(h) {
+			t.Errorf("%s on a second field line, after an empty one, not detected", name)
+		}
 	}
 	// A header outside the set is not evidence.
 	h := http.Header{}

@@ -7,7 +7,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/cplieger/webhttp/v3"
+	"github.com/cplieger/webhttp/v4"
 )
 
 func TestCanonicalHost(t *testing.T) {
