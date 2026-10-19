@@ -21,18 +21,11 @@ type staticConfig struct {
 	cacheControl func(assetPath string) string
 }
 
-// WithStaticCacheControl sets the per-asset Cache-Control policy. fn receives
-// the normalized asset path — no leading slash, and "index.html" for the root
-// ("/") request — and returns the Cache-Control value for that asset; an empty
-// return omits the header. The default policy returns "no-cache" for every
-// asset: revalidate on every load (the content-hash ETag makes that a cheap
-// 304), the right choice when asset paths are stable rather than
-// content-addressed. Supply a policy to differ per path, for example immutable
-// large fonts alongside no-cache app code. A nil fn is ignored, keeping the
-// default.
-//
-// The policy is MECHANISM-free: it chooses header values only. Whether an
-// asset is ETagged, gzipped, or revalidated is the handler's fixed behavior.
+// WithStaticCacheControl sets the per-asset Cache-Control policy, "no-cache"
+// for every asset by default. fn receives the asset path with no leading
+// slash, "index.html" for "/", and returns the header value; an empty value
+// omits the header. It chooses the value only: ETags, gzip and revalidation
+// are fixed. A nil fn keeps the default.
 func WithStaticCacheControl(fn func(assetPath string) string) StaticOption {
 	return func(c *staticConfig) {
 		if fn != nil {
@@ -41,50 +34,13 @@ func WithStaticCacheControl(fn func(assetPath string) string) StaticOption {
 	}
 }
 
-// StaticHandler serves an embedded (or any fs.FS) static tree with the
-// revalidation and compression plumbing embed.FS is missing.
-//
-// embed.FS reports a zero ModTime, so a bare http.FileServer emits neither
-// Last-Modified nor ETag, leaving the browser no way to revalidate: every full
-// page load re-downloads every asset. The bytes of an embedded tree are fixed
-// for the process lifetime, so StaticHandler walks the tree ONCE at
-// construction and precomputes, per file:
-//
-//   - a content-hash ETag (sha256), so http.ServeContent answers a matching
-//     If-None-Match with 304 Not Modified;
-//   - a gzip representation (best compression), kept only when it is actually
-//     smaller — already-compressed formats (woff2, png) and tiny files stay
-//     identity-only.
-//
-// Responses for known assets carry the ETag, a Cache-Control value from the
-// cache policy (default "no-cache"; see WithStaticCacheControl), and
-// Vary: Accept-Encoding (bodies vary by encoding, so shared caches must key on
-// it on every path). A client that offers gzip on a non-Range GET/HEAD gets
-// the precompressed body with Content-Encoding: gzip and a DISTINCT ETag
-// (the identity tag suffixed -gz), including its own 304 handling; everything
-// else falls through to the identity http.FileServer, which serves the
-// index.html for "/" and handles Range, directories, and 404s.
-//
-// One inherited behavior worth knowing, because it changed under the library
-// rather than in it. Go 1.27 makes net/http answer 404 instead of 301 when
-// http.FileServer would REDIRECT a path whose escaped form contains %2F, since
-// with StripPrefix in play there is no reliable target to redirect to.
-// Differentially measured, bare http.FileServer against go1.26.7 and go1.27.0,
-// over ten shapes: exactly the three redirect shapes move — "/sub%2Fdir"
-// (directory reached without a trailing slash), "/sub%2Findex.html" and
-// "/%2Findex.html" (the index canonicalization) go 301 to 404. Every
-// non-redirect shape is unchanged, INCLUDING serving a file through an escaped
-// slash ("/sub%2Fdir/leaf.txt" is still 200) and a directory whose escaped
-// slash is followed by a real one ("/sub%2Fdir/" is still 200). StaticHandler
-// answered identically to a bare FileServer on all of them, so it inherits
-// exactly this and nothing more. It is not an open-redirect fix: the old
-// Location was a relative segment ("dir/", "./") computed from the path, never
-// a reflection of the caller's %2F.
-//
-// The error is non-nil only when walking fsys fails (an unreadable embedded
-// tree is a malformed build; fail startup rather than serve a partial site).
-// Serving is allocation-free per request apart from net/http's own work: all
-// hashing and compression happened at construction.
+// StaticHandler serves fsys, typically an embed.FS, whose zero ModTime leaves
+// a bare http.FileServer nothing to revalidate on. It reads the tree once and
+// gives each file a sha256 ETag and, when smaller, a gzip body. A known asset
+// carries its ETag, Cache-Control and Vary: Accept-Encoding; a GET or HEAD
+// offering gzip without Range gets the gzip body under its own "-gz" ETag.
+// Everything else falls through to http.FileServer. The error is non-nil only
+// when walking fsys fails.
 func StaticHandler(fsys fs.FS, opts ...StaticOption) (http.Handler, error) {
 	c := &staticConfig{
 		cacheControl: func(string) string { return "no-cache" },
@@ -195,7 +151,7 @@ func serveGzip(w http.ResponseWriter, r *http.Request, etag string, gz gzAsset) 
 	// with the identity body.
 	gzEtag := `"` + strings.Trim(etag, `"`) + `-gz"`
 	h.Set("ETag", gzEtag)
-	if ifNoneMatchContains(r.Header.Get("If-None-Match"), gzEtag) {
+	if ifNoneMatch(r.Header, gzEtag) {
 		w.WriteHeader(http.StatusNotModified)
 		return true
 	}
@@ -209,57 +165,17 @@ func serveGzip(w http.ResponseWriter, r *http.Request, etag string, gz gzAsset) 
 	return true
 }
 
-// acceptsGzip reports whether the request's Accept-Encoding header offers gzip
-// with a non-zero quality value, either by naming gzip or through the "*"
-// wildcard (RFC 9110 §12.5.3: the wildcard matches any coding not otherwise
-// named, so "*" alone offers gzip and an explicit gzip entry — acceptance or
-// q=0 refusal — always wins over it as the more specific match). A malformed
-// quality value (an unparseable q= parameter) is deliberately read as
-// accepting: the client explicitly named the coding, and a mangled parameter
-// should not withdraw that offer.
-func acceptsGzip(r *http.Request) bool {
-	wildcard := false
-	for part := range strings.SplitSeq(r.Header.Get("Accept-Encoding"), ",") {
-		name, offered := encodingOffer(part)
-		switch {
-		case equalASCIIFold(name, "gzip"):
-			return offered // explicit gzip is the most specific match
-		case name == "*":
-			wildcard = offered
-		}
-	}
-	return wildcard
-}
-
-// encodingOffer parses one Accept-Encoding list element into its coding name
-// and whether that coding is offered: true for a missing, non-zero, or
-// malformed q= parameter, false only for a well-formed q=0 refusal.
-func encodingOffer(part string) (name string, offered bool) {
-	token, qual := part, "1"
-	if i := strings.IndexByte(part, ';'); i >= 0 {
-		token = part[:i]
-		if j := strings.Index(part[i:], "q="); j >= 0 {
-			qual = part[i+j+2:]
-			// A q-value may be followed by further parameters
-			// (`gzip;q=0;foo=x`); cut at the next ';' so a well-formed
-			// q=0 refusal is not misread as malformed-and-accepting.
-			if k := strings.IndexByte(qual, ';'); k >= 0 {
-				qual = qual[:k]
-			}
-		}
-	}
-	q, err := strconv.ParseFloat(strings.TrimSpace(qual), 64)
-	return strings.TrimSpace(token), err != nil || q != 0
-}
-
-// ifNoneMatchContains reports whether an If-None-Match header value matches the
-// given ETag (or the "*" wildcard).
-func ifNoneMatchContains(header, etag string) bool {
-	for tok := range strings.SplitSeq(header, ",") {
-		tok = strings.TrimSpace(tok)
-		if tok == "*" || tok == etag {
+// ifNoneMatch reports whether h's If-None-Match, over every field line, is
+// "*" as the whole field or lists an entity-tag weakly equal to etag, a
+// strong entity-tag (RFC 9110 section 13.1.2).
+func ifNoneMatch(h http.Header, etag string) bool {
+	members, wildcard := 0, false
+	for member := range fieldList(h, "If-None-Match", entityTagList) {
+		members++
+		wildcard = member == "*"
+		if strings.TrimPrefix(member, "W/") == etag {
 			return true
 		}
 	}
-	return false
+	return wildcard && members == 1
 }

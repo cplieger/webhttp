@@ -136,6 +136,20 @@ func TestStaticHandlerGzipNegotiation(t *testing.T) {
 		}
 	})
 
+	t.Run("an opaque tag holding a comma and a star is no wildcard", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/style.css", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		req.Header.Set("If-None-Match", `"other,*,tag"`)
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET with a non-matching If-None-Match = %d, want 200", rec.Code)
+		}
+		if got := rec.Header().Get("Content-Encoding"); got != "gzip" || rec.Body.Len() == 0 {
+			t.Errorf("Content-Encoding = %q with %d body bytes, want the gzip body", got, rec.Body.Len())
+		}
+	})
+
 	t.Run("Range request falls back to the identity file server", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/style.css", nil)
@@ -246,68 +260,44 @@ type failFS struct{}
 
 func (failFS) Open(string) (fs.File, error) { return nil, errFailFS }
 
-func TestAcceptsGzip(t *testing.T) {
-	cases := []struct {
-		name   string
-		header string
-		want   bool
-	}{
-		{"plain gzip", "gzip", true},
-		{"gzip with q=1", "gzip;q=1.0", true},
-		{"gzip explicitly disabled q=0", "gzip;q=0", false},
-		{"gzip disabled q=0.0", "gzip;q=0.0", false},
-		{"gzip with fractional q", "gzip;q=0.5", true},
-		{"gzip with space before params", "gzip ; q=0", false},
-		{"second token offers gzip", "deflate, gzip", true},
-		{"second token gzip disabled", "deflate, gzip;q=0", false},
-		{"no gzip offered", "br, deflate", false},
-		{"identity only", "identity", false},
-		{"empty header", "", false},
-		{"wildcard offers gzip", "*", true},
-		{"wildcard with non-zero q offers gzip", "*;q=0.5", true},
-		{"wildcard refused with q=0", "*;q=0", false},
-		{"wildcard alongside other codings", "identity, *", true},
-		{"explicit gzip refusal beats a wildcard", "gzip;q=0, *", false},
-		{"explicit gzip refusal beats a preceding wildcard", "*, gzip;q=0", false},
-		{"explicit gzip acceptance beats a refused wildcard", "*;q=0, gzip", true},
-		{"malformed q is permissive", "gzip;q=bogus", true},
-		{"q=0 with trailing parameter still refuses", "gzip;q=0;dummy=x", false},
-		{"q=0.0 with trailing parameter still refuses", "gzip;q=0.0;dummy=x", false},
-		{"non-zero q with trailing parameter accepts", "gzip;q=0.5;dummy=x", true},
-		{"malformed q with trailing parameter is permissive", "gzip;q=bogus;dummy=x", true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, "/", nil)
-			if tc.header != "" {
-				req.Header.Set("Accept-Encoding", tc.header)
-			}
-			if got := acceptsGzip(req); got != tc.want {
-				t.Errorf("acceptsGzip(Accept-Encoding=%q) = %v, want %v", tc.header, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestIfNoneMatchContains(t *testing.T) {
+func TestIfNoneMatch(t *testing.T) {
 	const etag = `"abc-gz"`
 	cases := []struct {
-		name   string
-		header string
-		want   bool
+		name  string
+		lines []string
+		want  bool
 	}{
-		{"empty header", "", false},
-		{"exact match", `"abc-gz"`, true},
-		{"wildcard", "*", true},
-		{"present in comma list", `"x", "abc-gz", "y"`, true},
-		{"absent from list", `"x", "y"`, false},
-		{"whitespace trimmed around match", `  "abc-gz"  `, true},
-		{"identity etag does not match gz etag", `"abc"`, false},
+		{"no header", nil, false},
+		{"empty header", []string{""}, false},
+		{"exact match", []string{`"abc-gz"`}, true},
+		{"wildcard", []string{"*"}, true},
+		{"present in comma list", []string{`"x", "abc-gz", "y"`}, true},
+		{"absent from list", []string{`"x", "y"`}, false},
+		{"whitespace trimmed around match", []string{`  "abc-gz"  `}, true},
+		{"identity etag does not match gz etag", []string{`"abc"`}, false},
+		{"weak tag matches by weak comparison", []string{`W/"abc-gz"`}, true},
+		{"match on a later field line", []string{`"x"`, `"abc-gz"`}, true},
+		{"unquoted tag does not match", []string{"abc-gz"}, false},
+		{"a star inside an opaque tag is no wildcard", []string{`"other,*,tag"`}, false},
+		{"a weak opaque tag holding a star is no wildcard", []string{`W/"a,*"`}, false},
+		{"a quoted star is an opaque tag", []string{`"*"`}, false},
+		{"a star beside tags is malformed", []string{`*, "x"`}, false},
+		{"a star beside the matching tag still matches", []string{`*, "abc-gz"`}, true},
+		{"a star on each of two lines is malformed", []string{"*", "*"}, false},
+		{"a backslash in an opaque tag escapes nothing", []string{`"x\", "abc-gz"`}, true},
+		{"a lower-case weak prefix is malformed", []string{`w/"abc-gz"`}, false},
+		{"an unclosed tag matches nothing", []string{`"abc-gz`}, false},
+		{"an unclosed tag swallows the rest of the list", []string{`"x, "abc-gz"`}, false},
+		{"an unclosed tag on an earlier line swallows the next", []string{`"x`, `"abc-gz"`}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := ifNoneMatchContains(tc.header, etag); got != tc.want {
-				t.Errorf("ifNoneMatchContains(%q, %q) = %v, want %v", tc.header, etag, got, tc.want)
+			h := http.Header{}
+			for _, line := range tc.lines {
+				h.Add("If-None-Match", line)
+			}
+			if got := ifNoneMatch(h, etag); got != tc.want {
+				t.Errorf("ifNoneMatch(%q, %q) = %v, want %v", tc.lines, etag, got, tc.want)
 			}
 		})
 	}
