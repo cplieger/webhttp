@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 
 	"github.com/cplieger/webhttp/v4"
 )
@@ -79,4 +80,25 @@ func ExampleNewStaticTokenVerifier() {
 	// true
 	// false
 	// false
+}
+
+func ExampleGzip() {
+	api := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[` + strings.Repeat(`"item",`, 400) + `"item"]}`))
+	})
+	// The event stream must reach the client write by write, so it is skipped.
+	events := func(r *http.Request) bool { return r.URL.Path == "/events" }
+	h := webhttp.Chain(api, webhttp.Recoverer(), webhttp.Gzip(webhttp.WithGzipSkip(events)))
+
+	for _, path := range []string{"/items", "/events"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		fmt.Printf("%s: %q\n", path, rec.Header().Get("Content-Encoding"))
+	}
+	// Output:
+	// /items: "gzip"
+	// /events: ""
 }

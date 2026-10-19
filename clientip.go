@@ -126,9 +126,9 @@ type forwardedElement struct {
 
 func parseForwarding(h http.Header) forwarding {
 	return forwarding{
-		xff:       parseList(h, "X-Forwarded-For"),
-		realIP:    parseList(h, "X-Real-Ip"),
-		forwarded: parseForwarded(h),
+		xff:       parseBounded(h, "X-Forwarded-For", tokenList, parseListEntry),
+		realIP:    parseBounded(h, "X-Real-Ip", tokenList, parseListEntry),
+		forwarded: parseBounded(h, "Forwarded", quotedStringList, parseForwardedElement),
 	}
 }
 
@@ -163,16 +163,18 @@ func isPublic(ip netip.Addr) bool {
 	return ip.IsGlobalUnicast() && !ip.IsPrivate()
 }
 
-func parseList(h http.Header, name string) []listEntry {
-	elems, ok := listElements(h, name, false)
-	if !ok {
-		return []listEntry{{}}
+// parseBounded parses each element of h's name list with parse, or returns
+// one zero element once the list holds more than maxForwardingHops.
+func parseBounded[T any](h http.Header, name string, syntax listSyntax, parse func(string) T) []T {
+	var elems []T
+	for elem := range fieldList(h, name, syntax) {
+		if len(elems) == maxForwardingHops {
+			var zero T
+			return []T{zero}
+		}
+		elems = append(elems, parse(elem))
 	}
-	entries := make([]listEntry, 0, len(elems))
-	for _, elem := range elems {
-		entries = append(entries, parseListEntry(elem))
-	}
-	return entries
+	return elems
 }
 
 func parseListEntry(elem string) listEntry {
@@ -192,64 +194,12 @@ func parseListEntry(elem string) listEntry {
 	return listEntry{addr: ip.Unmap(), bare: bare}
 }
 
-// listElements reads h's name field as an RFC 9110 section 5.6.1 list: field
-// lines joined with "," (section 5.2), so a proxy adding a line cannot leave a
-// client's line read alone; split at each comma, outside quoted-strings only
-// when quoted is set; elements trimmed of OWS; empty elements dropped. It
-// returns false, having stopped reading, once the field holds more than
-// maxForwardingHops elements. X-Forwarded-For passes quoted false: it has no
-// quoted-string, and a client's stray quote must not swallow the entry a
-// proxy appends after it.
-func listElements(h http.Header, name string, quoted bool) ([]string, bool) {
-	field := strings.Join(h.Values(name), ",")
-	var elems []string
-	start, inQuote := 0, false
-	for i := 0; i < len(field); i++ {
-		switch c := field[i]; {
-		case quoted && inQuote && c == '\\':
-			i++
-		case quoted && c == '"':
-			inQuote = !inQuote
-		case c == ',' && !inQuote:
-			if elems = appendListElement(elems, field[start:i]); len(elems) > maxForwardingHops {
-				return nil, false
-			}
-			start = i + 1
-		}
-	}
-	if elems = appendListElement(elems, field[start:]); len(elems) > maxForwardingHops {
-		return nil, false
-	}
-	return elems, true
-}
-
-func appendListElement(elems []string, elem string) []string {
-	if elem = strings.Trim(elem, " \t"); elem != "" {
-		return append(elems, elem)
-	}
-	return elems
-}
-
-func parseForwarded(h http.Header) []forwardedElement {
-	raw, ok := listElements(h, "Forwarded", true)
-	if !ok {
-		return []forwardedElement{{}}
-	}
-	elems := make([]forwardedElement, 0, len(raw))
-	for _, elem := range raw {
-		forNode, ok := parseForwardedElement(elem)
-		elems = append(elems, forwardedElement{forNode: forNode, valid: ok})
-	}
-	return elems
-}
-
 // parseForwardedElement parses an RFC 7239 section 4 forwarded-element:
 // pairs of token "=" (token / quoted-string), separated by ";", with no
 // whitespace outside a quoted-string. Names fold ASCII case and none may
 // repeat, and an element holds at most maxForwardedPairs pairs. The for and
-// by values must be section 6 nodes; it returns the for node, or false for an
-// invalid element.
-func parseForwardedElement(elem string) (netip.Addr, bool) {
+// by values must be section 6 nodes; an invalid element is the zero value.
+func parseForwardedElement(elem string) forwardedElement {
 	var forNode netip.Addr
 	seen := make([]string, 0, maxForwardedPairs)
 	for rest := elem; rest != ""; {
@@ -258,11 +208,11 @@ func parseForwardedElement(elem string) (netip.Addr, bool) {
 			continue
 		}
 		if len(seen) == maxForwardedPairs {
-			return netip.Addr{}, false
+			return forwardedElement{}
 		}
 		name, value, after, ok := cutForwardedPair(rest)
 		if !ok || slices.ContainsFunc(seen, func(s string) bool { return equalASCIIFold(s, name) }) {
-			return netip.Addr{}, false
+			return forwardedElement{}
 		}
 		seen, rest = append(seen, name), after
 		switch {
@@ -272,10 +222,10 @@ func parseForwardedElement(elem string) (netip.Addr, bool) {
 			_, ok = parseNode(value)
 		}
 		if !ok {
-			return netip.Addr{}, false
+			return forwardedElement{}
 		}
 	}
-	return forNode, true
+	return forwardedElement{forNode: forNode, valid: true}
 }
 
 // cutForwardedPair reads one forwarded-pair from the front of s, its value
@@ -314,28 +264,6 @@ func cutForwardedValue(s string) (value, rest string, ok bool) {
 		}
 	}
 	return "", "", false
-}
-
-// tokenLen is the length of the RFC 9110 section 5.6.2 token at the front of s.
-func tokenLen(s string) int {
-	for i := range len(s) {
-		if !tokenByte(s[i]) {
-			return i
-		}
-	}
-	return len(s)
-}
-
-func tokenByte(c byte) bool {
-	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0
-}
-
-func qdtextByte(c byte) bool {
-	return c == '\t' || c == ' ' || c == 0x21 || c >= 0x23 && c <= 0x5b || c >= 0x5d && c <= 0x7e || c >= 0x80
-}
-
-func quotedPairByte(c byte) bool {
-	return c == '\t' || c >= 0x20 && c != 0x7f
 }
 
 // parseNode parses an RFC 7239 section 6 node: an IPv4 address, a bracketed

@@ -93,7 +93,7 @@ A service that browsers reach should also refuse unknown `Host` names. Build a `
 
 ## API
 
-- Middleware: `Chain`, `Recoverer`, `SecurityHeaders`, `Logging`, `RouteTimeout`, `RateLimiter` with its `SessionCreateRateLimit` and `FailedAuthRateLimit` presets, `NoStore`.
+- Middleware: `Chain`, `Recoverer`, `SecurityHeaders`, `Gzip`, `Logging`, `RouteTimeout`, `RateLimiter` with its `SessionCreateRateLimit` and `FailedAuthRateLimit` presets, `NoStore`.
 - Logging and metrics: `RequestLogger` and its options, request-id helpers, `RouteMetricLabels`, `StatusRecorder`.
 - Trust checks: `ClientIP`, `ResolveClient`, `ParseCIDRs`, `ParseHostList` and `HostPolicy`, `CanonicalHost`, `LoopbackOnly`, `ClassifyBind`, `NewStaticTokenVerifier`.
 - Requests and responses: `WriteJSON`, `WriteError` and `ErrorCode`, `DecodeBody`, `DecodeJSONInto`, `LimitBody`, `RequireMethod`, `MethodNotAllowed`, `CanonicalRequestPath`.
@@ -104,7 +104,7 @@ The full reference is on [pkg.go.dev](https://pkg.go.dev/github.com/cplieger/web
 
 ## Middleware order and safety rules
 
-`Chain(h, A, B, C)` builds `A(B(C(h)))`, so the first entry sees the request first. Any `func(http.Handler) http.Handler` fits in the chain. Put `Recoverer` inside `Logging`, as in `Chain(mux, Logging(), Recoverer())`. In the other order, the access line records 200 for a request whose client received a 500.
+`Chain(h, A, B, C)` builds `A(B(C(h)))`, so the first entry sees the request first. Any `func(http.Handler) http.Handler` fits. Put `Recoverer` inside `Logging` and `Gzip` inside `Recoverer`, as in `Chain(mux, Logging(), Recoverer(), Gzip())`. Otherwise the access log can show 200 where the client got 500, or a panic can lose its 500.
 
 Place a `HostPolicy` before any cross-origin or CSRF check. In a DNS rebinding attack, the page's `Origin` and the request's `Host` both name the attacker's domain, so a cross-origin check passes it and only the Host allowlist refuses it. Place `NoStore` innermost, so a handler that sets its own `Cache-Control` still wins.
 
@@ -128,12 +128,12 @@ When `Serve` returns before `ctx` is cancelled, for example because the listener
 
 ## Documentation
 
-- [Middleware](docs/middleware.md) covers ordering, recovery, security headers, timeouts, rate limiting and `NoStore`.
+- [Middleware](docs/middleware.md) covers ordering, recovery, security headers, compression, timeouts, rate limiting and `NoStore`.
 - [Access logging and metrics](docs/access-logging.md) covers request ids, the log line, its bounds and the metric hooks.
 - [Client IP, hosts and credentials](docs/trust-checks.md) covers proxy trust, the Host allowlist and loopback checks.
 - [Requests and responses](docs/requests-and-responses.md) covers the JSON helpers, the error envelope, body decoding and path checks.
 - [Static assets and CSP hashes](docs/static-assets.md) covers embedded files, caching and hash-pinned inline scripts.
-- [Server, readiness and shutdown](docs/server.md) covers timeouts, readiness and the shutdown sequence.
+- [Server, readiness and shutdown](docs/server.md) covers timeouts, readiness and shutdown order.
 
 ## Credits
 

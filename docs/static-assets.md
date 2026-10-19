@@ -12,6 +12,8 @@ It serves a known asset with its ETag, the cache policy's `Cache-Control` and `V
 
 The error is non-nil only when walking `fsys` fails. A malformed embed is a build problem, so abort startup on it.
 
+From Go 1.27, `net/http` answers 404 instead of 301 where `http.FileServer` would redirect a path whose escaped form holds `%2F`, such as `/sub%2Fdir` or `/sub%2Findex.html`. `StaticHandler` inherits this. Serving a file through an escaped slash, as in `/sub%2Fdir/leaf.txt`, still answers 200.
+
 ## Cache policy
 
 `WithStaticCacheControl(fn)` sets the `Cache-Control` value per asset. `fn` receives the normalized asset path and returns the header value, or an empty string to leave the header out.
