@@ -4,17 +4,46 @@ This page is for a developer deciding what a request may claim about itself. It 
 
 ## Client IP
 
-`ClientIP(r, trusted...)` returns the best-effort client IP.
+`ResolveClient(r, trusted...)` resolves the client address against the trusted proxy prefixes, a `[]netip.Prefix`, and says where the answer came from.
 
-With no trusted ranges, or when the direct peer is outside them, it ignores `X-Forwarded-For` and returns the host of `r.RemoteAddr`. That is the TCP peer, which a client cannot spoof at this layer.
+With no trusted prefixes, or when the direct peer is outside them, it ignores `X-Forwarded-For` and answers the host of `r.RemoteAddr`. That is the TCP peer, which a client cannot spoof at this layer.
 
-Behind a trusted proxy it reads `X-Forwarded-For` from right to left, skipping each trusted hop, and returns the first untrusted entry. That is the correct reading when a proxy appends the peer it saw, as Caddy and most reverse proxies do. The leftmost entry is whatever the client sent.
+Behind a trusted proxy it reads `X-Forwarded-For` from right to left, skipping each trusted hop, and answers the first untrusted entry. That is the correct reading when a proxy appends the peer it saw, as Caddy and most reverse proxies do. The leftmost entry is whatever the client sent.
 
-`X-Real-IP` is never read, because a client can set it. The library hardcodes no trusted range. You supply them.
+`X-Forwarded-For` is read as an RFC 9110 list. Every field line is joined into one value, each entry is trimmed of spaces and tabs only, and empty entries are skipped. An entry that is not an address on its own, such as one with a port, quotes or a zone, stops the walk and the peer is answered.
+
+Each forwarding header is read up to 64 entries, counted across its field lines, which is far more hops than any real proxy chain has. A header holding more entries, or a `Forwarded` element holding more than 16 parameters, is invalid as a whole and is never read in part. Parsing costs time in proportion to the header's length, however many entries it holds, so `http.Server`'s `MaxHeaderBytes` is what bounds it. From a trusted proxy, an invalid `X-Forwarded-For` answers the peer. From any other peer, an invalid header sets `UntrustedForwarding` and names no address.
+
+`X-Real-IP` and `Forwarded` never set the address, because Caddy passes a client's copy through. The library hardcodes no trusted range. You supply them.
 
 The trusted set must hold every proxy hop between the client and the server. If a hop is missing, the walk stops there and returns that hop's address.
 
-`ParseCIDRs(entries)` turns an operator list of CIDRs or bare IPs into that trusted set. A bare IP becomes `/32` or `/128`, and blank entries are skipped. Malformed entries come back in a separate list, so a strict caller can reject them and a lenient one can log them and use the rest.
+Addresses compare unmapped, so an IPv4 proxy reaching a dual-stack listener as `::ffff:10.0.0.7` matches `10.0.0.0/8`.
+
+The answer is a `ClientResolution`:
+
+| Field | Meaning |
+| --- | --- |
+| `IP` | The client address |
+| `Peer` | The socket peer, unmapped, or the zero address when `r.RemoteAddr` is not an IP |
+| `Forwarded` | `IP` came from `X-Forwarded-For` sent by a trusted peer. When false, `IP` is the peer |
+| `UntrustedForwarding` | A peer outside the trusted set sent a `Forwarded`, `X-Forwarded-For` or `X-Real-IP` holding at least one non-empty entry, which was ignored |
+| `IgnoredPublic` | One of those ignored headers named a public address, meaning global unicast and outside the private ranges |
+
+Use it to decide whether a request is local. A trusted proxy that forwarded nothing answers its own address with `Forwarded` false, so a check on `IP` alone would take the proxy for a local client. `UntrustedForwarding` points to a proxy you have not listed, and `IgnoredPublic` to a public client behind it.
+
+For `IgnoredPublic`, an `X-Forwarded-For` or `X-Real-IP` entry names an address even when quoted, bracketed or followed by a port. A `Forwarded` element counts only when it follows RFC 7239 exactly. Its `name=value` pairs are joined by `;` with no spaces, and each name appears once. A `for` value with a port or an IPv6 address must be in quotes.
+
+`ClientIP(r, trusted...)` returns `ResolveClient`'s `IP` as text, for a log line or a rate-limit key. An IPv4-mapped peer reads as its IPv4 address, and a `RemoteAddr` that is not an IP reads as `invalid IP`.
+
+`ParseCIDRs(entries)` turns an operator list of CIDRs or bare IPs into that trusted set. A bare IP becomes a `/32` or `/128` prefix, a CIDR is masked to its network, and an IPv4-mapped entry becomes its IPv4 prefix. Blank entries are skipped. Malformed entries, zoned addresses included, come back in a separate list in input order, so a strict caller can reject them and a lenient one can log them and use the rest.
+
+### Moving from v3
+
+- `ParseCIDRs` returns `[]netip.Prefix`, and `ClientIP` and `WithClientIP` take `netip.Prefix` values.
+- `ClientIP` falls back to the unmapped peer address: `::ffff:10.0.0.1` reads `10.0.0.1`, and an unparseable `RemoteAddr` reads `invalid IP` instead of coming back as written.
+- `ClientIP` skips empty `X-Forwarded-For` entries, so `203.0.113.9,` and `203.0.113.9,,10.0.0.2` answer `203.0.113.9` where v3 answered the peer. It trims only spaces and tabs, so an entry padded with other whitespace now answers the peer.
+- `ClientIP` reads at most 64 `X-Forwarded-For` entries. A longer header answers the peer, where v3 walked it whole.
 
 ## Host allowlist
 

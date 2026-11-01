@@ -1,6 +1,6 @@
 # Middleware
 
-This page is for a developer assembling a webhttp middleware stack. It covers how `Chain` orders middleware, panic recovery, security headers, per-route timeouts, rate limiting and `NoStore`.
+This page is for a developer assembling a webhttp middleware stack. It covers how `Chain` orders middleware, panic recovery, security headers, response compression, per-route timeouts, rate limiting and `NoStore`.
 
 ## Chain and ordering
 
@@ -29,6 +29,28 @@ The 500 goes through the configured `ErrorResponder`. The default is `WriteError
 If the handler already wrote headers or body before it panicked, the status is on the wire. `Recoverer` then skips the 500 body, but it still logs the panic and calls the hook.
 
 `http.ErrAbortHandler` is not recovered. `Recoverer` panics again with it, as the `net/http` contract asks, so the server aborts the response the way the handler meant. It is not logged and fires no hook.
+
+## Gzip
+
+`Gzip(opts...)` compresses a response with gzip when the request offers gzip and the response is worth compressing. A response qualifies when it has no `Content-Encoding` of its own, a `Content-Type` on the type list, a status other than 1xx, 204, 206 or 304, and a body of at least the threshold.
+
+| Option | Effect |
+| --- | --- |
+| `WithGzipMinBytes(n)` | Compress bodies of at least `n` bytes, 1024 by default. Below 1, every non-empty body qualifies |
+| `WithGzipTypes(types...)` | Replace the type list, `application/json` and `+json` by default |
+| `WithGzipSkip(fn)` | Pass the requests `fn` matches to the handler unwrapped |
+
+Each `WithGzipTypes` entry is a `type/subtype` or a `+suffix`. A `type/subtype` entry matches the response's `Content-Type` with case folded and parameters dropped. A `+suffix` entry matches the subtype's structured suffix, the part after its last `+` (RFC 6839). So `+json` covers `application/problem+json` but not `application/x-ndjson`. A `Content-Type` that does not parse is never compressed. An entry of neither form, or one with a wildcard, panics when the option is built.
+
+`Gzip` holds the status and body back until the body reaches the threshold, then sends them compressed. A handler that returns first, or calls `Flush`, sends them as written, so a streaming handler is never stuck behind the buffer. Once compressed, `Flush` pushes the stream so far to the client. `Hijack` and `http.ResponseController` reach the underlying connection.
+
+Every response that could be compressed carries `Vary: Accept-Encoding`, whatever the outcome, because a shared cache must key on it. A 206 or 304 of a listed type carries it too, as RFC 9110 asks of both, though neither is compressed. A `Vary` that already lists `Accept-Encoding`, or is `*`, is left alone. A compressed response drops `Content-Length` and `Accept-Ranges`, which describe the uncompressed body. A strong `ETag` becomes weak, since the compressed bytes differ. A `HEAD` request is answered uncompressed.
+
+Accept-Encoding is read as one list across every field line. A gzip entry with a zero weight, such as `gzip;q=0`, refuses gzip even when `*` is offered, and `x-gzip` counts as gzip. An unparseable weight counts as an offer. `StaticHandler` negotiates the same way.
+
+Put `Gzip` inside `Recoverer`, as in `Chain(mux, Logging(), Recoverer(), Gzip())`. A panic before the body was sent then drops the held-back bytes, and `Recoverer` answers 500 on a clean wire. A panic after compression began leaves the gzip stream without its trailer, so the client sees a truncated body rather than a complete-looking one.
+
+Use `WithGzipSkip` for a route whose writes must reach the client as they happen, such as an event stream or a WebSocket. `StaticHandler` needs no skip, since its precompressed responses carry `Content-Encoding`, its ranges answer 206, and `Gzip` passes both through.
 
 ## SecurityHeaders
 

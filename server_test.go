@@ -18,7 +18,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/cplieger/webhttp/v3"
+	"github.com/cplieger/webhttp/v4"
 )
 
 func TestNewServer_defaults(t *testing.T) {
@@ -641,6 +641,237 @@ func TestRun_preDrainRunsBeforeShutdownDrain(t *testing.T) {
 func TestRun_nilPreDrainIgnored(t *testing.T) {
 	if err := runAndShutdown(t, webhttp.WithPreDrain(nil)); err != nil {
 		t.Errorf("Run with WithPreDrain(nil) = %v, want nil", err)
+	}
+}
+
+// signalOn returns a ConnState hook that sends on the returned channel each
+// time a connection enters state.
+func signalOn(state http.ConnState) (hook func(net.Conn, http.ConnState), entered <-chan struct{}) {
+	ch := make(chan struct{}, 8)
+	return func(_ net.Conn, s http.ConnState) {
+		if s == state {
+			ch <- struct{}{}
+		}
+	}, ch
+}
+
+func awaitSignal(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+// net/http's Shutdown counts a connection that has sent no request as active
+// for 5 s (https://go.dev/issue/22682); Run must not wait that out.
+func TestRun_closesSilentConnectionAtShutdown(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := webhttp.NewServer(http.NotFoundHandler())
+	hook, accepted := signalOn(http.StateNew)
+	srv.ConnState = hook
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- webhttp.Run(ctx, srv, ln, nil, webhttp.WithShutdownGrace(10*time.Second))
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	awaitSignal(t, accepted, "the silent connection to be accepted")
+
+	start := time.Now()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Run = %v, want nil", err)
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Errorf("Run took %v to shut down with one silent connection, want under 1s", elapsed)
+		}
+	case <-time.After(9 * time.Second):
+		t.Fatal("Run did not return within the grace period")
+	}
+
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	if _, err := conn.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Errorf("read on the silent connection = %v, want io.EOF (closed by the server)", err)
+	}
+}
+
+// lateListener hands Serve one more connection after Close, once release
+// fires, as an accept that raced the listener's close does.
+type lateListener struct {
+	net.Listener
+	late    net.Conn
+	release <-chan struct{}
+	closed  chan struct{}
+	once    sync.Once
+	handed  atomic.Bool
+}
+
+func (l *lateListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err == nil {
+		return conn, nil
+	}
+	select {
+	case <-l.closed:
+	default:
+		return nil, err
+	}
+	if !l.handed.CompareAndSwap(false, true) {
+		return nil, err
+	}
+	<-l.release
+	return l.late, nil
+}
+
+func (l *lateListener) Close() error {
+	l.once.Do(func() { close(l.closed) })
+	return l.Listener.Close()
+}
+
+func TestRun_closesConnectionAcceptedDuringShutdown(t *testing.T) {
+	inner, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	newHook, accepted := signalOn(http.StateNew)
+	closedHook, closed := signalOn(http.StateClosed)
+	srv := webhttp.NewServer(http.NotFoundHandler())
+	srv.ConnState = func(c net.Conn, s http.ConnState) {
+		newHook(c, s)
+		closedHook(c, s)
+	}
+	serverSide, clientSide := net.Pipe()
+	defer func() { _ = clientSide.Close() }()
+	// The late connection arrives only after the silent one has been closed,
+	// so after shutdown's sweep has run.
+	ln := &lateListener{Listener: inner, late: serverSide, release: closed, closed: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- webhttp.Run(ctx, srv, ln, nil, webhttp.WithShutdownGrace(10*time.Second))
+	}()
+
+	silent, err := net.Dial("tcp", inner.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = silent.Close() }()
+	awaitSignal(t, accepted, "the silent connection to be accepted")
+	if err := clientSide.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+
+	start := time.Now()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Run = %v, want nil", err)
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Errorf("Run took %v to shut down with a connection accepted during shutdown, want under 1s", elapsed)
+		}
+	case <-time.After(9 * time.Second):
+		t.Fatal("Run did not return within the grace period")
+	}
+
+	if _, err := clientSide.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Errorf("read on the late connection = %v, want io.EOF (closed by the server)", err)
+	}
+}
+
+func TestRun_chainsCallerConnState(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := webhttp.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	var (
+		mu   sync.Mutex
+		seen = map[string][]http.ConnState{}
+	)
+	idleHook, idle := signalOn(http.StateIdle)
+	newHook, accepted := signalOn(http.StateNew)
+	closedHook, closed := signalOn(http.StateClosed)
+	srv.ConnState = func(c net.Conn, s http.ConnState) {
+		mu.Lock()
+		seen[c.RemoteAddr().String()] = append(seen[c.RemoteAddr().String()], s)
+		mu.Unlock()
+		idleHook(c, s)
+		newHook(c, s)
+		closedHook(c, s)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- webhttp.Run(ctx, srv, ln, nil, webhttp.WithShutdownGrace(2*time.Second))
+	}()
+
+	transport := &http.Transport{}
+	defer transport.CloseIdleConnections()
+	resp, err := (&http.Client{Transport: transport, Timeout: 2 * time.Second}).Get("http://" + ln.Addr().String() + "/")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	_ = resp.Body.Close()
+	awaitSignal(t, accepted, "the request connection to be accepted")
+	awaitSignal(t, idle, "the request connection to go idle")
+
+	silent, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = silent.Close() }()
+	awaitSignal(t, accepted, "the silent connection to be accepted")
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Run = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return")
+	}
+	awaitSignal(t, closed, "the first connection to close")
+	awaitSignal(t, closed, "the second connection to close")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got, want := seen[silent.LocalAddr().String()], []http.ConnState{http.StateNew, http.StateClosed}; !slices.Equal(got, want) {
+		t.Errorf("silent connection states = %v, want %v", got, want)
+	}
+	delete(seen, silent.LocalAddr().String())
+	if len(seen) != 1 {
+		t.Fatalf("connections seen besides the silent one = %d, want 1: %v", len(seen), seen)
+	}
+	want := []http.ConnState{http.StateNew, http.StateActive, http.StateIdle, http.StateClosed}
+	for _, got := range seen {
+		if !slices.Equal(got, want) {
+			t.Errorf("request connection states = %v, want %v", got, want)
+		}
 	}
 }
 

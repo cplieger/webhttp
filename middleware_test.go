@@ -4,16 +4,16 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"slices"
 	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
 
-	"github.com/cplieger/webhttp/v3"
+	"github.com/cplieger/webhttp/v4"
 )
 
 // recordingMW returns a middleware that appends "<name>-in" before calling next
@@ -574,14 +574,10 @@ func TestLogging_passesOptionsThrough(t *testing.T) {
 }
 
 func TestClientIP(t *testing.T) {
-	trusted := func(cidrs ...string) []*net.IPNet {
-		out := make([]*net.IPNet, 0, len(cidrs))
+	trusted := func(cidrs ...string) []netip.Prefix {
+		out := make([]netip.Prefix, 0, len(cidrs))
 		for _, c := range cidrs {
-			_, n, err := net.ParseCIDR(c)
-			if err != nil {
-				t.Fatalf("bad test CIDR %q: %v", c, err)
-			}
-			out = append(out, n)
+			out = append(out, netip.MustParsePrefix(c))
 		}
 		return out
 	}
@@ -591,7 +587,7 @@ func TestClientIP(t *testing.T) {
 		remoteAddr string
 		xff        string
 		xRealIP    string
-		trusted    []*net.IPNet
+		trusted    []netip.Prefix
 		want       string
 	}{
 		// (a) No trusted proxies: the socket peer is the only trustworthy source,
@@ -623,10 +619,12 @@ func TestClientIP(t *testing.T) {
 		// (e) IPv6 trusted peer parsed from a bracketed host:port; the untrusted
 		// XFF entry is the client.
 		{"IPv6 trusted peer honors XFF", "[::1]:8080", "2001:db8::1", "", trusted("::1/128"), "2001:db8::1"},
-		// (e) Malformed RemoteAddr with no port is used verbatim; an unparseable
-		// peer can never be trusted, so XFF is ignored with or without a set.
-		{"malformed RemoteAddr, no trusted set", "not-an-addr", "1.2.3.4", "", nil, "not-an-addr"},
-		{"malformed RemoteAddr with trusted set", "weird", "1.2.3.4", "", trusted("10.0.0.0/8"), "weird"},
+		// (e) An unparseable peer can never be trusted, so XFF is ignored with or
+		// without a set, and the zero address's text is returned.
+		{"malformed RemoteAddr, no trusted set", "not-an-addr", "1.2.3.4", "", nil, "invalid IP"},
+		{"malformed RemoteAddr with trusted set", "weird", "1.2.3.4", "", trusted("10.0.0.0/8"), "invalid IP"},
+		// (f) An untrusted IPv4-mapped peer reads as its IPv4 address.
+		{"untrusted mapped peer is unmapped", "[::ffff:203.0.113.5]:1234", "1.2.3.4", "", trusted("10.0.0.0/8"), "203.0.113.5"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -653,10 +651,7 @@ func TestClientIP(t *testing.T) {
 // first line win. The right-to-left walk must still select the real appended
 // entry, closing the spoof gap.
 func TestClientIP_multiLineXFF(t *testing.T) {
-	_, trusted, err := net.ParseCIDR("10.0.0.0/8")
-	if err != nil {
-		t.Fatalf("bad test CIDR: %v", err)
-	}
+	trusted := netip.MustParsePrefix("10.0.0.0/8")
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.RemoteAddr = "10.0.0.1:9999" // immediate peer is a trusted proxy
 	// Two separate X-Forwarded-For header lines: the client's spoofed value

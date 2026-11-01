@@ -5,9 +5,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"log/slog"
-	"net"
 	"net/http"
+	"net/netip"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -80,7 +81,7 @@ type logConfig struct {
 	recordRoute     func(RequestMetric)
 	logLevel        func(r *http.Request, status int) slog.Level
 	clientIPFunc    func(*http.Request) string
-	clientIPTrusted []*net.IPNet
+	clientIPTrusted []netip.Prefix
 	maxLoggedPath   int
 	logClientIP     bool
 	skipUpgrades    bool
@@ -730,18 +731,14 @@ func ProbeLogLevel(paths ...string) LogOption {
 	})
 }
 
-// WithClientIP adds a "client_ip" attribute to the access-log line, set to the
-// best-effort client IP resolved by ClientIP with the given trusted proxy
-// ranges. With no trusted ranges the immediate socket peer is logged (the
-// spoof-proof default); pass the reverse-proxy CIDRs to resolve the real client
-// from a trusted X-Forwarded-For, exactly as ClientIP does. The attribute is
-// omitted entirely unless this option is supplied, so the default access line
-// is unchanged. It is resolved once per request, inside the deferred access
-// log, so it costs nothing on skipped (streaming) paths.
-func WithClientIP(trusted ...*net.IPNet) LogOption {
+// WithClientIP adds a "client_ip" attribute set to ClientIP(r, trusted...),
+// for example with ParseCIDRs's prefixes. The attribute is omitted unless this
+// option is supplied. It is resolved once per request inside the deferred
+// access log, so skipped paths pay nothing.
+func WithClientIP(trusted ...netip.Prefix) LogOption {
 	return func(c *logConfig) {
 		c.logClientIP = true
-		c.clientIPTrusted = trusted
+		c.clientIPTrusted = slices.Clone(trusted)
 		c.clientIPFunc = nil
 	}
 }
