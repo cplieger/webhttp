@@ -121,6 +121,6 @@ One divergence from the access line is deliberate. For a non-standard method, th
 
 - `WriteHeader(code)` and `Write(b)` record the first explicit code only. The first `Write` without one records 200.
 - `Status()` returns the recorded status. `Wrote()` reports whether the response is committed, which `Recoverer` uses to avoid writing a 500 over a started response.
-- `Unwrap()`, `Flush()`, `Hijack()` and `ReadFrom(src)` pass through to the underlying writer and return its results.
+- `Unwrap()`, `FlushError()`, `Hijack()` and `ReadFrom(src)` pass through to the underlying writer and return its results. `Flush()` is `FlushError()` without the error.
 
-`Unwrap` lets `http.NewResponseController` reach the underlying writer's flusher, hijacker and deadline setters. The recorder also implements `http.Flusher`, `http.Hijacker` and `io.ReaderFrom` directly. So a handler that type-asserts those interfaces still works, and `io.Copy` and `http.ServeContent` keep the sendfile fast path.
+The recorder implements `http.Flusher`, `FlushError`, `http.Hijacker` and `io.ReaderFrom` directly. So `http.NewResponseController(w).Flush()` returns the connection's own flush error, such as `os.ErrDeadlineExceeded` after a write deadline passes. A flush that fails still sets `Wrote()`, because net/http latches its implicit 200 before it flushes. A flush that returns `http.ErrNotSupported` leaves the response uncommitted, so keep `Gzip` inside `Recoverer`, the order the [Gzip section](middleware.md) asks for. A handler that type-asserts those interfaces still works, and `io.Copy` and `http.ServeContent` keep the sendfile fast path. `Unwrap` lets `http.NewResponseController` reach the rest of the underlying writer, such as its deadline setters.

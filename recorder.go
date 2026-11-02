@@ -2,24 +2,20 @@ package webhttp
 
 import (
 	"bufio"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 )
 
-// StatusRecorder wraps an http.ResponseWriter to capture the response status
-// code. Middleware that needs to observe the final status (access logging,
-// metrics) wraps the writer in a StatusRecorder.
+// StatusRecorder wraps an http.ResponseWriter to record the response status
+// for middleware such as access logging and metrics.
 //
-// It stays transparent to streaming in two complementary ways. The Unwrap
-// method lets http.NewResponseController walk to the underlying writer, so
-// ResponseController-based callers reach its Flusher, Hijacker, and deadline
-// setters. It also implements http.Flusher, http.Hijacker, and io.ReaderFrom
-// directly, so a handler or library that type-asserts those interfaces on the
-// writer (as gorilla/websocket does with w.(http.Hijacker)) still works, and
-// io.Copy/http.ServeContent keep the zero-copy sendfile fast path. Each
-// passthrough returns the underlying writer's own result, so, for example,
-// Hijack reports http.ErrNotSupported on an HTTP/2 stream.
+// It implements http.Flusher, FlushError, http.Hijacker and io.ReaderFrom
+// itself, each returning the underlying writer's result (a passed write
+// deadline, http.ErrNotSupported on an HTTP/2 hijack), so type assertions,
+// http.NewResponseController and the sendfile fast path work through it.
+// Unwrap reaches the rest of the underlying writer, such as its deadlines.
 type StatusRecorder struct {
 	http.ResponseWriter
 	status       int
@@ -58,33 +54,38 @@ func (s *StatusRecorder) Status() int {
 }
 
 // Wrote reports whether the response has been committed, i.e. WriteHeader, the
-// first Write or ReadFrom, or a successful Flush or Hijack has run. Middleware
-// such as Recoverer consults it to avoid writing a second status and body onto
-// a response a handler has already started, which would corrupt the body and
-// mislabel the status.
+// first Write or ReadFrom, a Flush that returned anything but
+// http.ErrNotSupported (a failed flush included), or a successful Hijack has run. Middleware such as Recoverer consults it to avoid
+// writing a second status and body onto a response a handler has already
+// started, which would corrupt the body and mislabel the status.
 func (s *StatusRecorder) Wrote() bool {
 	return s.wroteHeader
 }
 
-// Unwrap returns the wrapped http.ResponseWriter. http.NewResponseController
-// walks Unwrap to reach a Flusher, Hijacker, or other optional interface
-// implemented by the underlying writer, so streaming still works through the
-// recorder.
+// Unwrap returns the wrapped http.ResponseWriter, so http.NewResponseController
+// reaches the optional methods the recorder does not implement itself, such as
+// SetWriteDeadline and EnableFullDuplex.
 func (s *StatusRecorder) Unwrap() http.ResponseWriter {
 	return s.ResponseWriter
 }
 
-// Flush forwards to the underlying writer via http.ResponseController (which
-// walks the Unwrap chain), so a handler that type-asserts http.Flusher directly
-// still streams through the recorder. A no-op if the underlying writer cannot flush.
-func (s *StatusRecorder) Flush() {
-	// A successful flush commits the response (net/http writes an implicit 200
-	// header when none was set yet), so mark the recorder written to keep Wrote()
-	// honest for Recoverer's commit gate. Best-effort: an underlying writer that
-	// cannot flush has nothing to do, so its error is intentionally discarded.
-	if err := http.NewResponseController(s.ResponseWriter).Flush(); err == nil {
+// Flush is FlushError for callers that type-assert http.Flusher, which has no
+// way to report the error.
+func (s *StatusRecorder) Flush() { _ = s.FlushError() }
+
+// FlushError flushes the underlying writer through http.ResponseController and
+// returns its error: http.ErrNotSupported when no writer below could flush, or
+// the connection's own failure, such as os.ErrDeadlineExceeded. Any other result
+// commits the response, because net/http latches its implicit 200 before it
+// flushes. A wrapper that writes before reporting http.ErrNotSupported is not
+// seen as committed, which is why Gzip belongs inside Recoverer.
+func (s *StatusRecorder) FlushError() error {
+	err := http.NewResponseController(s.ResponseWriter).Flush()
+	// errors.Is, not ==: ResponseController wraps the sentinel.
+	if !errors.Is(err, http.ErrNotSupported) {
 		s.wroteHeader = true
 	}
+	return err
 }
 
 // Hijack forwards to the underlying writer via http.ResponseController for
@@ -94,15 +95,11 @@ func (s *StatusRecorder) Flush() {
 func (s *StatusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	conn, rw, err := http.NewResponseController(s.ResponseWriter).Hijack()
 	if err == nil {
-		// Latch "hijacked with nothing recorded yet" BEFORE the commit flag below
-		// erases the distinction. When a handler takes the connection over without
-		// having written a status or a byte, net/http sent nothing at all: the
-		// handler owns the whole wire (this is how gorilla/websocket writes its
-		// 101 handshake), so the 200 the recorder defaults to describes no
-		// response that exists. RequestLogger's WithSkipUpgrades reads that fact
-		// through switchedProtocol; Status() keeps returning the default, since
-		// every existing caller wants a status rather than a second zero value to
-		// handle.
+		// Latch before the commit below erases it: a hijack with nothing written
+		// means net/http sent nothing and the handler owns the wire
+		// (gorilla/websocket writes its own 101), so the default 200 describes no
+		// response. switchedProtocol reads this; Status() keeps the default for
+		// callers that want a status.
 		s.hijackedBare = !s.wroteHeader
 		// The connection is now the caller's; the ResponseWriter can no longer
 		// emit a status/body, so mark it committed to stop Recoverer writing onto it.
@@ -132,8 +129,7 @@ func (s *StatusRecorder) ReadFrom(src io.Reader) (int64, error) {
 	// panic; committing unconditionally before the copy would leak an empty 200.
 	// A partial write (n > 0 with an error) has already started the body, so it
 	// commits like a normal Write. This only ever sets wroteHeader to true, so an
-	// earlier true from WriteHeader/Write is preserved. Mirrors the success-only
-	// commit gate on Flush/Hijack.
+	// earlier true from WriteHeader/Write is preserved.
 	var n int64
 	var err error
 	if rf, ok := s.ResponseWriter.(io.ReaderFrom); ok {
