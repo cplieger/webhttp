@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cplieger/webhttp/v4"
 )
@@ -75,12 +78,12 @@ func TestStatusRecorder_flushReachesHTTPTestRecorder(t *testing.T) {
 		t.Fatalf("Flush through recorder: %v", err)
 	}
 	if !under.Flushed {
-		t.Error("underlying httptest recorder was not flushed through Unwrap")
+		t.Error("underlying httptest recorder was not flushed through the recorder")
 	}
 }
 
-// flushOnlyWriter exposes Flush so the Unwrap chain can be tested with a writer
-// whose flusher is reached only through StatusRecorder.Unwrap.
+// flushOnlyWriter is an http.Flusher with no FlushError, the older shape a
+// recorder's flush must still reach.
 type flushOnlyWriter struct {
 	http.ResponseWriter
 	flushed bool
@@ -88,19 +91,19 @@ type flushOnlyWriter struct {
 
 func (f *flushOnlyWriter) Flush() { f.flushed = true }
 
-func TestStatusRecorder_flushReachesCustomFlusherThroughUnwrap(t *testing.T) {
+func TestStatusRecorder_flushReachesCustomFlusherThroughResponseController(t *testing.T) {
 	fw := &flushOnlyWriter{ResponseWriter: httptest.NewRecorder()}
 	rec := webhttp.NewStatusRecorder(fw)
 	if err := http.NewResponseController(rec).Flush(); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
 	if !fw.flushed {
-		t.Error("custom Flush was not reached through the Unwrap chain")
+		t.Error("custom Flush was not reached through the recorder")
 	}
 }
 
-// hijackOnlyWriter exposes Hijack so the Unwrap chain can be tested for the
-// hijack path SSE/WebSocket handlers rely on.
+// hijackOnlyWriter exposes Hijack, the path WebSocket handlers rely on, so a
+// hijack through the recorder can be observed.
 type hijackOnlyWriter struct {
 	http.ResponseWriter
 	hijacked bool
@@ -111,14 +114,14 @@ func (h *hijackOnlyWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return nil, nil, nil
 }
 
-func TestStatusRecorder_hijackReachesCustomHijackerThroughUnwrap(t *testing.T) {
+func TestStatusRecorder_hijackReachesCustomHijackerThroughResponseController(t *testing.T) {
 	hw := &hijackOnlyWriter{ResponseWriter: httptest.NewRecorder()}
 	rec := webhttp.NewStatusRecorder(hw)
 	if _, _, err := http.NewResponseController(rec).Hijack(); err != nil {
 		t.Fatalf("Hijack: %v", err)
 	}
 	if !hw.hijacked {
-		t.Error("custom Hijack was not reached through the Unwrap chain")
+		t.Error("custom Hijack was not reached through the recorder")
 	}
 }
 
@@ -281,17 +284,139 @@ func (*failingReaderFromWriter) ReadFrom(io.Reader) (int64, error) {
 	return 0, errRead
 }
 
+// flushErrorWriter models net/http's writer on a connection whose flush fails
+// (a passed write deadline returns os.ErrDeadlineExceeded): net/http has
+// already committed its implicit 200 when the error comes back.
+type flushErrorWriter struct {
+	http.ResponseWriter
+	err error
+}
+
+func (f *flushErrorWriter) FlushError() error { return f.err }
+
+func TestStatusRecorder_flushErrorReportsUnderlyingResult(t *testing.T) {
+	tests := []struct {
+		name      string
+		under     http.ResponseWriter
+		wantErr   error
+		wantWrote bool
+	}{
+		{"successful flush commits", httptest.NewRecorder(), nil, true},
+		{"failed flush returns its error committed", &flushErrorWriter{httptest.NewRecorder(), os.ErrDeadlineExceeded}, os.ErrDeadlineExceeded, true},
+		{"no flush support returns ErrNotSupported uncommitted", &plainWriter{httptest.NewRecorder()}, http.ErrNotSupported, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := webhttp.NewStatusRecorder(tt.under)
+			err := http.NewResponseController(rec).Flush()
+			if !errors.Is(err, tt.wantErr) {
+				t.Errorf("ResponseController.Flush err = %v, want %v", err, tt.wantErr)
+			}
+			if got := rec.Wrote(); got != tt.wantWrote {
+				t.Errorf("Wrote() = %v, want %v", got, tt.wantWrote)
+			}
+		})
+	}
+}
+
+// TestStatusRecorder_flushErrorReachesHandlerThroughMiddleware covers the
+// recorder where handlers meet it: inside Logging, and inside Recoverer and
+// Gzip, whose own flush forwards to the recorder.
+func TestStatusRecorder_flushErrorReachesHandlerThroughMiddleware(t *testing.T) {
+	stacks := []struct {
+		name string
+		wrap func(http.Handler) http.Handler
+	}{
+		{"Logging", webhttp.Logging(webhttp.WithLogger(discardLogger()))},
+		{"Logging Recoverer Gzip", func(h http.Handler) http.Handler {
+			return webhttp.Chain(h,
+				webhttp.Logging(webhttp.WithLogger(discardLogger())),
+				webhttp.Recoverer(webhttp.WithRecoverLogger(discardLogger())),
+				webhttp.Gzip(),
+			)
+		}},
+	}
+	writers := []struct {
+		name    string
+		under   func() http.ResponseWriter
+		wantErr error
+	}{
+		{"flush succeeds", func() http.ResponseWriter { return httptest.NewRecorder() }, nil},
+		{"flush hits the write deadline", func() http.ResponseWriter {
+			return &flushErrorWriter{httptest.NewRecorder(), os.ErrDeadlineExceeded}
+		}, os.ErrDeadlineExceeded},
+		{"writer cannot flush", func() http.ResponseWriter { return &plainWriter{httptest.NewRecorder()} }, http.ErrNotSupported},
+	}
+	for _, s := range stacks {
+		for _, wr := range writers {
+			t.Run(s.name+" "+wr.name, func(t *testing.T) {
+				var err error
+				h := s.wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					err = http.NewResponseController(w).Flush()
+				}))
+				h.ServeHTTP(wr.under(), httptest.NewRequest(http.MethodGet, "/feed", nil))
+				if !errors.Is(err, wr.wantErr) {
+					t.Errorf("handler's ResponseController.Flush err = %v, want %v", err, wr.wantErr)
+				}
+			})
+		}
+	}
+}
+
 func TestStatusRecorder_unsupportedFlushLeavesUncommitted(t *testing.T) {
 	// plainWriter implements no optional interface, so a Flush through the
 	// recorder finds no flusher and http.NewResponseController returns
-	// http.ErrNotSupported. A failed flush must not commit the response.
+	// http.ErrNotSupported. Nothing was written, so the response stays
+	// uncommitted.
 	rec := webhttp.NewStatusRecorder(&plainWriter{ResponseWriter: httptest.NewRecorder()})
 	if rec.Wrote() {
 		t.Fatal("Wrote() = true before any operation")
 	}
 	rec.Flush()
 	if rec.Wrote() {
-		t.Error("Wrote() = true after an unsupported Flush; a failed flush must not commit the response")
+		t.Error("Wrote() = true after an unsupported Flush; no flusher ran, so nothing was committed")
+	}
+}
+
+// TestRecoverer_skips500AfterFailedFlushOnRealServer runs net/http's own
+// writer, which commits its implicit 200 before a flush fails: Recoverer must
+// not write a 500 onto it, and the access line must record the 200 that went
+// out.
+func TestRecoverer_skips500AfterFailedFlushOnRealServer(t *testing.T) {
+	logCap := &captureHandler{}
+	h := webhttp.Chain(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		rc := http.NewResponseController(w)
+		if err := rc.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+			t.Errorf("SetWriteDeadline: %v", err)
+		}
+		if err := rc.Flush(); err == nil {
+			t.Error("Flush past the write deadline returned nil, so this test cannot observe a failed flush")
+		}
+		panic("boom after failed flush")
+	}),
+		webhttp.Logging(webhttp.WithLogger(slog.New(logCap))),
+		webhttp.Recoverer(webhttp.WithRecoverLogger(discardLogger())),
+	)
+	url, errorLog := gzipServer(t, h)
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The connection fails mid-response, so the client error is expected.
+	if resp, err := http.DefaultTransport.RoundTrip(req); err == nil {
+		_ = resp.Body.Close()
+	}
+
+	if logs := errorLog(); strings.Contains(logs, "superfluous") {
+		t.Errorf("server error log = %q, want no superfluous WriteHeader from Recoverer", logs)
+	}
+	recs := logCap.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("got %d log records, want exactly 1 (the access line)", len(recs))
+	}
+	if m := attrsOf(recs[0]); m["status"] != int64(http.StatusOK) {
+		t.Errorf("access line status = %v, want 200 (the status net/http committed)", m["status"])
 	}
 }
 
@@ -386,14 +511,9 @@ func TestRecoverer_emits500AfterFailedReadFrom(t *testing.T) {
 }
 
 // TestStatusRecorder_readFromMarksCommitted asserts a successful (n>0) ReadFrom
-// commits the response so Wrote() reports true, the positive-branch sibling of
-// flushMarksCommitted / hijackMarksCommitted. Streaming a body via the
+// commits the response so Wrote() reports true: streaming a body through the
 // io.ReaderFrom fast path starts the response just like Write, so Recoverer must
-// not append a second status/body onto it. Without this test, deleting the
-// "if n > 0 { s.wroteHeader = true }" commit line in ReadFrom survives the whole
-// suite: the negative tests pin only the n==0 branch, and the two success-path
-// ReadFrom tests (readFromUsesUnderlyingReaderFrom, readFromFallsBackToCopy)
-// assert only Status()/n/body, never Wrote().
+// not append a second status and body onto it.
 func TestStatusRecorder_readFromMarksCommitted(t *testing.T) {
 	// readerFromWriter implements io.ReaderFrom, so ReadFrom takes the fast path
 	// (rf.ReadFrom) rather than the io.Copy fallback.
