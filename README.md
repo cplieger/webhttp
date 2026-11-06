@@ -1,5 +1,8 @@
 # webhttp
 
+> Moved to [`github.com/cplieger/go/httpserver`](https://github.com/cplieger/go/tree/dev/httpserver) and renamed `httpserver`.
+> **Archived 2026-11-06. This repository is read-only. The published Go module stays available.**
+
 [![Go Reference](https://pkg.go.dev/badge/github.com/cplieger/webhttp/v4.svg)](https://pkg.go.dev/github.com/cplieger/webhttp/v4) [![Go version](https://img.shields.io/github/go-mod/go-version/cplieger/webhttp)](https://github.com/cplieger/webhttp/blob/main/go.mod) [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/webhttp/badges/mutation.json)](https://github.com/cplieger/webhttp/issues?q=label%3Agremlins-tracker)
 
 webhttp hardens your Go `net/http` server with access logging, security headers, a client IP that cannot be spoofed and graceful shutdown.
